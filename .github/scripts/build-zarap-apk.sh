@@ -20,20 +20,11 @@ printf '%s\n' \
 	'CONFIG_PACKAGE_luci-app-zarap=m' >> .config
 make defconfig
 
-pkg_version="$(sed -n 's/^PKG_VERSION:=//p' /feed/luci-app-zarap/Makefile)"
-pkg_release="$(sed -n 's/^PKG_RELEASE:=//p' /feed/luci-app-zarap/Makefile)"
-package_arch="$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"/\1/p' .config)"
-
-if [[ -z "${pkg_version}" || -z "${pkg_release}" || -z "${package_arch}" ]]; then
-	printf 'Unable to determine the Zarap package target\n' >&2
-	exit 1
-fi
-
-# Build the final package target directly. The regular package/.../compile
-# target recursively compiles runtime dependencies such as sing-box even
-# though this LuCI package contains only architecture-independent files.
-apk_target="${PWD}/bin/packages/${package_arch}/action/luci-app-zarap-${pkg_version}-r${pkg_release}.apk"
-make -j"$(nproc)" IDEPEND= "${apk_target}" V=s
+# Use OpenWrt's public package target: raw APK file targets are internal to
+# recursive make and are not exported at the SDK top level. Clearing IDEPEND
+# prevents runtime dependencies (notably sing-box and its Go toolchain) from
+# being compiled while retaining them in the generated APK metadata.
+make -j"$(nproc)" IDEPEND= package/luci-app-zarap/compile V=s
 
 mapfile -t apks < <(find bin/packages -type f -name 'luci-app-zarap-*.apk' -print)
 if [[ "${#apks[@]}" -ne 1 ]]; then
