@@ -15,6 +15,9 @@ echo 'src-link action /feed' >> feeds.conf
 
 ./scripts/feeds update base packages luci action
 ./scripts/feeds install -p action -f luci-app-zarap
+printf '%s\n' \
+	'CONFIG_PACKAGE_sing-box=m' \
+	'CONFIG_PACKAGE_luci-app-zarap=m' >> .config
 make defconfig
 
 pkg_version="$(sed -n 's/^PKG_VERSION:=//p' /feed/luci-app-zarap/Makefile)"
@@ -30,7 +33,7 @@ fi
 # target recursively compiles runtime dependencies such as sing-box even
 # though this LuCI package contains only architecture-independent files.
 apk_target="${PWD}/bin/packages/${package_arch}/action/luci-app-zarap-${pkg_version}-r${pkg_release}.apk"
-make -j"$(nproc)" DEVELOPER=1 IDEPEND= "${apk_target}" V=s
+make -j"$(nproc)" IDEPEND= "${apk_target}" V=s
 
 mapfile -t apks < <(find bin/packages -type f -name 'luci-app-zarap-*.apk' -print)
 if [[ "${#apks[@]}" -ne 1 ]]; then
