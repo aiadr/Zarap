@@ -30,7 +30,7 @@ fi
 # target recursively compiles runtime dependencies such as sing-box even
 # though this LuCI package contains only architecture-independent files.
 apk_target="bin/packages/${package_arch}/action/luci-app-zarap-${pkg_version}-r${pkg_release}.apk"
-make -j"$(nproc)" "${apk_target}" V=s
+make -j"$(nproc)" DEVELOPER=1 IDEPEND= "${apk_target}" V=s
 
 mapfile -t apks < <(find bin/packages -type f -name 'luci-app-zarap-*.apk' -print)
 if [[ "${#apks[@]}" -ne 1 ]]; then
