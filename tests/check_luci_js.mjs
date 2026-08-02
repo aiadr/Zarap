@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
 const source = await readFile(
-  new URL('../htdocs/luci-static/resources/view/zarap/overview.js', import.meta.url),
+  new URL('../luci-app-zarap/htdocs/luci-static/resources/view/zarap/overview.js', import.meta.url),
   'utf8',
 );
 

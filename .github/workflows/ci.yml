@@ -2,7 +2,13 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -50,9 +56,9 @@ jobs:
       - name: Check JavaScript, JSON, shell and contracts
         run: |
           node tests/check_luci_js.mjs
-          python3 -m json.tool root/usr/share/luci/menu.d/luci-app-zarap.json >/dev/null
-          python3 -m json.tool root/usr/share/rpcd/acl.d/luci-app-zarap.json >/dev/null
-          sh -n root/etc/init.d/zarap root/etc/uci-defaults/90-zarap
+          python3 -m json.tool luci-app-zarap/root/usr/share/luci/menu.d/luci-app-zarap.json >/dev/null
+          python3 -m json.tool luci-app-zarap/root/usr/share/rpcd/acl.d/luci-app-zarap.json >/dev/null
+          sh -n luci-app-zarap/root/etc/init.d/zarap luci-app-zarap/root/etc/uci-defaults/90-zarap
           python3 -m unittest discover -s tests -v
 
       - name: Build ucode syntax checker
@@ -71,7 +77,7 @@ jobs:
           /tmp/ucode/build/ucode
           -cdynlink=fs,dynlink=luci.http,dynlink=ubus,dynlink=uci
           -o /tmp/zarap.uc
-          root/usr/share/rpcd/ucode/zarap.uc
+          luci-app-zarap/root/usr/share/rpcd/ucode/zarap.uc
 
       - name: Check nftables syntax
         run: sudo nft -c -f tests/nftables.conf

@@ -5,7 +5,7 @@ import { dirname, join, normalize } from 'node:path';
 
 const browserDir = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = join(browserDir, '..', '..');
-const viewPath = join(repositoryRoot, 'htdocs/luci-static/resources/view/zarap/overview.js');
+const viewPath = join(repositoryRoot, 'luci-app-zarap/htdocs/luci-static/resources/view/zarap/overview.js');
 const port = Number(process.env.PORT || 4173);
 
 const contentTypes = {

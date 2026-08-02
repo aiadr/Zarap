@@ -30,7 +30,7 @@ jobs:
           PRIVATE_KEY: ${{ secrets.ZARAP_APK_PRIVATE_KEY }}
         run: |
           test -n "$PRIVATE_KEY" || { echo "ZARAP_APK_PRIVATE_KEY is not configured" >&2; exit 1; }
-          version="$(sed -n 's/^PKG_VERSION:=//p' Makefile)"
+          version="$(sed -n 's/^PKG_VERSION:=//p' luci-app-zarap/Makefile)"
           test "${GITHUB_REF_NAME}" = "v${version}" || {
             echo "Tag ${GITHUB_REF_NAME} does not match Makefile version ${version}" >&2
             exit 1

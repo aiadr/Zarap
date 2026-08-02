@@ -5,12 +5,19 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BACKEND = (ROOT / "root/usr/share/rpcd/ucode/zarap.uc").read_text()
-NFT = (ROOT / "root/etc/nftables.d/90-zarap.nft").read_text()
-MAKEFILE = (ROOT / "Makefile").read_text()
+PACKAGE_ROOT = ROOT / "luci-app-zarap"
+BACKEND = (PACKAGE_ROOT / "root/usr/share/rpcd/ucode/zarap.uc").read_text()
+NFT = (PACKAGE_ROOT / "root/etc/nftables.d/90-zarap.nft").read_text()
+MAKEFILE = (PACKAGE_ROOT / "Makefile").read_text()
 
 
 class PackageContractTests(unittest.TestCase):
+    def test_repository_has_openwrt_feed_layout(self):
+        self.assertFalse((ROOT / "Makefile").exists())
+        self.assertTrue((PACKAGE_ROOT / "Makefile").is_file())
+        self.assertTrue((PACKAGE_ROOT / "htdocs").is_dir())
+        self.assertTrue((PACKAGE_ROOT / "root").is_dir())
+
     def test_required_package_dependencies_are_declared(self):
         for package in (
             "sing-box",
@@ -23,8 +30,8 @@ class PackageContractTests(unittest.TestCase):
 
     def test_json_manifests_are_valid(self):
         for path in (
-            ROOT / "root/usr/share/luci/menu.d/luci-app-zarap.json",
-            ROOT / "root/usr/share/rpcd/acl.d/luci-app-zarap.json",
+            PACKAGE_ROOT / "root/usr/share/luci/menu.d/luci-app-zarap.json",
+            PACKAGE_ROOT / "root/usr/share/rpcd/acl.d/luci-app-zarap.json",
         ):
             json.loads(path.read_text())
 
