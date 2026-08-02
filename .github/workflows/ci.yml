@@ -58,6 +58,7 @@ jobs:
           node tests/check_luci_js.mjs
           python3 -m json.tool luci-app-zarap/root/usr/share/luci/menu.d/luci-app-zarap.json >/dev/null
           python3 -m json.tool luci-app-zarap/root/usr/share/rpcd/acl.d/luci-app-zarap.json >/dev/null
+          bash -n .github/scripts/build-zarap-apk.sh
           sh -n luci-app-zarap/root/etc/init.d/zarap luci-app-zarap/root/etc/uci-defaults/90-zarap
           python3 -m unittest discover -s tests -v
 
@@ -84,21 +85,29 @@ jobs:
 
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Build OpenWrt 25.12 APK
-        uses: openwrt/gh-action-sdk@797d0e3d0eb13b355c3447f60d0179d4b43089e2
+      - name: Build only the Zarap APK
         env:
-          ARCH: x86_64-25.12.4
-          PACKAGES: luci-app-zarap
-          V: s
+          SDK_IMAGE: ghcr.io/openwrt/sdk:x86_64-25.12.4@sha256:820d614294e64d048059cfe3dac58049fc0ce621a9d3ac21217c2caafb7d9616
+        run: |
+          install -d -m 0777 "${RUNNER_TEMP}/zarap-apk"
+          docker pull "${SDK_IMAGE}"
+          docker run --rm \
+            --entrypoint /bin/bash \
+            --workdir /builder \
+            -v "${GITHUB_WORKSPACE}:/feed:ro" \
+            -v "${RUNNER_TEMP}/zarap-apk:/artifacts" \
+            "${SDK_IMAGE}" \
+            /feed/.github/scripts/build-zarap-apk.sh
+          mkdir -p ci-artifacts
+          cp "${RUNNER_TEMP}"/zarap-apk/luci-app-zarap-*.apk ci-artifacts/
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: luci-app-zarap-apk
-          path: bin/packages/**/*.apk
+          path: ci-artifacts/luci-app-zarap-*.apk
           if-no-files-found: error
