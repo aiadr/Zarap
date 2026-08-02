@@ -13,7 +13,7 @@ sed \
 	feeds.conf.default > feeds.conf
 echo 'src-link action /feed' >> feeds.conf
 
-./scripts/feeds update packages luci
+./scripts/feeds update packages luci action
 ./scripts/feeds install -p action -f luci-app-zarap
 make defconfig
 
