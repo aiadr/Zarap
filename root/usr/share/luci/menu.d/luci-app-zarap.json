@@ -1,0 +1,13 @@
+{
+	"admin/services/zarap": {
+		"title": "Zarap",
+		"order": 45,
+		"action": {
+			"type": "view",
+			"path": "zarap/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-zarap" ]
+		}
+	}
+}

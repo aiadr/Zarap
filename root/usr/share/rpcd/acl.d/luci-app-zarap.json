@@ -1,0 +1,17 @@
+{
+	"luci-app-zarap": {
+		"description": "Manage Zarap transparent proxy",
+		"read": {
+			"ubus": {
+				"zarap": [ "status", "devices", "validate", "logs", "updates" ]
+			},
+			"uci": [ "zarap", "dhcp", "network" ]
+		},
+		"write": {
+			"ubus": {
+				"zarap": [ "apply", "restart", "stop", "update_component" ]
+			},
+			"uci": [ "zarap", "dhcp" ]
+		}
+	}
+}

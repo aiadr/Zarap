@@ -1,0 +1,25 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color: #20252b;
+  background: #f2f4f7;
+}
+
+body { margin: 0; }
+.test-header { padding: 10px 20px; color: #fff; background: #334155; }
+#app, #notifications { max-width: 1100px; margin: 16px auto; }
+.cbi-map, .cbi-section { padding: 16px; border-radius: 8px; background: #fff; }
+.cbi-section { margin: 12px 0; border: 1px solid #d8dee6; }
+.cbi-value { display: grid; grid-template-columns: 220px 1fr; gap: 12px; margin: 12px 0; }
+.cbi-input-text, .cbi-input-password { box-sizing: border-box; padding: 7px; }
+.table { width: 100%; border-collapse: collapse; }
+.th, .td { padding: 8px; border-bottom: 1px solid #d8dee6; text-align: left; }
+.label { padding: 3px 7px; border-radius: 4px; }
+.success { color: #166534; background: #dcfce7; }
+.warning { color: #854d0e; background: #fef9c3; }
+.error { color: #b91c1c; }
+.btn { padding: 7px 11px; cursor: pointer; }
+.right, .cbi-page-actions { margin-top: 12px; text-align: right; }
+.notification { padding: 10px; border-radius: 6px; background: #e2e8f0; }
+.notification.error { color: #991b1b; background: #fee2e2; }
+#modal { position: fixed; z-index: 20; inset: 20% 25%; padding: 20px; border: 1px solid #64748b; border-radius: 10px; background: #fff; box-shadow: 0 12px 40px #0005; }
+pre { padding: 10px; background: #0f172a; color: #e2e8f0; }
