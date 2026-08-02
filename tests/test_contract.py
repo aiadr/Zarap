@@ -20,13 +20,15 @@ class PackageContractTests(unittest.TestCase):
 
     def test_required_package_dependencies_are_declared(self):
         for package in (
-            "sing-box",
             "firewall4",
             "kmod-nft-tproxy",
             "kmod-nft-socket",
             "ip-full",
         ):
             self.assertIn(f"+{package}", MAKEFILE)
+
+        self.assertRegex(MAKEFILE, r"LUCI_DEPENDS:=.*\bsing-box\b")
+        self.assertNotIn("+sing-box", MAKEFILE)
 
     def test_json_manifests_are_valid(self):
         for path in (
