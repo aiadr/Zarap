@@ -1,0 +1,14 @@
+{
+  "name": "luci-app-zarap-tests",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "test:browser": "playwright test",
+    "test:browser:headed": "playwright test --headed",
+    "test:browser:ui": "playwright test --ui"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}

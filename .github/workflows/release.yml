@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: zarap-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag and signing key
+        id: version
+        env:
+          PRIVATE_KEY: ${{ secrets.ZARAP_APK_PRIVATE_KEY }}
+        run: |
+          test -n "$PRIVATE_KEY" || { echo "ZARAP_APK_PRIVATE_KEY is not configured" >&2; exit 1; }
+          version="$(sed -n 's/^PKG_VERSION:=//p' luci-app-zarap/Makefile)"
+          test "${GITHUB_REF_NAME}" = "v${version}" || {
+            echo "Tag ${GITHUB_REF_NAME} does not match Makefile version ${version}" >&2
+            exit 1
+          }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed APK
+        uses: openwrt/gh-action-sdk@797d0e3d0eb13b355c3447f60d0179d4b43089e2
+        env:
+          ARCH: x86_64-25.12.4
+          PACKAGES: luci-app-zarap
+          PRIVATE_KEY: ${{ secrets.ZARAP_APK_PRIVATE_KEY }}
+          V: s
+
+      - name: Collect current and historical APKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist current
+          find bin -type f -name 'luci-app-zarap-*.apk' -exec cp -v '{}' current/ ';'
+          test "$(find current -type f -name '*.apk' | wc -l)" -eq 1
+          cp current/*.apk dist/
+          gh release list --limit 100 --json tagName --jq '.[].tagName' | while read -r tag; do
+            gh release download "$tag" --pattern 'luci-app-zarap-*-r*.apk' --dir dist --clobber || true
+          done
+
+      - name: Build signed repository index and public key
+        env:
+          PRIVATE_KEY: ${{ secrets.ZARAP_APK_PRIVATE_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$PRIVATE_KEY" > /tmp/zarap-apk-private.pem
+          openssl pkey -in /tmp/zarap-apk-private.pem -pubout -out dist/zarap-apk.pem
+          chmod 0644 dist/zarap-apk.pem
+          docker run --rm \
+            -v "$PWD/dist:/repo" \
+            -v /tmp/zarap-apk-private.pem:/run/zarap-apk-private.pem:ro \
+            alpine:edge \
+            sh -ec 'apk mkndx --allow-untrusted --sign-key /run/zarap-apk-private.pem --output /repo/packages.adb /repo/luci-app-zarap-*-r*.apk'
+          cp current/*.apk dist/luci-app-zarap.apk
+          (cd dist && sha256sum zarap-apk.pem packages.adb *.apk > SHA256SUMS)
+          rm -f /tmp/zarap-apk-private.pem
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: zarap-release
+          path: dist/
+          if-no-files-found: error
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - name: Deploy signed APK repository
+        id: pages
+        uses: actions/deploy-pages@v4
+
+      - name: Download release files
+        uses: actions/download-artifact@v4
+        with:
+          name: zarap-release
+          path: dist
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          versioned="$(find dist -maxdepth 1 -type f -name "luci-app-zarap-${VERSION}-r*.apk" -print -quit)"
+          test -n "$versioned"
+          gh release create "v${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Zarap v${VERSION}" \
+            --generate-notes \
+            "$versioned" dist/luci-app-zarap.apk dist/SHA256SUMS dist/zarap-apk.pem

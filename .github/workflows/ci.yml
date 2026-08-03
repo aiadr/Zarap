@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+
+      - name: Install browser test dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Run browser tests
+        run: pnpm test:browser
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
+
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check JavaScript, JSON, shell and contracts
+        run: |
+          node tests/check_luci_js.mjs
+          python3 -m json.tool luci-app-zarap/root/usr/share/luci/menu.d/luci-app-zarap.json >/dev/null
+          python3 -m json.tool luci-app-zarap/root/usr/share/rpcd/acl.d/luci-app-zarap.json >/dev/null
+          bash -n .github/scripts/build-zarap-apk.sh
+          sh -n luci-app-zarap/root/etc/init.d/zarap luci-app-zarap/root/etc/uci-defaults/90-zarap
+          python3 -m unittest discover -s tests -v
+
+      - name: Build ucode syntax checker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libjson-c-dev nftables
+          git clone https://github.com/jow-/ucode.git /tmp/ucode
+          git -C /tmp/ucode checkout 81205a25437a83e3b9e1eb55ac169be84453d53b
+          cmake -S /tmp/ucode -B /tmp/ucode/build \
+            -DUCI_SUPPORT=OFF -DUBUS_SUPPORT=OFF -DULOOP_SUPPORT=OFF \
+            -DRTNL_SUPPORT=OFF -DNL80211_SUPPORT=OFF
+          cmake --build /tmp/ucode/build --parallel
+
+      - name: Check ucode syntax
+        run: >-
+          /tmp/ucode/build/ucode
+          -cdynlink=fs,dynlink=luci.http,dynlink=ubus,dynlink=uci
+          -o /tmp/zarap.uc
+          luci-app-zarap/root/usr/share/rpcd/ucode/zarap.uc
+
+      - name: Check nftables syntax
+        run: sudo nft -c -f tests/nftables.conf
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache OpenWrt SDK archive
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/openwrt-sdk-cache
+          key: openwrt-sdk-x86_64-25.12.4-28e004c1
+
+      - name: Build only the Zarap APK
+        env:
+          SDK_IMAGE: ghcr.io/openwrt/sdk:x86_64-25.12.4@sha256:820d614294e64d048059cfe3dac58049fc0ce621a9d3ac21217c2caafb7d9616
+        run: |
+          install -d -m 0777 "${RUNNER_TEMP}/zarap-apk" "${RUNNER_TEMP}/openwrt-sdk-cache"
+          docker pull "${SDK_IMAGE}"
+          docker run --rm \
+            --entrypoint /bin/bash \
+            --workdir /builder \
+            -v "${GITHUB_WORKSPACE}:/feed:ro" \
+            -v "${RUNNER_TEMP}/zarap-apk:/artifacts" \
+            -v "${RUNNER_TEMP}/openwrt-sdk-cache:/sdk-cache" \
+            "${SDK_IMAGE}" \
+            /feed/.github/scripts/build-zarap-apk.sh
+          mkdir -p ci-artifacts
+          cp "${RUNNER_TEMP}"/zarap-apk/luci-app-zarap-*.apk ci-artifacts/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-zarap-apk
+          path: ci-artifacts/luci-app-zarap-*.apk
+          if-no-files-found: error
