@@ -17,12 +17,16 @@ echo 'src-link action /feed' >> feeds.conf
 ./scripts/feeds install -p action -f luci-app-zarap
 make defconfig
 
-# Use OpenWrt's public package target: raw APK file targets are internal to
-# recursive make and are not exported at the SDK top level. DEVELOPER makes
-# the APK target available without selecting Zarap or sing-box in .config;
-# clearing IDEPEND prevents runtime dependencies from being compiled. Their
-# constraints are still taken from the package-specific metadata.
-make -j"$(nproc)" DEVELOPER=1 IDEPEND= package/luci-app-zarap/compile V=s
+pkg_version="$(sed -n 's/^PKG_VERSION:=//p' /feed/luci-app-zarap/Makefile)"
+pkg_release="$(sed -n 's/^PKG_RELEASE:=//p' /feed/luci-app-zarap/Makefile)"
+package_arch="$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\([^"]*\)"/\1/p' .config)"
+apk_target="${PWD}/bin/packages/${package_arch}/action/luci-app-zarap-${pkg_version}-r${pkg_release}.apk"
+
+# The top-level package target adds runtime packages to the build graph. Call
+# the package sub-make's APK target instead: it builds and packages Zarap while
+# preserving its dependency metadata, without compiling sing-box or a kernel.
+make -r -C package/feeds/action/luci-app-zarap \
+	TOPDIR="${PWD}" DEVELOPER=1 "${apk_target}" V=s
 
 mapfile -t apks < <(find bin/packages -type f -name 'luci-app-zarap-*.apk' -print)
 if [[ "${#apks[@]}" -ne 1 ]]; then
