@@ -38,9 +38,22 @@ Zarap не закреплён за конкретной версией `sing-box
 https://aiadr.github.io/Zarap/packages.adb
 ```
 
-Публичный ключ будет опубликован как `https://aiadr.github.io/Zarap/zarap-apk.pem`. Его реальный SHA-256 необходимо зафиксировать в этом README одновременно с добавлением секрета `ZARAP_APK_PRIVATE_KEY`; до этого подключать репозиторий нельзя.
+Публичный ключ опубликован как `https://aiadr.github.io/Zarap/zarap-apk.pem`. Перед первым подключением репозитория установите его через терминал роутера с обязательной проверкой SHA-256:
 
-После установки проверенного ключа пользователь один раз добавляет URL `packages.adb` через **LuCI → Система → Программы → Настроить apk**, обновляет списки и устанавливает `luci-app-zarap`. Последующие обновления доступны штатно через LuCI и через страницу Zarap. Установка напрямую по URL GitHub Release останется только аварийным способом.
+```sh
+wget -O /tmp/zarap-apk.pem \
+  https://aiadr.github.io/Zarap/zarap-apk.pem
+
+echo 'd7ef4639a8fadbd7775e78b6cd394516707bee449cd10c410492fd03bcf00fd1  /tmp/zarap-apk.pem' | sha256sum -c - &&
+mkdir -p /etc/apk/keys &&
+cp /tmp/zarap-apk.pem /etc/apk/keys/zarap-apk.pem &&
+chmod 0644 /etc/apk/keys/zarap-apk.pem &&
+rm -f /tmp/zarap-apk.pem
+```
+
+Если проверка SHA-256 не пройдёт, ключ не будет скопирован в доверенное хранилище.
+
+После установки проверенного ключа пользователь один раз добавляет URL `https://aiadr.github.io/Zarap/packages.adb` в `/etc/apk/repositories.d/customfeeds.list` через **LuCI → Система → Программы → Настроить apk**, сохраняет настройки, обновляет списки и устанавливает `luci-app-zarap`. Последующие обновления доступны штатно через LuCI и через страницу Zarap. Установка напрямую по URL GitHub Release остаётся только аварийным способом.
 
 ## Использование
 
