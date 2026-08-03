@@ -12,6 +12,7 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
 
   await expect(page.getByRole('heading', { name: 'Zarap' })).toBeVisible();
   await expect(page.getByText('sing-box работает')).toBeVisible();
+  await expect(page.getByText('TProxy слушает')).toBeVisible();
   await expect(page.getByText('kill switch активен')).toBeVisible();
   await expect(page.getByText('маршрутизация активна')).toBeVisible();
 
@@ -26,6 +27,10 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
 
   await expect(page.locator('body')).not.toContainText('123e4567-e89b-42d3-a456-426614174000');
   await expect(page.locator('body')).not.toContainText('0123456789abcdefghijklmnopqrstuvwxyzABCDE');
+  await expect(page.getByText(/vless:\/\/\*\*\*\*\*\*\*\*@proxy\.example\.test/)).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.some(call => call.method === 'devices')).toBe(false);
 });
 
 test('validates and applies the exact selected devices', async ({ page }) => {
@@ -37,7 +42,7 @@ test('validates and applies the exact selected devices', async ({ page }) => {
   await tablet.locator('input[data-field="name"]').fill('Планшет ребёнка');
   await tablet.locator('input[data-field="ip"]').fill('192.168.1.62');
 
-  await page.getByRole('button', { name: 'Проверить', exact: true }).click();
+  await page.getByRole('button', { name: 'Проверить конфигурацию', exact: true }).click();
   await expect(page.getByText('Ссылка и список устройств корректны')).toBeVisible();
 
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
@@ -60,9 +65,10 @@ test('shows backend validation errors without applying configuration', async ({ 
   await openZarap(page);
   await page.evaluate(() => { window.__mockState.validateError = 'MVP поддерживает только транспорт TCP'; });
   await page.getByLabel('VLESS Reality-ссылка').fill(validLink.replace('type=tcp', 'type=ws'));
-  await page.getByRole('button', { name: 'Проверить', exact: true }).click();
+  await page.getByRole('button', { name: 'Проверить конфигурацию', exact: true }).click();
 
   await expect(page.getByText('MVP поддерживает только транспорт TCP')).toBeVisible();
+  await expect(page.getByText(/Ошибка входных данных/)).toBeVisible();
   const calls = await page.evaluate(() => window.__rpcCalls);
   expect(calls.some(call => call.method === 'apply')).toBe(false);
 });

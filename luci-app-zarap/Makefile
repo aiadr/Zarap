@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=LuCI support for Zarap transparent proxy
-LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +rpcd-mod-iwinfo sing-box +firewall4 +kmod-nft-tproxy +kmod-nft-socket +ip-full
+LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode sing-box +firewall4 +kmod-nft-tproxy +kmod-nft-socket +ip-full
 LUCI_PKGARCH:=all
 
 PKG_NAME:=luci-app-zarap

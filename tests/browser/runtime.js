@@ -15,19 +15,13 @@ const fixtures = {
     ok: true,
     enabled: true,
     configured: true,
+    state: 'working',
+    message: 'Zarap работает',
     running: true,
+    listener: true,
     firewall: true,
     routing: true,
-    server: 'proxy.example.test',
-    server_port: 443,
-    server_name: 'cdn.example.test',
-    fingerprint: 'chrome',
-    clients: [
-      { mac: '00:11:22:33:44:55', ip: '192.168.1.50', name: 'Телевизор' }
-    ]
-  },
-  devices: {
-    ok: true,
+    masked_link: 'vless://********@proxy.example.test:443?security=reality&type=tcp&sni=cdn.example.test#Zarap',
     devices: [
       {
         mac: '00:11:22:33:44:55', name: 'Телевизор', ip: '192.168.1.50',
@@ -47,17 +41,19 @@ const fixtures = {
     ]
   },
   components: {
-    'luci-app-zarap': { installed: 'luci-app-zarap-0.1.0-r1', update_available: false, candidate: '' },
-    'sing-box': { installed: 'sing-box-1.12.22-r1', update_available: false, candidate: '' }
+	'luci-app-zarap': { installed: '0.1.0-r1', checked: false, update_available: false, candidate: '' },
+	'sing-box': { installed: '1.12.22-r1', checked: false, update_available: false, candidate: '' }
   },
   refreshedComponents: {
     'luci-app-zarap': {
-      installed: 'luci-app-zarap-0.1.0-r1', update_available: true,
-      candidate: 'luci-app-zarap-0.2.0-r1 all'
+      installed: '0.1.0-r1', update_available: true,
+      checked: true,
+      candidate: '0.2.0-r1'
     },
     'sing-box': {
-      installed: 'sing-box-1.12.22-r1', update_available: true,
-      candidate: 'sing-box-1.12.23-r1 x86_64'
+      installed: '1.12.22-r1', update_available: true,
+      checked: true,
+      candidate: '1.12.23-r1'
     }
   }
 };
@@ -68,7 +64,6 @@ function clone(value) {
 
 const handlers = {
   status: () => clone(fixtures.status),
-  devices: () => clone(fixtures.devices),
   logs: () => ({ ok: true, logs: 'sing-box запущен\nUUID: [скрыто]\nReality key: [скрыто]' }),
   updates: refresh => ({
     ok: true,
@@ -76,7 +71,7 @@ const handlers = {
     components: clone(refresh ? fixtures.refreshedComponents : fixtures.components)
   }),
   validate: () => window.__mockState.validateError
-    ? { ok: false, error: window.__mockState.validateError }
+	? { ok: false, error: window.__mockState.validateError, kind: 'input_error' }
     : { ok: true, server: 'proxy.example.test', server_name: 'cdn.example.test', clients: 2 },
   apply: () => window.__mockState.applyError
     ? { ok: false, error: window.__mockState.applyError }

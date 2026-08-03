@@ -8,15 +8,22 @@ import { connect } from 'ubus';
 import { cursor } from 'uci';
 
 const CONFIG = '/etc/zarap/sing-box.json';
-const CONFIG_TMP = '/tmp/zarap-sing-box.json';
+const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp';
 const NFT_CONFIG = '/etc/nftables.d/90-zarap.nft';
-const NFT_TMP = '/tmp/zarap-nft.conf';
+const NFT_TMP = '/etc/nftables.d/.90-zarap.nft.tmp';
 const NFT_CHECK = '/tmp/zarap-nft-check.conf';
+const UCI_CANDIDATE = '/etc/config/.zarap-candidate';
+const UCI_CANDIDATE_DELTA = '/tmp/.zarap-uci';
+const UCI_CONFIGS = ['zarap', 'dhcp', 'sing-box'];
 const COMPONENTS = { 'luci-app-zarap': true, 'sing-box': true };
 const LOCK_FILE = '/var/lock/zarap.lock';
 
-function result_error(message, details) {
-	return { ok: false, error: message, details: details || '' };
+function result_error(message, details, kind) {
+	return { ok: false, error: message, details: details || '', kind: kind || 'operation_error' };
+}
+
+function input_error(message) {
+	return result_error(message, '', 'input_error');
 }
 
 function capture(command) {
@@ -66,7 +73,7 @@ function valid_ipv4(value) {
 function parse_vless(link) {
 	link = trim('' + (link || ''));
 	if (!match(link, /^vless:\/\//))
-		return result_error('Ссылка должна начинаться с vless://');
+		return input_error('Ссылка должна начинаться с vless://');
 
 	let fragment_at = index(link, '#');
 	if (fragment_at >= 0)
@@ -77,7 +84,7 @@ function parse_vless(link) {
 	let query = query_at >= 0 ? substr(link, query_at + 1) : '';
 	let at = rindex(authority, '@');
 	if (at <= 0)
-		return result_error('В ссылке отсутствуют UUID или адрес сервера');
+		return input_error('В ссылке отсутствуют UUID или адрес сервера');
 
 	let uuid = lc(urldecode(substr(authority, 0, at)) || '');
 	let endpoint = substr(authority, at + 1);
@@ -86,25 +93,25 @@ function parse_vless(link) {
 	if (substr(endpoint, 0, 1) == '[') {
 		let closing = index(endpoint, ']');
 		if (closing < 2 || substr(endpoint, closing + 1, 1) != ':')
-			return result_error('Некорректный IPv6-адрес сервера');
+			return input_error('Некорректный IPv6-адрес сервера');
 		server = substr(endpoint, 1, closing - 1);
 		port_text = substr(endpoint, closing + 2);
 	}
 	else {
 		let colon = rindex(endpoint, ':');
 		if (colon <= 0)
-			return result_error('В ссылке отсутствует порт сервера');
+			return input_error('В ссылке отсутствует порт сервера');
 		server = urldecode(substr(endpoint, 0, colon)) || '';
 		port_text = substr(endpoint, colon + 1);
 	}
 
 	let port = int(port_text);
 	if (!match(uuid, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/))
-		return result_error('Некорректный UUID');
+		return input_error('Некорректный UUID');
 	if (!match(server, /^[A-Za-z0-9._:-]+$/))
-		return result_error('Некорректный адрес сервера');
+		return input_error('Некорректный адрес сервера');
 	if (!match(port_text, /^[0-9]+$/) || port < 1 || port > 65535)
-		return result_error('Порт сервера должен быть от 1 до 65535');
+		return input_error('Порт сервера должен быть от 1 до 65535');
 
 	let params = urldecode_params(query);
 	let security = lc(params.security || '');
@@ -117,23 +124,23 @@ function parse_vless(link) {
 	let fingerprint = params.fp || 'chrome';
 
 	if (security != 'reality')
-		return result_error('MVP поддерживает только VLESS Reality');
+		return input_error('MVP поддерживает только VLESS Reality');
 	if (transport != 'tcp')
-		return result_error('MVP поддерживает только транспорт TCP');
+		return input_error('MVP поддерживает только транспорт TCP');
 	if (flow != '' && flow != 'xtls-rprx-vision')
-		return result_error('Поддерживается только flow xtls-rprx-vision');
+		return input_error('Поддерживается только flow xtls-rprx-vision');
 	if (encryption != '' && encryption != 'none')
-		return result_error('Для VLESS параметр encryption должен быть none');
+		return input_error('Для VLESS параметр encryption должен быть none');
 	if (!match(sni, /^[A-Za-z0-9.-]+$/))
-		return result_error('В Reality-ссылке отсутствует корректный SNI');
+		return input_error('В Reality-ссылке отсутствует корректный SNI');
 	if (!match(public_key, /^[A-Za-z0-9_-]{32,64}$/))
-		return result_error('В Reality-ссылке отсутствует корректный публичный ключ');
+		return input_error('В Reality-ссылке отсутствует корректный публичный ключ');
 	if (short_id != '' && !match(short_id, /^[0-9A-Fa-f]{2,32}$/))
-		return result_error('Short ID должен быть чётной шестнадцатеричной строкой');
+		return input_error('Short ID должен быть чётной шестнадцатеричной строкой');
 	if (length(short_id) % 2 != 0)
-		return result_error('Short ID должен содержать чётное число символов');
+		return input_error('Short ID должен содержать чётное число символов');
 	if (!match(fingerprint, /^[A-Za-z0-9_-]+$/))
-		return result_error('Некорректный fingerprint');
+		return input_error('Некорректный fingerprint');
 
 	return {
 		ok: true,
@@ -154,7 +161,7 @@ function validate_clients(clients) {
 	if (clients == null)
 		clients = [];
 	if (type(clients) != 'array')
-		return result_error('Список устройств имеет неверный формат');
+		return input_error('Список устройств имеет неверный формат');
 
 	let result = [], seen_mac = {}, seen_ip = {};
 	for (let client in clients) {
@@ -163,15 +170,15 @@ function validate_clients(clients) {
 		let name = trim('' + (client?.name || ''));
 
 		if (!mac)
-			return result_error('У одного из устройств некорректный MAC-адрес');
+			return input_error('У одного из устройств некорректный MAC-адрес');
 		if (is_private_mac(mac))
-			return result_error('Устройство ' + mac + ' использует приватный MAC. Отключите рандомизацию MAC для этой Wi-Fi-сети.');
+			return input_error('Устройство ' + mac + ' использует приватный MAC. Отключите рандомизацию MAC для этой Wi-Fi-сети.');
 		if (!valid_ipv4(ip))
-			return result_error('Для устройства ' + mac + ' нужен корректный статический IPv4-адрес');
+			return input_error('Для устройства ' + mac + ' нужен корректный статический IPv4-адрес');
 		if (seen_mac[mac] || seen_ip[ip])
-			return result_error('MAC- и IPv4-адреса выбранных устройств не должны повторяться');
+			return input_error('MAC- и IPv4-адреса выбранных устройств не должны повторяться');
 		if (length(name) > 63 || (name != '' && !match(name, /^[A-Za-z0-9А-Яа-яЁё_. -]+$/)))
-			return result_error('Имя устройства содержит недопустимые символы');
+			return input_error('Имя устройства содержит недопустимые символы');
 
 		seen_mac[mac] = true;
 		seen_ip[ip] = true;
@@ -310,6 +317,24 @@ function static_leases() {
 	return { by_mac: by_mac, by_ip: by_ip };
 }
 
+function current_dhcp_leases() {
+	let by_mac = {};
+	for (let line in split(readfile('/tmp/dhcp.leases') || '', '\n')) {
+		let fields = split(trim(line), /[ \t]+/);
+		if (length(fields) < 4)
+			continue;
+		let mac = normalize_mac(fields[1]);
+		if (!mac || !valid_ipv4(fields[2]))
+			continue;
+		by_mac[mac] = {
+			mac: mac,
+			ip: fields[2],
+			name: fields[3] == '*' ? '' : fields[3]
+		};
+	}
+	return by_mac;
+}
+
 function ipv4_in_lan(ip) {
 	let ubus = connect();
 	if (!ubus)
@@ -325,7 +350,7 @@ function ipv4_in_lan(ip) {
 }
 
 function resolve_static_leases(clients) {
-	let leases = static_leases(), result = [];
+	let leases = static_leases(), dynamic = current_dhcp_leases(), result = [];
 	for (let client in clients) {
 		let existing = leases.by_mac[client.mac];
 		if (existing) {
@@ -337,19 +362,19 @@ function resolve_static_leases(clients) {
 		}
 		let conflict = leases.by_ip[client.ip];
 		if (conflict && conflict.mac != client.mac)
-			return result_error('IPv4-адрес ' + client.ip + ' уже закреплён за ' + conflict.mac);
+			return input_error('IPv4-адрес ' + client.ip + ' уже закреплён за ' + conflict.mac);
 		if (!ipv4_in_lan(client.ip))
-			return result_error('IPv4-адрес ' + client.ip + ' не входит в LAN-подсеть');
+			return input_error('IPv4-адрес ' + client.ip + ' не входит в LAN-подсеть');
 		push(result, {
 			mac: client.mac, ip: client.ip, name: client.name,
-			has_static_lease: false
+			has_static_lease: false,
+			reconnect_required: !!dynamic[client.mac]?.ip && dynamic[client.mac].ip != client.ip
 		});
 	}
 	return { ok: true, clients: result };
 }
 
-function save_uci(parsed, enabled, clients) {
-	let uci = cursor();
+function configure_uci(uci, parsed, enabled, clients) {
 	uci.load('zarap');
 	uci.set('zarap', 'main', 'zarap');
 	uci.set('zarap', 'main', 'enabled', enabled ? '1' : '0');
@@ -369,9 +394,6 @@ function save_uci(parsed, enabled, clients) {
 		uci.set('zarap', section, 'ip', client.ip);
 		uci.set('zarap', section, 'name', client.name);
 	}
-	if (!uci.commit('zarap'))
-		return false;
-
 	uci.load('dhcp');
 	for (let client in clients) {
 		if (client.has_static_lease)
@@ -383,16 +405,57 @@ function save_uci(parsed, enabled, clients) {
 		uci.set('dhcp', section, 'ip', client.ip);
 		uci.set('dhcp', section, 'zarap_managed', '1');
 	}
-	if (!uci.commit('dhcp'))
-		return false;
-
 	uci.load('sing-box');
 	uci.set('sing-box', 'main', 'sing-box');
 	uci.set('sing-box', 'main', 'enabled', enabled ? '1' : '0');
 	uci.set('sing-box', 'main', 'user', 'root');
 	uci.set('sing-box', 'main', 'conffile', CONFIG);
 	uci.set('sing-box', 'main', 'workdir', '/tmp/zarap');
-	return !!uci.commit('sing-box');
+	return true;
+}
+
+function cleanup_uci_candidate() {
+	for (let name in UCI_CONFIGS) {
+		unlink(UCI_CANDIDATE + '/' + name);
+		unlink(UCI_CANDIDATE_DELTA + '/' + name);
+	}
+}
+
+function prepare_uci_candidate(parsed, enabled, clients) {
+	mkdir(UCI_CANDIDATE);
+	chmod(UCI_CANDIDATE, 0700);
+	mkdir(UCI_CANDIDATE_DELTA);
+	chmod(UCI_CANDIDATE_DELTA, 0700);
+	cleanup_uci_candidate();
+
+	for (let name in UCI_CONFIGS) {
+		let content = readfile('/etc/config/' + name);
+		if (writefile(UCI_CANDIDATE + '/' + name, content == null ? '' : content) == null) {
+			cleanup_uci_candidate();
+			return result_error('Не удалось создать временный UCI-кандидат', '', 'startup_error');
+		}
+	}
+
+	let candidate = cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA);
+	if (!configure_uci(candidate, parsed, enabled, clients)) {
+		cleanup_uci_candidate();
+		return result_error('Не удалось сформировать временный UCI-кандидат', '', 'startup_error');
+	}
+	for (let name in UCI_CONFIGS)
+		if (!candidate.commit(name)) {
+			cleanup_uci_candidate();
+			return result_error('Временный UCI-кандидат не прошёл проверку', '', 'compatibility_error');
+		}
+
+	return { ok: true };
+}
+
+function activate_uci_candidate() {
+	for (let name in UCI_CONFIGS)
+		if (!rename(UCI_CANDIDATE + '/' + name, '/etc/config/' + name))
+			return false;
+	chmod('/etc/config/zarap', 0600);
+	return true;
 }
 
 function read_clients() {
@@ -426,34 +489,130 @@ function saved_proxy_config() {
 	};
 }
 
+function masked_proxy(parsed) {
+	if (!parsed)
+		return '';
+	return 'vless://********@' + parsed.server + ':' + parsed.server_port +
+		'?security=reality&type=tcp&sni=' + parsed.server_name +
+		(parsed.flow ? '&flow=' + parsed.flow : '') + '#Zarap';
+}
+
+function check_runtime(enabled) {
+	if (!enabled)
+		return { ok: true, running: false, listener: false, firewall: false, routing: false };
+
+	let running = system(['/etc/init.d/sing-box', 'running']) == 0;
+	let listeners = capture('/usr/sbin/ss -H -lntup sport = :7893').output;
+	let listener = listeners && index(lc(listeners), 'sing-box') >= 0;
+	let firewall = system('/usr/sbin/nft list chain inet fw4 zarap_killswitch_forward >/dev/null 2>&1') == 0 &&
+		system('/usr/sbin/nft list chain inet fw4 zarap_prerouting >/dev/null 2>&1') == 0;
+	let rule = system('/sbin/ip -4 rule show | grep -q "fwmark 0x5a52.*lookup 2022"') == 0;
+	let route = system('/sbin/ip -4 route show table 2022 | grep -Eq "^local (default|0.0.0.0/0) dev lo"') == 0;
+	return {
+		ok: running && listener && firewall && rule && route,
+		running: running,
+		listener: !!listener,
+		firewall: firewall,
+		routing: rule && route
+	};
+}
+
+function recent_connection_error() {
+	let output = lc(capture('/sbin/logread -e sing-box -l 80').output);
+	for (let marker in [
+		'connection refused', 'network is unreachable', 'i/o timeout',
+		'connection reset', 'reality handshake', 'tls handshake'
+	])
+		if (index(output, marker) >= 0)
+			return true;
+	return false;
+}
+
+function validate_candidate(parsed, clients) {
+	mkdir('/etc/zarap');
+	chmod('/etc/zarap', 0700);
+	let sing_box = sprintf('%J', sing_box_config(parsed, 7893)) + '\n';
+	let nft = nft_config(clients, 7893);
+	let config_written = writefile(CONFIG_TMP, sing_box);
+	let nft_written = writefile(NFT_TMP, nft);
+	if (config_written == null || nft_written == null) {
+		unlink(CONFIG_TMP); unlink(NFT_TMP);
+		return result_error('Не удалось создать временные файлы конфигурации', '', 'startup_error');
+	}
+	chmod(CONFIG_TMP, 0600);
+	if (writefile(NFT_CHECK, 'table inet zarap_check {\n' + nft + '}\n') == null) {
+		unlink(CONFIG_TMP); unlink(NFT_TMP);
+		return result_error('Не удалось создать файл проверки nftables', '', 'startup_error');
+	}
+
+	if (system(['/usr/bin/sing-box', 'check', '-c', CONFIG_TMP]) != 0) {
+		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
+		return result_error('Установленный sing-box отклонил сгенерированную конфигурацию', '', 'compatibility_error');
+	}
+	if (system(['/usr/sbin/nft', '-c', '-f', NFT_CHECK]) != 0) {
+		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
+		return result_error('nftables отклонил сгенерированные правила', '', 'compatibility_error');
+	}
+	return { ok: true, sing_box: sing_box, nft: nft };
+}
+
 function rollback(backups) {
+	let ok = true;
 	for (let path, content in backups) {
 		if (content == null)
 			unlink(path);
-		else
-			writefile(path, content);
+		else if (writefile(path, content) == null)
+			ok = false;
 	}
 	chmod('/etc/config/zarap', 0600);
-	unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
-	system(['/etc/init.d/firewall', 'reload']);
-	system(['/etc/init.d/dnsmasq', 'restart']);
-	system(['/etc/init.d/zarap', 'restart']);
-	system(['/etc/init.d/sing-box', 'restart']);
+	unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
+	if (system(['/etc/init.d/firewall', 'reload']) != 0) ok = false;
+	if (system(['/etc/init.d/dnsmasq', 'restart']) != 0) ok = false;
+	if (system(['/etc/init.d/zarap', 'restart']) != 0) ok = false;
+	if (system(['/etc/init.d/sing-box', 'restart']) != 0) ok = false;
+	return ok;
+}
+
+function restore_update_files(backups, restart_proxy) {
+	let ok = true;
+	for (let path, content in backups) {
+		if (content == null)
+			unlink(path);
+		else if (writefile(path, content) == null)
+			ok = false;
+	}
+	chmod('/etc/config/zarap', 0600);
+	if (system(['/etc/init.d/firewall', 'reload']) != 0) ok = false;
+	if (system(['/etc/init.d/zarap', 'restart']) != 0) ok = false;
+	if (restart_proxy) {
+		if (system(['/etc/init.d/sing-box', 'restart']) != 0) ok = false;
+	}
+	else {
+		system(['/etc/init.d/sing-box', 'stop']);
+	}
+	return ok;
 }
 
 function resource_conflict() {
 	let listeners = capture('/usr/sbin/ss -H -lntup sport = :7893').output;
-	if (listeners && index(lc(listeners), 'sing-box') < 0)
+	if (listeners && (!saved_proxy_config() || index(lc(listeners), 'sing-box') < 0))
 		return result_error('Порт 7893 уже занят другим процессом');
 
 	let routes = capture('/sbin/ip -4 route show table 2022').output;
-	if (routes && !match(routes, /^local (default|0\.0\.0\.0\/0) dev lo/))
-		return result_error('Таблица маршрутизации 2022 уже используется другой конфигурацией');
+	for (let line in split(routes, '\n'))
+		if (trim(line) && !match(trim(line), /^local (default|0\.0\.0\.0\/0) dev lo( |$)/))
+			return result_error('Таблица маршрутизации 2022 уже используется другой конфигурацией');
 
 	let rules = capture('/sbin/ip -4 rule show').output;
 	for (let line in split(rules, '\n'))
 		if (index(line, 'fwmark 0x5a52') >= 0 && index(line, 'lookup 2022') < 0)
 			return result_error('Packet mark 0x5a52 уже используется другой таблицей маршрутизации');
+
+	let nft_rules = capture('/usr/sbin/nft -a list ruleset').output;
+	let own_chain = capture('/usr/sbin/nft -a list chain inet fw4 zarap_prerouting').output;
+	for (let line in split(nft_rules, '\n'))
+		if (index(line, '0x5a52') >= 0 && index(own_chain, trim(line)) < 0)
+			return result_error('Packet mark 0x5a52 уже используется другим правилом nftables');
 
 	return { ok: true };
 }
@@ -469,7 +628,7 @@ function apply_configuration(args) {
 	else {
 		let saved = saved_proxy_config();
 		if (!saved)
-			return result_error('Для первоначальной настройки вставьте VLESS Reality-ссылку');
+			return input_error('Для первоначальной настройки вставьте VLESS Reality-ссылку');
 		parsed_result = { ok: true, config: saved };
 	}
 	let client_result = validate_clients(args?.clients);
@@ -482,23 +641,14 @@ function apply_configuration(args) {
 	if (!conflict.ok)
 		return conflict;
 
-	mkdir('/etc/zarap');
-	chmod('/etc/zarap', 0700);
-	let sing_box = sprintf('%J', sing_box_config(parsed_result.config, 7893)) + '\n';
 	let enabled = !!args?.enabled;
-	let nft = nft_config(enabled ? client_result.clients : [], 7893);
-	writefile(CONFIG_TMP, sing_box);
-	chmod(CONFIG_TMP, 0600);
-	writefile(NFT_TMP, nft);
-	writefile(NFT_CHECK, 'table inet zarap_check {\n' + nft + '}\n');
-
-	if (system(['/usr/bin/sing-box', 'check', '-c', CONFIG_TMP]) != 0) {
+	let candidate = validate_candidate(parsed_result.config, enabled ? client_result.clients : []);
+	if (!candidate.ok)
+		return candidate;
+	let uci_candidate = prepare_uci_candidate(parsed_result.config, enabled, client_result.clients);
+	if (!uci_candidate.ok) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
-		return result_error('sing-box отклонил сгенерированную конфигурацию');
-	}
-	if (system(['/usr/sbin/nft', '-c', '-f', NFT_CHECK]) != 0) {
-		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
-		return result_error('nftables отклонил сгенерированные правила');
+		return uci_candidate;
 	}
 
 	let backups = {};
@@ -509,24 +659,30 @@ function apply_configuration(args) {
 		chmod(CONFIG + '.bak', 0600);
 	}
 
-	if (!save_uci(parsed_result.config, enabled, client_result.clients)) {
-		rollback(backups);
-		return result_error('Не удалось сохранить конфигурацию UCI');
+	if (!activate_uci_candidate()) {
+		let restored = rollback(backups);
+		return result_error(restored ? 'Не удалось атомарно активировать UCI; изменения отменены' :
+			'Критическая ошибка активации UCI и rollback; kill switch не отключался', '', 'startup_error');
 	}
-	chmod('/etc/config/zarap', 0600);
+	if (system(['/etc/init.d/dnsmasq', 'restart']) != 0) {
+		let restored = rollback(backups);
+		return result_error(restored ? 'dnsmasq не принял static DHCP lease; изменения отменены' :
+			'Критическая ошибка dnsmasq и rollback; kill switch не отключался', '', 'startup_error');
+	}
 
 	if (!rename(CONFIG_TMP, CONFIG) || !rename(NFT_TMP, NFT_CONFIG)) {
-		rollback(backups);
-		return result_error('Не удалось активировать сгенерированные файлы');
+		let restored = rollback(backups);
+		return result_error(restored ? 'Не удалось атомарно активировать файлы; изменения отменены' :
+			'Критическая ошибка активации файлов и rollback; kill switch не отключался', '', 'startup_error');
 	}
 	chmod(CONFIG, 0600);
 	unlink(NFT_CHECK);
 
 	if (system(['/etc/init.d/firewall', 'reload']) != 0) {
-		rollback(backups);
-		return result_error('firewall4 не принял правила Zarap; восстановлена предыдущая конфигурация');
+		let restored = rollback(backups);
+		return result_error(restored ? 'firewall4 не принял правила Zarap; восстановлена предыдущая конфигурация' :
+			'Критическая ошибка firewall4 и rollback; загруженный kill switch не отключался', '', 'startup_error');
 	}
-	system(['/etc/init.d/dnsmasq', 'restart']);
 	let service_code;
 	if (enabled) {
 		service_code = system(['/etc/init.d/zarap', 'restart']);
@@ -538,49 +694,53 @@ function apply_configuration(args) {
 		service_code = system(['/etc/init.d/zarap', 'stop']);
 	}
 	if (service_code != 0) {
-		rollback(backups);
-		return result_error('Не удалось запустить Zarap; восстановлена предыдущая конфигурация');
+		let restored = rollback(backups);
+		return result_error(restored ? 'Не удалось запустить Zarap; восстановлена предыдущая конфигурация' :
+			'Критическая ошибка запуска и rollback; kill switch оставлен активным', '', 'startup_error');
 	}
 
-	return { ok: true, enabled: enabled, clients: client_result.clients };
+	let health = check_runtime(enabled);
+	if (!health.ok) {
+		let restored = rollback(backups);
+		return result_error(restored ? 'Локальная инфраструктура Zarap не прошла проверку; конфигурация восстановлена' :
+			'Критическая ошибка проверки и rollback; kill switch оставлен активным', sprintf('%J', health), 'startup_error');
+	}
+
+	return { ok: true, enabled: enabled, clients: client_result.clients, health: health };
 }
 
 function device_list() {
 	let devices = {}, selected = {}, leases = static_leases();
+	let dynamic_leases = current_dhcp_leases();
 	for (let client in read_clients())
 		selected[client.mac] = client;
 
 	let ubus = connect();
 	if (ubus) {
-		let hints = ubus.call('luci-rpc', 'getHostHints') || {};
-		let wireless = ubus.call('network.wireless', 'status') || {};
-		for (let radio in wireless)
-			for (let iface in (wireless[radio]?.interfaces || [])) {
-				if (iface?.config?.mode && iface.config.mode != 'ap')
-					continue;
-				let ifname = iface?.ifname;
-				if (!ifname) continue;
-				let info = ubus.call('iwinfo', 'info', { device: ifname }) || {};
-				let assoc = ubus.call('iwinfo', 'assoclist', { device: ifname }) || {};
-				for (let station in (assoc.results || [])) {
-					let mac = normalize_mac(station?.mac);
-					if (!mac) continue;
-					let hint = hints[mac] || {};
-					let lease = leases.by_mac[mac] || {};
-					devices[mac] = {
-						mac: mac,
-						name: lease.name || hint.name || selected[mac]?.name || ('Устройство ' + mac),
-						ip: lease.ip || hint.ipaddrs?.[0] || selected[mac]?.ip || '',
-						connected: true,
-						wireless: true,
-						network: info.ssid || '',
-						signal: station.signal || 0,
-						has_static_lease: !!lease.ip,
-						private_mac: is_private_mac(mac),
-						selected: !!selected[mac]
-					};
-				}
+		let objects = split(capture('/bin/ubus list "hostapd.*"').output, '\n');
+		for (let object in objects) {
+			if (!match(object, /^hostapd\.[A-Za-z0-9_.-]+$/))
+				continue;
+			let response = ubus.call(object, 'get_clients') || {};
+			for (let raw_mac, station in (response.clients || {})) {
+				let mac = normalize_mac(raw_mac);
+				if (!mac) continue;
+				let lease = leases.by_mac[mac] || {};
+				let dynamic = dynamic_leases[mac] || {};
+				devices[mac] = {
+					mac: mac,
+					name: lease.name || dynamic.name || selected[mac]?.name || ('Устройство ' + mac),
+					ip: lease.ip || dynamic.ip || selected[mac]?.ip || '',
+					connected: true,
+					wireless: true,
+					network: substr(object, 8),
+					signal: station?.signal || 0,
+					has_static_lease: !!lease.ip,
+					private_mac: is_private_mac(mac),
+					selected: !!selected[mac]
+				};
 			}
+		}
 		ubus.disconnect();
 	}
 
@@ -610,22 +770,42 @@ function status() {
 	uci.load('zarap');
 	let enabled = uci.get('zarap', 'main', 'enabled') == '1';
 	let configured = !!uci.get('zarap', 'main', 'server');
-	let running = system(['/etc/init.d/sing-box', 'running']) == 0;
-	let firewall = system('/usr/sbin/nft list chain inet fw4 zarap_killswitch_forward >/dev/null 2>&1') == 0;
-	let routing = system('/sbin/ip -4 rule show | grep -q "fwmark 0x5a52.*lookup 2022"') == 0;
+	let health = check_runtime(enabled);
+	let state = 'disabled', message = 'Zarap выключен';
+	if (!configured) {
+		state = 'not_configured';
+		message = 'Прокси ещё не настроен';
+	}
+	else if (access(CONFIG) && system(['/usr/bin/sing-box', 'check', '-c', CONFIG]) != 0) {
+		state = 'compatibility_error';
+		message = 'Установленный sing-box не принимает текущую конфигурацию';
+	}
+	else if (enabled && !health.ok) {
+		state = 'startup_error';
+		message = 'Процесс, TProxy, nftables или policy routing не прошли проверку';
+	}
+	else if (enabled && recent_connection_error()) {
+		state = 'connection_error';
+		message = 'Локальная инфраструктура работает, но в журнале есть ошибка соединения с прокси';
+	}
+	else if (enabled) {
+		state = 'working';
+		message = 'Zarap работает';
+	}
+	let saved = saved_proxy_config();
 
 	return {
 		ok: true,
 		enabled: enabled,
 		configured: configured,
-		running: running,
-		firewall: firewall,
-		routing: routing,
-		server: uci.get('zarap', 'main', 'server') || '',
-		server_port: int(uci.get('zarap', 'main', 'server_port') || 0),
-		server_name: uci.get('zarap', 'main', 'server_name') || '',
-		fingerprint: uci.get('zarap', 'main', 'fingerprint') || '',
-		clients: read_clients()
+		state: state,
+		message: message,
+		running: health.running,
+		listener: health.listener,
+		firewall: health.firewall,
+		routing: health.routing,
+		masked_link: masked_proxy(saved),
+		devices: device_list()
 	};
 }
 
@@ -646,12 +826,23 @@ function logs() {
 		if (secret)
 			while (index(output, secret) >= 0)
 				output = replace(output, secret, '[скрыто]');
+	output = replace(output, /vless:\/\/[^ \t\r\n"'<>]+/g, 'vless://[скрыто]');
+	output = replace(output, /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}/g, '[скрыто]');
+	output = replace(output, /"(public_key|private_key|short_id)"[ \t]*:[ \t]*"[^"]*"/g, '"секрет":"[скрыто]"');
 	return { ok: true, logs: output };
 }
 
 function package_version(name) {
 	let found = capture('/sbin/apk info -v ' + name).output;
-	return split(found, '\n')[0] || '';
+	let line = split(found, '\n')[0] || '';
+	let prefix = name + '-';
+	return index(line, prefix) == 0 ? substr(line, length(prefix)) : line;
+}
+
+function candidate_version(name, line) {
+	let value = split(line || '', /[ \t]+/)[0] || '';
+	let prefix = name + '-';
+	return index(value, prefix) == 0 ? substr(value, length(prefix)) : value;
 }
 
 function updates(refresh) {
@@ -667,8 +858,9 @@ function updates(refresh) {
 				line = candidate;
 		components[name] = {
 			installed: package_version(name),
+			checked: refresh && refresh_code == 0,
 			update_available: refresh && line != '',
-			candidate: line
+			candidate: candidate_version(name, line)
 		};
 	}
 	return { ok: refresh_code == 0, refresh_code: refresh_code, components: components };
@@ -682,8 +874,10 @@ function update_component(name) {
 	if (current.enabled && !current.firewall)
 		return result_error('Обновление запрещено: kill switch не активен');
 
-	for (let path in ['/etc/config/zarap', CONFIG, NFT_CONFIG]) {
+	let backups = {};
+	for (let path in ['/etc/config/zarap', '/etc/config/sing-box', CONFIG, NFT_CONFIG]) {
 		let content = readfile(path);
+		backups[path] = content;
 		if (content != null) {
 			writefile(path + '.bak', content);
 			chmod(path + '.bak', 0600);
@@ -694,36 +888,69 @@ function update_component(name) {
 		system(['/etc/init.d/sing-box', 'stop']);
 
 	let code = system(['/sbin/apk', 'add', '--upgrade', name]);
-	if (code != 0)
-		return result_error('apk не смог обновить ' + name + '; kill switch оставлен активным');
-
-	if (access(CONFIG) && system(['/usr/bin/sing-box', 'check', '-c', CONFIG]) != 0)
-		return result_error('Новая версия sing-box не принимает текущий конфиг; сервис оставлен остановленным');
-
-	if (system(['/etc/init.d/firewall', 'reload']) != 0)
-		return result_error('После обновления firewall4 отклонил правила Zarap');
-
-	if (current.enabled) {
-		if (system(['/etc/init.d/zarap', 'restart']) != 0 || system(['/etc/init.d/sing-box', 'restart']) != 0)
-			return result_error('Пакет обновлён, но сервис не запустился; kill switch оставлен активным');
-		if (system(['/etc/init.d/sing-box', 'running']) != 0)
-			return result_error('Пакет обновлён, но процесс sing-box не работает; kill switch оставлен активным');
+	if (code != 0) {
+		let recovered = name != 'sing-box' || !current.enabled || restore_update_files(backups, true);
+		return result_error('apk не смог обновить ' + name + (recovered ?
+			'; предыдущая конфигурация восстановлена, kill switch активен' :
+			'; восстановление сервиса не удалось, kill switch оставлен активным'), '', 'startup_error');
 	}
 
-	return { ok: true, component: name };
+	if (access(CONFIG) && system(['/usr/bin/sing-box', 'check', '-c', CONFIG]) != 0) {
+		restore_update_files(backups, false);
+		return result_error('Новая версия sing-box не принимает текущий конфиг; файлы восстановлены, сервис остановлен, kill switch активен', '', 'compatibility_error');
+	}
+	if (name == 'luci-app-zarap' && system([
+		'/usr/bin/ucode', '-cdynlink=fs,dynlink=luci.http,dynlink=ubus,dynlink=uci',
+		'-o', '/tmp/zarap-update.uc', '/usr/share/rpcd/ucode/zarap.uc'
+	]) != 0) {
+		restore_update_files(backups, current.enabled);
+		return result_error('Новый код Zarap не прошёл проверку; конфигурационные файлы восстановлены, kill switch активен', '', 'compatibility_error');
+	}
+	unlink('/tmp/zarap-update.uc');
+
+	if (system(['/etc/init.d/firewall', 'reload']) != 0) {
+		restore_update_files(backups, current.enabled);
+		return result_error('После обновления firewall4 отклонил правила; файлы восстановлены, kill switch не отключался', '', 'startup_error');
+	}
+
+	if (current.enabled) {
+		if (system(['/etc/init.d/zarap', 'restart']) != 0 || system(['/etc/init.d/sing-box', 'restart']) != 0) {
+			restore_update_files(backups, true);
+			return result_error('Пакет обновлён, но сервис не запустился; файлы восстановлены, kill switch активен', '', 'startup_error');
+		}
+		let health = check_runtime(true);
+		if (!health.ok) {
+			restore_update_files(backups, true);
+			return result_error('После обновления не прошла проверка процесса, TProxy, nftables или маршрутизации; файлы восстановлены', sprintf('%J', health), 'startup_error');
+		}
+	}
+
+	if (name == 'luci-app-zarap')
+		system('(/bin/sleep 1; /etc/init.d/rpcd restart) >/dev/null 2>&1 &');
+	return { ok: true, component: name, reload_required: name == 'luci-app-zarap' };
 }
 
 const methods = {
 	status: { call: function() { return status(); } },
-	devices: { call: function() { return { ok: true, devices: device_list() }; } },
 	validate: {
 		args: { link: 'string', clients: [] },
 		call: function(request) {
-			let parsed = parse_vless(request.args?.link);
+			let link = trim('' + (request.args?.link || ''));
+			let parsed = link ? parse_vless(link) : { ok: true, config: saved_proxy_config() };
 			if (!parsed.ok) return parsed;
+			if (!parsed.config) return input_error('Для первоначальной проверки вставьте VLESS Reality-ссылку');
 			let clients = validate_clients(request.args?.clients);
 			if (!clients.ok) return clients;
-			return { ok: true, server: parsed.config.server, server_name: parsed.config.server_name, clients: length(clients.clients) };
+			clients = resolve_static_leases(clients.clients);
+			if (!clients.ok) return clients;
+			let conflict = resource_conflict();
+			if (!conflict.ok) return conflict;
+			let candidate = validate_candidate(parsed.config, clients.clients);
+			if (!candidate.ok) return candidate;
+			let uci_candidate = prepare_uci_candidate(parsed.config, true, clients.clients);
+			unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
+			if (!uci_candidate.ok) return uci_candidate;
+			return { ok: true, masked_link: masked_proxy(parsed.config), clients: length(clients.clients) };
 		}
 	},
 	apply: {
@@ -741,13 +968,17 @@ const methods = {
 			let code = system(['/etc/init.d/zarap', 'restart']);
 			if (code == 0)
 				code = system(['/etc/init.d/sing-box', 'restart']);
-			return code == 0 ? { ok: true } : result_error('Не удалось перезапустить Zarap');
+			let health = code == 0 ? check_runtime(true) : { ok: false };
+			return code == 0 && health.ok ? { ok: true, health: health } :
+				result_error('После перезапуска не прошла проверка процесса, TProxy, nftables или маршрутизации', sprintf('%J', health), 'startup_error');
 		}
 	},
 	stop: {
 		call: function() {
 			let code = system(['/etc/init.d/sing-box', 'stop']);
-			return code == 0 ? { ok: true } : result_error('Не удалось остановить Zarap');
+			let firewall = system('/usr/sbin/nft list chain inet fw4 zarap_killswitch_forward >/dev/null 2>&1') == 0;
+			return code == 0 && firewall ? { ok: true, kill_switch: true } :
+				result_error('Не удалось безопасно остановить sing-box с активным kill switch', '', 'startup_error');
 		}
 	},
 	logs: { call: function() { return logs(); } },

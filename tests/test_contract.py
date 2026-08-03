@@ -29,6 +29,7 @@ class PackageContractTests(unittest.TestCase):
 
         self.assertRegex(MAKEFILE, r"LUCI_DEPENDS:=.*\bsing-box\b")
         self.assertNotIn("+sing-box", MAKEFILE)
+        self.assertNotIn("rpcd-mod-iwinfo", MAKEFILE)
 
     def test_json_manifests_are_valid(self):
         for path in (
@@ -42,6 +43,37 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("'luci-app-zarap': true", BACKEND)
         self.assertIn("'sing-box': true", BACKEND)
         self.assertNotIn("apk upgrade", BACKEND)
+
+    def test_rpc_surface_matches_specification(self):
+        methods_body = BACKEND.split("const methods = {", 1)[1]
+        for method in (
+            "status", "validate", "apply", "restart", "stop", "logs",
+            "updates", "update_component",
+        ):
+            self.assertRegex(methods_body, rf"\b{method}:\s*{{")
+        self.assertNotRegex(methods_body, r"\bdevices:\s*{")
+
+    def test_atomic_temporary_files_share_target_directories(self):
+        self.assertIn("const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp'", BACKEND)
+        self.assertIn("const NFT_TMP = '/etc/nftables.d/.90-zarap.nft.tmp'", BACKEND)
+        self.assertIn("const UCI_CANDIDATE = '/etc/config/.zarap-candidate'", BACKEND)
+        self.assertIn("cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA)", BACKEND)
+        self.assertIn("activate_uci_candidate()", BACKEND)
+
+    def test_apply_and_updates_verify_complete_runtime(self):
+        for check in ("running && listener && firewall && rule && route", "check_runtime(enabled)", "check_runtime(true)"):
+            self.assertIn(check, BACKEND)
+        self.assertIn("restore_update_files(backups", BACKEND)
+        self.assertIn("apk не смог обновить", BACKEND)
+        self.assertIn("restore_update_files(backups, true)", BACKEND)
+
+    def test_device_discovery_uses_hostapd_and_dhcp_leases(self):
+        self.assertIn('/bin/ubus list "hostapd.*"', BACKEND)
+        self.assertIn("/tmp/dhcp.leases", BACKEND)
+
+    def test_update_check_is_required_before_update_buttons(self):
+        view = (PACKAGE_ROOT / "htdocs/luci-static/resources/view/zarap/overview.js").read_text()
+        self.assertIn("data.checked && data.update_available", view)
 
     def test_private_mac_detection_covers_locally_administered_bit(self):
         pattern = re.compile(r"^[0-9A-F][2367ABEF]:")

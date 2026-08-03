@@ -3,7 +3,7 @@
 		"description": "Manage Zarap transparent proxy",
 		"read": {
 			"ubus": {
-				"zarap": [ "status", "devices", "validate", "logs", "updates" ]
+				"zarap": [ "status", "validate", "logs", "updates" ]
 			},
 			"uci": [ "zarap", "dhcp", "network" ]
 		},
