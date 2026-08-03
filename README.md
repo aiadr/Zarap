@@ -44,7 +44,7 @@ https://aiadr.github.io/Zarap/packages.adb
 wget -O /tmp/zarap-apk.pem \
   https://aiadr.github.io/Zarap/zarap-apk.pem
 
-echo 'e8e7b1090d190d7039b01afcd84164727923a8b103fcb12e282849d0dd3b2cbb  /tmp/zarap-apk.pem' | sha256sum -c - &&
+echo 'd7ef4639a8fadbd7775e78b6cd394516707bee449cd10c410492fd03bcf00fd1  /tmp/zarap-apk.pem' | sha256sum -c - &&
 mkdir -p /etc/apk/keys &&
 cp /tmp/zarap-apk.pem /etc/apk/keys/zarap-apk.pem &&
 chmod 0644 /etc/apk/keys/zarap-apk.pem &&
