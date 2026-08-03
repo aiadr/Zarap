@@ -89,17 +89,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache OpenWrt SDK archive
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/openwrt-sdk-cache
+          key: openwrt-sdk-x86_64-25.12.4-28e004c1
+
       - name: Build only the Zarap APK
         env:
           SDK_IMAGE: ghcr.io/openwrt/sdk:x86_64-25.12.4@sha256:820d614294e64d048059cfe3dac58049fc0ce621a9d3ac21217c2caafb7d9616
         run: |
-          install -d -m 0777 "${RUNNER_TEMP}/zarap-apk"
+          install -d -m 0777 "${RUNNER_TEMP}/zarap-apk" "${RUNNER_TEMP}/openwrt-sdk-cache"
           docker pull "${SDK_IMAGE}"
           docker run --rm \
             --entrypoint /bin/bash \
             --workdir /builder \
             -v "${GITHUB_WORKSPACE}:/feed:ro" \
             -v "${RUNNER_TEMP}/zarap-apk:/artifacts" \
+            -v "${RUNNER_TEMP}/openwrt-sdk-cache:/sdk-cache" \
             "${SDK_IMAGE}" \
             /feed/.github/scripts/build-zarap-apk.sh
           mkdir -p ci-artifacts
