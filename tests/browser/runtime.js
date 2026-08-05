@@ -65,11 +65,20 @@ function clone(value) {
 const handlers = {
   status: () => clone(fixtures.status),
   logs: () => ({ ok: true, logs: 'sing-box запущен\nUUID: [скрыто]\nReality key: [скрыто]' }),
-  updates: refresh => ({
-    ok: true,
-    refresh_code: 0,
-    components: clone(refresh ? fixtures.refreshedComponents : fixtures.components)
-  }),
+  updates: refresh => (refresh && window.__mockState.updatesError
+    ? {
+      ok: false,
+      error: 'apk не смог обновить списки репозиториев',
+      details: window.__mockState.updatesError,
+      kind: 'operation_error',
+      refresh_code: 1,
+      components: clone(fixtures.components)
+    }
+    : {
+      ok: true,
+      refresh_code: 0,
+      components: clone(refresh ? fixtures.refreshedComponents : fixtures.components)
+    }),
   validate: () => window.__mockState.validateError
 	? { ok: false, error: window.__mockState.validateError, kind: 'input_error' }
     : { ok: true, server: 'proxy.example.test', server_name: 'cdn.example.test', clients: 2 },

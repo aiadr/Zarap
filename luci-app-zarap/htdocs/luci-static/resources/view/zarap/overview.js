@@ -25,10 +25,22 @@ function notify(result, successText) {
 		connection_error: _('Ошибка соединения')
 	};
 	const title = titles[result && result.kind];
-	ui.addNotification(null, E('p', {}, [ title ? E('strong', {}, title + ': ') : '',
-		(result && result.error) || _('Неизвестная ошибка') ]), 'error');
+	const nodes = [ E('p', {}, [ title ? E('strong', {}, title + ': ') : '',
+		(result && result.error) || _('Неизвестная ошибка') ]) ];
+	// Backends attach the underlying tool output here; dropping it left the
+	// user with a bare "unknown error" and nothing to act on.
+	if (result && result.details)
+		nodes.push(E('pre', {
+			'style': 'max-height:12em;overflow:auto;white-space:pre-wrap;margin:.5em 0 0'
+		}, result.details));
+	ui.addNotification(null, nodes, 'error');
 	return false;
 }
+
+// Themes float .important buttons to the far edge, so on a narrow screen an
+// action pair lands on two lines at opposite sides. A flex row keeps them
+// together: float does not apply to flex items.
+const ACTION_ROW = 'display:flex;flex-wrap:wrap;gap:.5em;justify-content:flex-end;align-items:center';
 
 // LuCI is usually served over plain HTTP, where navigator.clipboard does not
 // exist. Fall back to a detached textarea, which still works in that context.
@@ -120,8 +132,8 @@ function updateRow(name, data, owner, runtimeStatus) {
 			'click': ui.createHandlerFn(owner, function() {
 				ui.showModal(_('Подтвердите обновление'), [
 					E('p', {}, _('APK обновит только компонент %s и необходимые ему зависимости.').format(title)),
-					E('div', { 'class': 'right' }, [
-						E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Отмена')), ' ',
+					E('div', { 'class': 'right', 'style': ACTION_ROW }, [
+						E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Отмена')),
 						E('button', {
 							'class': 'btn cbi-button-positive important',
 							'click': ui.createHandlerFn(owner, async function(ev) {
@@ -183,7 +195,7 @@ return view.extend({
 					statusPill(status.firewall, _('kill switch активен'), _('нет правил firewall')),
 					statusPill(status.routing, _('маршрутизация активна'), _('нет policy routing'))
 				]),
-				E('div', { 'class': 'right' }, [
+				E('div', { 'class': 'right', 'style': ACTION_ROW }, [
 					E('button', {
 						'class': 'btn cbi-button-action',
 						'disabled': status.enabled ? null : '',
@@ -192,7 +204,7 @@ return view.extend({
 							if (notify(await callRestart(), _('Zarap перезапущен')))
 								window.location.reload();
 						})
-					}, _('Перезапустить')), ' ',
+					}, _('Перезапустить')),
 					E('button', {
 						'class': 'btn cbi-button-negative',
 						'disabled': status.enabled ? null : '',
@@ -238,14 +250,14 @@ return view.extend({
 					])),
 					E('tbody', {}, devices.length ? devices.map(deviceRow) : E('tr', {}, E('td', { 'colspan': 5 }, _('Устройства пока не обнаружены'))))
 				]),
-				E('div', { 'class': 'cbi-page-actions' }, [
+				E('div', { 'class': 'cbi-page-actions', 'style': ACTION_ROW }, [
 					E('button', {
 						'class': 'btn cbi-button-neutral',
 						'click': ui.createHandlerFn(this, async function() {
 							const link = document.querySelector('#zarap-link').value;
 							notify(await callValidate(link, selectedClients()), _('Ссылка и список устройств корректны'));
 						})
-					}, _('Проверить конфигурацию')), ' ',
+					}, _('Проверить конфигурацию')),
 					E('button', {
 						'class': 'btn cbi-button-save important',
 						'click': ui.createHandlerFn(this, async function(ev) {
@@ -282,7 +294,7 @@ return view.extend({
 						updateRow('sing-box', updates['sing-box'] || {}, this, status)
 					])
 				]),
-				E('p', {}, E('button', {
+				E('div', { 'class': 'right', 'style': ACTION_ROW }, E('button', {
 					'class': 'btn cbi-button-action',
 					'click': ui.createHandlerFn(this, async function(ev) {
 						ev.currentTarget.disabled = true;
@@ -303,7 +315,7 @@ return view.extend({
 
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('Журнал')),
-				E('div', { 'class': 'right' }, [
+				E('div', { 'class': 'right', 'style': ACTION_ROW }, [
 					E('button', {
 						'id': 'zarap-copy-logs',
 						'class': 'btn cbi-button-action',

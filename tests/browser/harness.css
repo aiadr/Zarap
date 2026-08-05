@@ -23,3 +23,10 @@ body { margin: 0; }
 .notification.error { color: #991b1b; background: #fee2e2; }
 #modal { position: fixed; z-index: 20; inset: 20% 25%; padding: 20px; border: 1px solid #64748b; border-radius: 10px; background: #fff; box-shadow: 0 12px 40px #0005; }
 pre { padding: 10px; background: #0f172a; color: #e2e8f0; }
+
+/* Verbatim from luci-theme-bootstrap: everything in a page-actions row that is
+   not one of the listed button kinds is floated left, which is what pulls an
+   action pair to opposite edges. Reproduced so the layout is under test. */
+.cbi-page-actions > :not([method="post"]):not(.cbi-button-apply):not(.cbi-button-negative):not(.cbi-button-save):not(.cbi-button-reset) {
+	float: left;
+}

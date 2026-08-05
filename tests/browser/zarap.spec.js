@@ -111,3 +111,30 @@ test('copies the scrubbed log to the clipboard', async ({ page, context }) => {
   expect(clipboard).toContain('sing-box запущен');
   expect(clipboard).toContain('[скрыто]');
 });
+
+test('shows what apk reported when the update check fails', async ({ page }) => {
+  await openZarap(page);
+  await page.evaluate(() => {
+    window.__mockState.updatesError = 'ERROR: unable to select packages: no repositories available';
+  });
+
+  await page.getByRole('button', { name: 'Проверить обновления' }).click();
+
+  await expect(page.getByText('apk не смог обновить списки репозиториев')).toBeVisible();
+  await expect(page.getByText('no repositories available')).toBeVisible();
+  await expect(page.getByText('Неизвестная ошибка')).toHaveCount(0);
+});
+
+test('keeps an action pair aligned instead of at opposite edges', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openZarap(page);
+
+  const check = page.getByRole('button', { name: 'Проверить конфигурацию', exact: true });
+  const apply = page.getByRole('button', { name: 'Сохранить и применить' });
+  const checkBox = await check.boundingBox();
+  const applyBox = await apply.boundingBox();
+
+  // The theme floats the neutral button left while the save button stays
+  // right-aligned; both must end up against the same edge instead.
+  expect(Math.abs(checkBox.x + checkBox.width - (applyBox.x + applyBox.width))).toBeLessThan(2);
+});

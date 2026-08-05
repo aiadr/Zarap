@@ -844,11 +844,19 @@ function logs() {
 	return { ok: true, logs: output };
 }
 
+// apk 3 answers `info -v` with description lines ("name: summary"), never a
+// version, so the installed version has to come from `list -I`, which prints
+// "<name>-<version> <arch> {origin} (license) [installed]" — the same shape
+// the upgradable listing uses.
 function package_version(name) {
-	let found = capture('/usr/bin/apk info -v ' + name).output;
-	let line = split(found, '\n')[0] || '';
+	let found = capture('/usr/bin/apk list -I ' + name + ' 2>/dev/null').output;
 	let prefix = name + '-';
-	return index(line, prefix) == 0 ? substr(line, length(prefix)) : line;
+	for (let line in split(found, '\n')) {
+		let value = split(trim(line), /[ \t]+/)[0] || '';
+		if (index(value, prefix) == 0)
+			return substr(value, length(prefix));
+	}
+	return '';
 }
 
 function candidate_version(name, line) {
@@ -858,10 +866,15 @@ function candidate_version(name, line) {
 }
 
 function updates(refresh) {
-	let refresh_code = 0;
-	if (refresh)
-		refresh_code = system(['/usr/bin/apk', 'update']);
-	let upgradeable = capture('/usr/bin/apk list --upgradable').output;
+	let refresh_code = 0, refresh_output = '';
+	if (refresh) {
+		// Keep apk's own message: an exit code alone leaves the user with
+		// nothing to act on when a repository or its key is misconfigured.
+		let refreshed = capture('/usr/bin/apk update 2>&1');
+		refresh_code = refreshed.code;
+		refresh_output = refreshed.output;
+	}
+	let upgradeable = capture('/usr/bin/apk list --upgradable 2>/dev/null').output;
 	let components = {};
 	for (let name in keys(COMPONENTS)) {
 		let line = '';
@@ -875,7 +888,16 @@ function updates(refresh) {
 			candidate: candidate_version(name, line)
 		};
 	}
-	return { ok: refresh_code == 0, refresh_code: refresh_code, components: components };
+	if (refresh_code != 0)
+		return {
+			ok: false,
+			error: 'apk не смог обновить списки репозиториев',
+			details: refresh_output,
+			kind: 'operation_error',
+			refresh_code: refresh_code,
+			components: components
+		};
+	return { ok: true, refresh_code: refresh_code, components: components };
 }
 
 function update_component(name) {

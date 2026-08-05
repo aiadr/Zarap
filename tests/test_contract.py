@@ -53,6 +53,12 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("function unmanaged_sing_box()", BACKEND)
         self.assertIn("не под управлением Zarap", BACKEND)
 
+    def test_installed_version_is_read_from_a_listing(self):
+        # apk 3's `info -v` prints description lines, never a version, so the
+        # installed version has to be parsed out of `list -I`.
+        self.assertNotIn("apk info -v", BACKEND)
+        self.assertIn("/usr/bin/apk list -I ", BACKEND)
+
     def test_json_manifests_are_valid(self):
         for path in (
             PACKAGE_ROOT / "root/usr/share/luci/menu.d/luci-app-zarap.json",
