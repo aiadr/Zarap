@@ -24,6 +24,19 @@ function notify(result, successText) {
 		startup_error: _('Ошибка запуска'),
 		connection_error: _('Ошибка соединения')
 	};
+	// A failed ubus call does not reject: rpc.declare resolves with the bare
+	// status code, which has no ok/error/kind and used to render as the
+	// useless "Неизвестная ошибка".
+	if (result == null || typeof result != 'object') {
+		const status = typeof result == 'number'
+			? '%s (%d)'.format(rpc.getStatusText(result), result)
+			: _('роутер не ответил');
+		ui.addNotification(null, E('p', {}, [
+			E('strong', {}, _('Запрос к роутеру не выполнен') + ': '), status
+		]), 'error');
+		return false;
+	}
+
 	const title = titles[result && result.kind];
 	const nodes = [ E('p', {}, [ title ? E('strong', {}, title + ': ') : '',
 		(result && result.error) || _('Неизвестная ошибка') ]) ];

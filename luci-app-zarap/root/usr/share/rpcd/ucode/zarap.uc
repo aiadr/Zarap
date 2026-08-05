@@ -16,6 +16,9 @@ const UCI_CANDIDATE = '/etc/config/.zarap-candidate';
 const UCI_CANDIDATE_DELTA = '/tmp/.zarap-uci';
 const UCI_CONFIGS = ['zarap', 'dhcp', 'sing-box'];
 const COMPONENTS = { 'luci-app-zarap': true, 'sing-box': true };
+// Kept under the LuCI RPC deadline so a slow mirror reports a reason instead
+// of the call dying and surfacing as a bare ubus status code.
+const REFRESH_TIMEOUT = 15;
 const LOCK_FILE = '/var/lock/zarap.lock';
 
 function result_error(message, details, kind) {
@@ -870,7 +873,9 @@ function updates(refresh) {
 	if (refresh) {
 		// Keep apk's own message: an exit code alone leaves the user with
 		// nothing to act on when a repository or its key is misconfigured.
-		let refreshed = capture('/usr/bin/apk update 2>&1');
+		// LuCI drops the call after L.env.rpctimeout (20s by default) and the
+		// view then only sees a ubus status code. Give up first, with a reason.
+		let refreshed = capture('timeout ' + REFRESH_TIMEOUT + ' /usr/bin/apk update 2>&1');
 		refresh_code = refreshed.code;
 		refresh_output = refreshed.output;
 	}
@@ -891,7 +896,9 @@ function updates(refresh) {
 	if (refresh_code != 0)
 		return {
 			ok: false,
-			error: 'apk не смог обновить списки репозиториев',
+			error: refresh_code == 124 ?
+				sprintf('Обновление списков репозиториев не уложилось в %d с и было прервано', REFRESH_TIMEOUT) :
+				'apk не смог обновить списки репозиториев',
 			details: refresh_output,
 			kind: 'operation_error',
 			refresh_code: refresh_code,

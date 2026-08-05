@@ -138,3 +138,15 @@ test('keeps an action pair aligned instead of at opposite edges', async ({ page 
   // right-aligned; both must end up against the same edge instead.
   expect(Math.abs(checkBox.x + checkBox.width - (applyBox.x + applyBox.width))).toBeLessThan(2);
 });
+
+test('names the failure when the update RPC itself does not complete', async ({ page }) => {
+  await openZarap(page);
+  // A failed ubus call resolves with the status code, not an object.
+  await page.evaluate(() => { window.__mockState.updatesRpcStatus = 7; });
+
+  await page.getByRole('button', { name: 'Проверить обновления' }).click();
+
+  await expect(page.getByText('Запрос к роутеру не выполнен')).toBeVisible();
+  await expect(page.getByText(/Timeout \(7\)/)).toBeVisible();
+  await expect(page.getByText('Неизвестная ошибка')).toHaveCount(0);
+});

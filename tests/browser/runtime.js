@@ -65,7 +65,9 @@ function clone(value) {
 const handlers = {
   status: () => clone(fixtures.status),
   logs: () => ({ ok: true, logs: 'sing-box запущен\nUUID: [скрыто]\nReality key: [скрыто]' }),
-  updates: refresh => (refresh && window.__mockState.updatesError
+  updates: refresh => (refresh && window.__mockState.updatesRpcStatus != null
+    ? window.__mockState.updatesRpcStatus
+    : refresh && window.__mockState.updatesError
     ? {
       ok: false,
       error: 'apk не смог обновить списки репозиториев',
@@ -93,6 +95,10 @@ const handlers = {
 };
 
 window.rpc = {
+  getStatusText(code) {
+    return ({ 6: 'Permission denied', 7: 'Timeout' })[code] || 'Unknown error';
+  },
+
   declare(definition) {
     return async (...args) => {
       window.__rpcCalls.push({ object: definition.object, method: definition.method, args: clone(args) });
