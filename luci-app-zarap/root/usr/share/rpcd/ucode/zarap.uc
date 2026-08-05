@@ -765,6 +765,16 @@ function device_list() {
 	return result;
 }
 
+// True while the sing-box service runs on somebody else's configuration. Its
+// failures then belong to that configuration, not to Zarap, and saying so keeps
+// a crash-looping package default from reading as a Zarap fault.
+function unmanaged_sing_box() {
+	let uci = cursor();
+	uci.load('sing-box');
+	return (uci.get('sing-box', 'main', 'conffile') || '') != CONFIG &&
+		uci.get('sing-box', 'main', 'enabled') == '1';
+}
+
 function status() {
 	let uci = cursor();
 	uci.load('zarap');
@@ -774,7 +784,9 @@ function status() {
 	let state = 'disabled', message = 'Zarap выключен';
 	if (!configured) {
 		state = 'not_configured';
-		message = 'Прокси ещё не настроен';
+		message = unmanaged_sing_box() ?
+			'Прокси ещё не настроен: вставьте VLESS Reality-ссылку. Служба sing-box сейчас работает не под управлением Zarap, со своей конфигурацией — её ошибки в журнале к Zarap не относятся' :
+			'Прокси ещё не настроен: вставьте VLESS Reality-ссылку и включите Zarap';
 	}
 	else if (access(CONFIG) && system(['/usr/bin/sing-box', 'check', '-c', CONFIG]) != 0) {
 		state = 'compatibility_error';
@@ -833,7 +845,7 @@ function logs() {
 }
 
 function package_version(name) {
-	let found = capture('/sbin/apk info -v ' + name).output;
+	let found = capture('/usr/bin/apk info -v ' + name).output;
 	let line = split(found, '\n')[0] || '';
 	let prefix = name + '-';
 	return index(line, prefix) == 0 ? substr(line, length(prefix)) : line;
@@ -848,8 +860,8 @@ function candidate_version(name, line) {
 function updates(refresh) {
 	let refresh_code = 0;
 	if (refresh)
-		refresh_code = system(['/sbin/apk', 'update']);
-	let upgradeable = capture('/sbin/apk list --upgradable').output;
+		refresh_code = system(['/usr/bin/apk', 'update']);
+	let upgradeable = capture('/usr/bin/apk list --upgradable').output;
 	let components = {};
 	for (let name in keys(COMPONENTS)) {
 		let line = '';
@@ -887,7 +899,7 @@ function update_component(name) {
 	if (name == 'sing-box')
 		system(['/etc/init.d/sing-box', 'stop']);
 
-	let code = system(['/sbin/apk', 'add', '--upgrade', name]);
+	let code = system(['/usr/bin/apk', 'add', '--upgrade', name]);
 	if (code != 0) {
 		let recovered = name != 'sing-box' || !current.enabled || restore_update_files(backups, true);
 		return result_error('apk не смог обновить ' + name + (recovered ?

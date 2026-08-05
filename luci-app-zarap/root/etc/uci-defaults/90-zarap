@@ -4,6 +4,25 @@ chmod 0600 /etc/config/zarap 2>/dev/null
 mkdir -p /etc/zarap /tmp/zarap
 chmod 0700 /etc/zarap
 
+# Installing Zarap pulls in sing-box, which ships an enabled service and the
+# upstream example /etc/sing-box/config.json. Current sing-box refuses to start
+# on that example, so procd respawns it in a crash loop before Zarap has any
+# configuration of its own to apply. Park the service through the same uci flag
+# Zarap sets when it applies, so applying hands control back on its own.
+#
+# Only the untouched package default is parked: a sing-box pointed at somebody
+# else's configuration, or already pointed at Zarap's, is left alone.
+zarap_conf=/etc/zarap/sing-box.json
+singbox_conf="$(uci -q get sing-box.main.conffile)"
+
+if [ -f /etc/config/sing-box ] && [ ! -s "$zarap_conf" ] &&
+	[ "$singbox_conf" != "$zarap_conf" ] &&
+	{ [ -z "$singbox_conf" ] || [ "$singbox_conf" = /etc/sing-box/config.json ]; }; then
+	/etc/init.d/sing-box stop 2>/dev/null
+	uci -q set sing-box.main.enabled='0' && uci -q commit sing-box
+	logger -t zarap "sing-box service parked: package default configuration, waiting for Zarap to apply its own"
+fi
+
 /etc/init.d/rpcd restart 2>/dev/null
 /etc/init.d/firewall reload 2>/dev/null
 

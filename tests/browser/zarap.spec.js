@@ -99,3 +99,15 @@ test('refreshes both components and confirms each update separately', async ({ p
   expect(update.args).toEqual(['luci-app-zarap']);
   expect(calls.filter(call => call.method === 'updates' && call.args[0] === true)).toHaveLength(1);
 });
+
+test('copies the scrubbed log to the clipboard', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await openZarap(page);
+
+  await page.getByRole('button', { name: 'Скопировать журнал' }).click();
+  await expect(page.getByText('Журнал скопирован в буфер обмена')).toBeVisible();
+
+  const clipboard = await page.evaluate(() => navigator.clipboard.readText());
+  expect(clipboard).toContain('sing-box запущен');
+  expect(clipboard).toContain('[скрыто]');
+});

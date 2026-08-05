@@ -9,6 +9,7 @@ PACKAGE_ROOT = ROOT / "luci-app-zarap"
 BACKEND = (PACKAGE_ROOT / "root/usr/share/rpcd/ucode/zarap.uc").read_text()
 NFT = (PACKAGE_ROOT / "root/etc/nftables.d/90-zarap.nft").read_text()
 MAKEFILE = (PACKAGE_ROOT / "Makefile").read_text()
+UCI_DEFAULTS = (PACKAGE_ROOT / "root/etc/uci-defaults/90-zarap").read_text()
 
 
 class PackageContractTests(unittest.TestCase):
@@ -24,12 +25,33 @@ class PackageContractTests(unittest.TestCase):
             "kmod-nft-tproxy",
             "kmod-nft-socket",
             "ip-full",
+            "ss",
         ):
             self.assertIn(f"+{package}", MAKEFILE)
 
         self.assertRegex(MAKEFILE, r"LUCI_DEPENDS:=.*\bsing-box\b")
         self.assertNotIn("+sing-box", MAKEFILE)
         self.assertNotIn("rpcd-mod-iwinfo", MAKEFILE)
+
+    def test_external_binaries_use_their_installed_paths(self):
+        # OpenWrt installs apk as /usr/bin/apk; /sbin/apk does not exist, and
+        # calling it silently fails every update check.
+        self.assertNotIn("/sbin/apk", BACKEND)
+        for path in ("/usr/bin/apk", "/usr/sbin/ss", "/usr/sbin/nft", "/usr/bin/sing-box"):
+            self.assertIn(path, BACKEND)
+
+    def test_install_parks_only_the_default_sing_box(self):
+        # The package default is parked through the same uci flag apply sets,
+        # so applying a configuration hands the service back automatically.
+        self.assertIn("uci -q set sing-box.main.enabled='0'", UCI_DEFAULTS)
+        self.assertIn("/etc/sing-box/config.json", UCI_DEFAULTS)
+        self.assertIn('"$singbox_conf" != "$zarap_conf"', UCI_DEFAULTS)
+        self.assertNotIn("sing-box disable", UCI_DEFAULTS)
+        self.assertIn("uci.set('sing-box', 'main', 'enabled', enabled ? '1' : '0')", BACKEND)
+
+    def test_status_separates_an_unmanaged_sing_box(self):
+        self.assertIn("function unmanaged_sing_box()", BACKEND)
+        self.assertIn("не под управлением Zarap", BACKEND)
 
     def test_json_manifests_are_valid(self):
         for path in (

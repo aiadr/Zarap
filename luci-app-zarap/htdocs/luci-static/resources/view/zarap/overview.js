@@ -30,6 +30,31 @@ function notify(result, successText) {
 	return false;
 }
 
+// LuCI is usually served over plain HTTP, where navigator.clipboard does not
+// exist. Fall back to a detached textarea, which still works in that context.
+function copyToClipboard(text) {
+	if (window.isSecureContext && navigator.clipboard)
+		return navigator.clipboard.writeText(text);
+
+	const area = E('textarea', {
+		'readonly': '',
+		'style': 'position:fixed;top:-1000px;left:-1000px;opacity:0'
+	});
+	area.value = text;
+	document.body.appendChild(area);
+	area.select();
+	area.setSelectionRange(0, text.length);
+	let copied = false;
+	try {
+		copied = document.execCommand('copy');
+	}
+	catch (e) {
+		copied = false;
+	}
+	document.body.removeChild(area);
+	return copied ? Promise.resolve() : Promise.reject(new Error('execCommand'));
+}
+
 function statusPill(ok, yesText, noText) {
 	return E('span', {
 		'class': ok ? 'label success' : 'label warning',
@@ -278,6 +303,25 @@ return view.extend({
 
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('Журнал')),
+				E('div', { 'class': 'right' }, [
+					E('button', {
+						'id': 'zarap-copy-logs',
+						'class': 'btn cbi-button-action',
+						'disabled': logs ? null : '',
+						'title': logs ? _('Секреты в журнале уже скрыты') : _('Журнал пуст'),
+						// Not ui.createHandlerFn: the fallback copy must run inside the
+						// click gesture, which an async wrapper would lose.
+						'click': function(ev) {
+							const button = ev.currentTarget;
+							copyToClipboard(logs).then(function() {
+								ui.addNotification(null, E('p', {}, _('Журнал скопирован в буфер обмена')), 'info');
+							}, function() {
+								ui.addNotification(null, E('p', {}, _('Не удалось скопировать журнал. Выделите текст и скопируйте вручную.')), 'error');
+							});
+							button.blur();
+						}
+					}, _('Скопировать журнал'))
+				]),
 				E('pre', { 'style': 'max-height:24em;overflow:auto;white-space:pre-wrap' }, logs || _('Записей пока нет'))
 			])
 		]);
