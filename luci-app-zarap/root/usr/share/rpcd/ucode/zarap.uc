@@ -971,10 +971,13 @@ function update_component(name) {
 	return { ok: true, component: name, reload_required: name == 'luci-app-zarap' };
 }
 
+// rpcd builds each ubus policy from the *type* of the sample value given
+// here, so a type name like 'bool' declares a string argument and the real
+// boolean call is rejected with UBUS_STATUS_INVALID_ARGUMENT.
 const methods = {
 	status: { call: function() { return status(); } },
 	validate: {
-		args: { link: 'string', clients: [] },
+		args: { link: '', clients: [] },
 		call: function(request) {
 			let link = trim('' + (request.args?.link || ''));
 			let parsed = link ? parse_vless(link) : { ok: true, config: saved_proxy_config() };
@@ -995,7 +998,7 @@ const methods = {
 		}
 	},
 	apply: {
-		args: { link: 'string', enabled: 'bool', clients: [] },
+		args: { link: '', enabled: true, clients: [] },
 		call: function(request) {
 			let lock = acquire_lock();
 			if (!lock) return result_error('Другая операция Zarap уже выполняется');
@@ -1024,7 +1027,7 @@ const methods = {
 	},
 	logs: { call: function() { return logs(); } },
 	updates: {
-		args: { refresh: 'bool' },
+		args: { refresh: true },
 		call: function(request) {
 			let refresh = !!request.args?.refresh;
 			if (!refresh) return updates(false);
@@ -1036,7 +1039,7 @@ const methods = {
 		}
 	},
 	update_component: {
-		args: { name: 'string' },
+		args: { name: '' },
 		call: function(request) {
 			let name = request.args?.name || '';
 			let lock = acquire_lock();

@@ -81,6 +81,16 @@ class PackageContractTests(unittest.TestCase):
             self.assertRegex(methods_body, rf"\b{method}:\s*{{")
         self.assertNotRegex(methods_body, r"\bdevices:\s*{")
 
+    def test_rpc_args_declare_types_by_sample_value(self):
+        # rpcd builds the ubus policy from the type of each args value, so a
+        # type name such as 'bool' declares a string and makes the real call
+        # fail with UBUS_STATUS_INVALID_ARGUMENT.
+        methods_body = BACKEND.split("const methods = {", 1)[1]
+        for type_name in ("'bool'", "'string'", "'number'", "'array'", "'boolean'"):
+            self.assertNotIn(type_name, methods_body)
+        self.assertIn("args: { refresh: true }", methods_body)
+        self.assertIn("args: { link: '', enabled: true, clients: [] }", methods_body)
+
     def test_atomic_temporary_files_share_target_directories(self):
         self.assertIn("const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp'", BACKEND)
         self.assertIn("const NFT_TMP = '/etc/nftables.d/.90-zarap.nft.tmp'", BACKEND)
