@@ -59,6 +59,16 @@ class PackageContractTests(unittest.TestCase):
         self.assertNotIn("apk info -v", BACKEND)
         self.assertIn("/usr/bin/apk list -I ", BACKEND)
 
+    def test_external_commands_use_absolute_paths(self):
+        # A bare applet name is not guaranteed to exist — BusyBox builds leave
+        # applets out, which is how a `timeout` wrapper broke the update check.
+        # This only checks the leading command, not ones inside a pipeline.
+        commands = re.findall(r"(?:capture|system)\(\s*\[?\s*'([^']+)'", BACKEND)
+        self.assertTrue(commands)
+        for command in commands:
+            leading = command.lstrip("( \t")
+            self.assertTrue(leading.startswith("/"), f"not an absolute path: {command}")
+
     def test_json_manifests_are_valid(self):
         for path in (
             PACKAGE_ROOT / "root/usr/share/luci/menu.d/luci-app-zarap.json",
