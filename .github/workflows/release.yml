@@ -2,58 +2,113 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
 
+# Releases must not overlap: the version number is derived from the releases
+# that already exist, so two concurrent runs would compute the same one.
 concurrency:
   group: zarap-release
   cancel-in-progress: false
 
+env:
+  # Number of package versions kept in the signed repository index.
+  INDEX_DEPTH: 10
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Verify tag and signing key
+      - name: Compute version and verify signing key
         id: version
         env:
+          GH_TOKEN: ${{ github.token }}
           PRIVATE_KEY: ${{ secrets.ZARAP_APK_PRIVATE_KEY }}
         run: |
           test -n "$PRIVATE_KEY" || { echo "ZARAP_APK_PRIVATE_KEY is not configured" >&2; exit 1; }
-          version="$(sed -n 's/^PKG_VERSION:=//p' luci-app-zarap/Makefile)"
-          test "${GITHUB_REF_NAME}" = "v${version}" || {
-            echo "Tag ${GITHUB_REF_NAME} does not match Makefile version ${version}" >&2
-            exit 1
-          }
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Build signed APK
-        uses: openwrt/gh-action-sdk@797d0e3d0eb13b355c3447f60d0179d4b43089e2
+          version="$(date -u +%Y.%m.%d)"
+
+          # Several commits can land on the same day, so the package release
+          # number continues from the highest one already published for today.
+          highest=0
+          for tag in $(gh release list --limit 100 --json tagName --jq '.[].tagName'); do
+            case "$tag" in
+              "v${version}-r"*) ;;
+              *) continue ;;
+            esac
+            candidate="${tag##*-r}"
+            case "$candidate" in
+              ''|*[!0-9]*) continue ;;
+            esac
+            if [ "$candidate" -gt "$highest" ]; then
+              highest="$candidate"
+            fi
+          done
+          release=$((highest + 1))
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release=${release}" >> "$GITHUB_OUTPUT"
+          echo "Building luci-app-zarap-${version}-r${release}"
+
+      - name: Stamp package version
         env:
-          ARCH: x86_64-25.12.4
-          PACKAGES: luci-app-zarap
-          PRIVATE_KEY: ${{ secrets.ZARAP_APK_PRIVATE_KEY }}
-          V: s
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE: ${{ steps.version.outputs.release }}
+        run: |
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${VERSION}/" luci-app-zarap/Makefile
+          sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=${RELEASE}/" luci-app-zarap/Makefile
+          test "$(sed -n 's/^PKG_VERSION:=//p' luci-app-zarap/Makefile)" = "${VERSION}"
+          test "$(sed -n 's/^PKG_RELEASE:=//p' luci-app-zarap/Makefile)" = "${RELEASE}"
+
+      # Signing is not part of packaging: in the APK path CONFIG_SIGNED_PACKAGES
+      # only reaches `apk mkndx --sign`, so the published repository is signed by
+      # the index step below. That lets releases reuse the same cached-SDK build
+      # as CI instead of provisioning a fresh SDK on every commit.
+      - name: Cache OpenWrt SDK archive
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/openwrt-sdk-cache
+          key: openwrt-sdk-x86_64-25.12.4-28e004c1
+
+      - name: Build only the Zarap APK
+        env:
+          SDK_IMAGE: ghcr.io/openwrt/sdk:x86_64-25.12.4@sha256:820d614294e64d048059cfe3dac58049fc0ce621a9d3ac21217c2caafb7d9616
+        run: |
+          install -d -m 0777 "${RUNNER_TEMP}/zarap-apk" "${RUNNER_TEMP}/openwrt-sdk-cache"
+          docker pull "${SDK_IMAGE}"
+          docker run --rm \
+            --entrypoint /bin/bash \
+            --workdir /builder \
+            -v "${GITHUB_WORKSPACE}:/feed:ro" \
+            -v "${RUNNER_TEMP}/zarap-apk:/artifacts" \
+            -v "${RUNNER_TEMP}/openwrt-sdk-cache:/sdk-cache" \
+            "${SDK_IMAGE}" \
+            /feed/.github/scripts/build-zarap-apk.sh
 
       - name: Collect current and historical APKs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p dist current
-          find bin -type f -name 'luci-app-zarap-*.apk' -exec cp -v '{}' current/ ';'
+          cp -v "${RUNNER_TEMP}"/zarap-apk/luci-app-zarap-*.apk current/
           test "$(find current -type f -name '*.apk' | wc -l)" -eq 1
           cp current/*.apk dist/
-          gh release list --limit 100 --json tagName --jq '.[].tagName' | while read -r tag; do
+          # The current build occupies one slot of the index.
+          gh release list --limit "$((INDEX_DEPTH - 1))" --json tagName --jq '.[].tagName' | while read -r tag; do
             gh release download "$tag" --pattern 'luci-app-zarap-*-r*.apk' --dir dist --clobber || true
           done
 
@@ -85,18 +140,14 @@ jobs:
         uses: actions/upload-pages-artifact@v4
         with:
           path: dist/
+          retention-days: 30
 
-  publish:
+  release:
     needs: build
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.pages.outputs.page_url }}
+    permissions:
+      contents: write
     steps:
-      - name: Deploy signed APK repository
-        id: pages
-        uses: actions/deploy-pages@v4
-
       - name: Download release files
         uses: actions/download-artifact@v4
         with:
@@ -107,11 +158,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.build.outputs.version }}
+          RELEASE: ${{ needs.build.outputs.release }}
         run: |
-          versioned="$(find dist -maxdepth 1 -type f -name "luci-app-zarap-${VERSION}-r*.apk" -print -quit)"
-          test -n "$versioned"
-          gh release create "v${VERSION}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "Zarap v${VERSION}" \
-            --generate-notes \
-            "$versioned" dist/luci-app-zarap.apk dist/SHA256SUMS dist/zarap-apk.pem
+          full="${VERSION}-r${RELEASE}"
+          versioned="dist/luci-app-zarap-${full}.apk"
+          test -f "$versioned"
+          set -- "$versioned" dist/luci-app-zarap.apk dist/SHA256SUMS dist/zarap-apk.pem
+          if gh release view "v${full}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "v${full}" --repo "${GITHUB_REPOSITORY}" --clobber "$@"
+          else
+            gh release create "v${full}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "Zarap ${full}" \
+              --generate-notes \
+              "$@"
+          fi
+
+  pages:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - name: Deploy signed APK repository
+        id: pages
+        uses: actions/deploy-pages@v4
