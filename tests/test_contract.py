@@ -125,8 +125,12 @@ class PackageContractTests(unittest.TestCase):
         # repopulate them and then read back what the kernel actually holds.
         self.assertIn("function sync_live_sets(", BACKEND)
         self.assertIn("function live_clients_match(", BACKEND)
-        self.assertIn("nft flush set inet fw4 ", BACKEND)
-        self.assertIn("!sync_live_sets(live_clients) || !live_clients_match(live_clients)", BACKEND)
+        self.assertIn("flush set inet fw4 ", BACKEND)
+        # One transaction, and nft's own message has to reach the caller: an
+        # earlier version sent it to /dev/null and left a failure unexplained.
+        self.assertIn("/usr/sbin/nft -f ' + NFT_SYNC + ' 2>&1", BACKEND)
+        self.assertIn("synced.output", BACKEND)
+        self.assertIn("!synced.ok || !live_clients_match(live_clients)", BACKEND)
         # The rollback path has to converge the kernel too.
         self.assertIn("sync_live_sets(read_clients())", BACKEND)
 

@@ -12,6 +12,7 @@ const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp';
 const NFT_CONFIG = '/etc/nftables.d/90-zarap.nft';
 const NFT_TMP = '/etc/nftables.d/.90-zarap.nft.tmp';
 const NFT_CHECK = '/tmp/zarap-nft-check.conf';
+const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
 const UCI_CANDIDATE = '/etc/config/.zarap-candidate';
 const UCI_CANDIDATE_DELTA = '/tmp/.zarap-uci';
 const UCI_CONFIGS = ['zarap', 'dhcp', 'sing-box'];
@@ -632,15 +633,21 @@ function sync_live_sets(clients) {
 		zarap_direct_v4: direct.v4,
 		zarap_direct_v6: direct.v6
 	};
+
+	// One transaction, so the sets never sit half-updated, and the output is
+	// kept: swallowing nft's message here left a failure with nothing to act on.
+	let script = '';
 	for (let name, elements in wanted) {
-		if (system('/usr/sbin/nft flush set inet fw4 ' + name + ' >/dev/null 2>&1') != 0)
-			return false;
-		if (length(elements) &&
-			system('/usr/sbin/nft add element inet fw4 ' + name +
-				' { ' + join(', ', elements) + ' } >/dev/null 2>&1') != 0)
-			return false;
+		script += 'flush set inet fw4 ' + name + '\n';
+		if (length(elements))
+			script += 'add element inet fw4 ' + name + ' { ' + join(', ', elements) + ' }\n';
 	}
-	return true;
+	if (writefile(NFT_SYNC, script) == null)
+		return { ok: false, output: 'не удалось записать ' + NFT_SYNC };
+
+	let applied = capture('/usr/sbin/nft -f ' + NFT_SYNC + ' 2>&1');
+	unlink(NFT_SYNC);
+	return { ok: applied.code == 0, output: applied.output };
 }
 
 // Reads back what the kernel holds, so an apply cannot report success while the
@@ -667,8 +674,11 @@ function rollback(backups) {
 	unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
 	if (system(['/etc/init.d/firewall', 'reload']) != 0) ok = false;
 	// The restored selection keeps its kill switch whatever the master switch says.
-	if (!sync_live_sets(read_clients()))
+	let resynced = sync_live_sets(read_clients());
+	if (!resynced.ok) {
+		system('/usr/bin/logger -t zarap "nft sync failed during rollback: ' + replace(resynced.output, /"/g, "'") + '"');
 		ok = false;
+	}
 	if (system(['/etc/init.d/dnsmasq', 'restart']) != 0) ok = false;
 	if (system(['/etc/init.d/zarap', 'restart']) != 0) ok = false;
 	if (system(['/etc/init.d/sing-box', 'restart']) != 0) ok = false;
@@ -794,10 +804,12 @@ function apply_configuration(args) {
 	// Selected devices stay in the sets even with Zarap switched off; releasing
 	// one means deselecting it, which is the only thing that opens its WAN path.
 	let live_clients = client_result.clients;
-	if (!sync_live_sets(live_clients) || !live_clients_match(live_clients)) {
+	let synced = sync_live_sets(live_clients);
+	if (!synced.ok || !live_clients_match(live_clients)) {
 		let restored = rollback(backups);
 		return result_error(restored ? 'Правила firewall в ядре не совпали с сохранёнными; восстановлена предыдущая конфигурация' :
-			'Критическая ошибка синхронизации правил и rollback; kill switch оставлен активным', '', 'startup_error');
+			'Критическая ошибка синхронизации правил и rollback; kill switch оставлен активным',
+			synced.output, 'startup_error');
 	}
 
 	let service_code;

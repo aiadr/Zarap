@@ -154,6 +154,66 @@ class NftRulesTests(unittest.TestCase):
             subprocess.run(self.nft_command + ["delete", "table", *table],
                            capture_output=True, text=True)
 
+    def test_the_sync_script_is_a_valid_nft_transaction(self):
+        """The apply path drives the live sets through this script.
+
+        Rendered by the real sync_live_sets and then handed to nft, with the
+        table renamed so nothing belonging to the firewall is touched.
+        """
+        stubs = UBUS_STUB + """
+let captured = '';
+function writefile(path, text) { captured = text; return length(text); }
+function capture(command) { print(captured); return { code: 0, output: '' }; }
+function unlink(path) { return true; }
+const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
+"""
+        script = "%s\n%s\nsync_live_sets(%s);\n" % (
+            stubs,
+            "\n".join(lift(BACKEND.read_text(), name)
+                       for name in ("valid_ipv4", "network_v4", "direct_networks",
+                                    "sync_live_sets")),
+            CLIENTS)
+        with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run([self.ucode, path], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            rendered = done.stdout
+        finally:
+            os.unlink(path)
+
+        self.assertIn("flush set inet fw4 zarap_clients_v4", rendered)
+        self.assertIn("192.168.10.167", rendered)
+        self.assertIn("192.168.10.0/24", rendered)
+
+        table = ["inet", "zarap_selftest"]
+        setup = ("table inet zarap_selftest {\n"
+                 "\tset zarap_clients_v4 { type ipv4_addr\n\t}\n"
+                 "\tset zarap_clients_mac { type ether_addr\n\t}\n"
+                 "\tset zarap_direct_v4 { type ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n\t}\n"
+                 "\tset zarap_direct_v6 { type ipv6_addr\n\t\tflags interval\n\t\tauto-merge\n\t}\n}\n")
+
+        def run(text, *args):
+            with tempfile.NamedTemporaryFile("w", suffix=".nft", delete=False) as handle:
+                handle.write(text)
+                path = handle.name
+            try:
+                return subprocess.run(self.nft_command + [*args, "-f", path],
+                                      capture_output=True, text=True)
+            finally:
+                os.unlink(path)
+
+        subprocess.run(self.nft_command + ["delete", "table", *table],
+                       capture_output=True, text=True)
+        try:
+            self.assertEqual(run(setup).returncode, 0)
+            done = run(rendered.replace("inet fw4", "inet zarap_selftest"))
+            self.assertEqual(done.returncode, 0, done.stderr)
+        finally:
+            subprocess.run(self.nft_command + ["delete", "table", *table],
+                           capture_output=True, text=True)
+
     def test_generated_sets_carry_the_client_data(self):
         ruleset = self.generate()
         self.assertIn("192.168.10.167", ruleset)
