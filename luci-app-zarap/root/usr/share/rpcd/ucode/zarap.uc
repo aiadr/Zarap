@@ -253,6 +253,25 @@ function network_v4(address, mask) {
 	return join('.', output) + '/' + mask;
 }
 
+// True when a CIDR already falls inside one of the entries. The LAN discovered
+// over ubus is normally inside the RFC1918 ranges listed below, and an interval
+// set rejects overlapping elements. auto-merge would absorb them, but a set
+// created before that flag was added keeps its old definition through every
+// reload, so the overlap has to be avoided rather than merged away.
+function v4_covered(cidr, entries) {
+	let parts = split(cidr, '/');
+	let mask = length(parts) > 1 ? int(parts[1]) : 32;
+	for (let entry in entries) {
+		let entry_parts = split(entry, '/');
+		let entry_mask = length(entry_parts) > 1 ? int(entry_parts[1]) : 32;
+		if (entry_mask <= mask &&
+			network_v4(parts[0], entry_mask) != null &&
+			network_v4(parts[0], entry_mask) == network_v4(entry_parts[0], entry_mask))
+			return true;
+	}
+	return false;
+}
+
 function direct_networks() {
 	let v4 = [
 		'0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8',
@@ -266,11 +285,15 @@ function direct_networks() {
 		let lan = ubus.call('network.interface.lan', 'status') || {};
 		for (let item in (lan['ipv4-address'] || [])) {
 			let cidr = network_v4(item?.address || '', int(item?.mask));
-			if (cidr)
+			if (cidr && !v4_covered(cidr + '/' + int(item?.mask), v4))
 				push(v4, cidr);
 		}
+		// Only a global unicast prefix adds anything: unique-local, link-local
+		// and multicast are already covered by fc00::/7, fe80::/10 and ff00::/8,
+		// and repeating them would overlap.
 		for (let item in (lan['ipv6-prefix'] || []))
-			if (match(item?.address || '', /^[0-9A-Fa-f:]+$/) && int(item?.mask) >= 0 && int(item?.mask) <= 128)
+			if (match(item?.address || '', /^[23][0-9A-Fa-f]*:[0-9A-Fa-f:]*$/) &&
+				int(item?.mask) >= 0 && int(item?.mask) <= 128)
 				push(v6, item.address + '/' + int(item.mask));
 		ubus.disconnect();
 	}

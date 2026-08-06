@@ -49,7 +49,7 @@ class NftRulesTests(unittest.TestCase):
         source = BACKEND.read_text()
         cls.prelude = UBUS_STUB + "\n".join(
             lift(source, name)
-            for name in ("valid_ipv4", "network_v4", "nft_set",
+            for name in ("valid_ipv4", "network_v4", "v4_covered", "nft_set",
                          "direct_networks", "nft_config"))
 
     @classmethod
@@ -98,8 +98,8 @@ class NftRulesTests(unittest.TestCase):
             os.unlink(path)
 
     def test_nftables_accepts_the_generated_ruleset(self):
-        # The LAN sits inside 192.168.0.0/16 and the prefix inside fc00::/7, so
-        # without auto-merge nft rejects both sets as conflicting intervals.
+        # The LAN sits inside 192.168.0.0/16 and the prefix inside fc00::/7;
+        # emitting either again is rejected as conflicting intervals.
         done = self.check(self.generate())
         self.assertEqual(done.returncode, 0, done.stderr)
 
@@ -170,8 +170,8 @@ const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
         script = "%s\n%s\nsync_live_sets(%s);\n" % (
             stubs,
             "\n".join(lift(BACKEND.read_text(), name)
-                       for name in ("valid_ipv4", "network_v4", "direct_networks",
-                                    "sync_live_sets")),
+                       for name in ("valid_ipv4", "network_v4", "v4_covered",
+                                    "direct_networks", "sync_live_sets")),
             CLIENTS)
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
@@ -185,14 +185,18 @@ const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
 
         self.assertIn("flush set inet fw4 zarap_clients_v4", rendered)
         self.assertIn("192.168.10.167", rendered)
-        self.assertIn("192.168.10.0/24", rendered)
+        self.assertNotIn("192.168.10.0/24", rendered)
 
         table = ["inet", "zarap_selftest"]
+        # Deliberately without auto-merge. A set keeps the definition it was
+        # created with through every reload, so a router that has been running
+        # Zarap since before that flag existed still has the plain interval set
+        # — and that is where the overlapping element was rejected.
         setup = ("table inet zarap_selftest {\n"
                  "\tset zarap_clients_v4 { type ipv4_addr\n\t}\n"
                  "\tset zarap_clients_mac { type ether_addr\n\t}\n"
-                 "\tset zarap_direct_v4 { type ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n\t}\n"
-                 "\tset zarap_direct_v6 { type ipv6_addr\n\t\tflags interval\n\t\tauto-merge\n\t}\n}\n")
+                 "\tset zarap_direct_v4 { type ipv4_addr\n\t\tflags interval\n\t}\n"
+                 "\tset zarap_direct_v6 { type ipv6_addr\n\t\tflags interval\n\t}\n}\n")
 
         def run(text, *args):
             with tempfile.NamedTemporaryFile("w", suffix=".nft", delete=False) as handle:
@@ -218,8 +222,10 @@ const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
         ruleset = self.generate()
         self.assertIn("192.168.10.167", ruleset)
         self.assertIn("EA:76:7F:24:D1:79", ruleset)
-        # The LAN discovered over ubus has to be reachable directly.
-        self.assertIn("192.168.10.0/24", ruleset)
+        # The LAN already sits inside 192.168.0.0/16, so emitting it again
+        # would only create an overlap an interval set refuses.
+        self.assertNotIn("192.168.10.0/24", ruleset)
+        self.assertIn("192.168.0.0/16", ruleset)
 
     def test_tproxy_and_kill_switch_rules_are_present(self):
         ruleset = self.generate()
