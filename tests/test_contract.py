@@ -109,11 +109,44 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("activate_uci_candidate()", BACKEND)
 
     def test_apply_and_updates_verify_complete_runtime(self):
-        for check in ("running && listener && firewall && rule && route", "check_runtime(enabled)", "check_runtime(true)"):
+        for check in ("running && listener && firewall && rule && route",
+                      "check_runtime(enabled)", "check_runtime(enabled, LISTENER_WAIT)",
+                      "check_runtime(true, LISTENER_WAIT)"):
             self.assertIn(check, BACKEND)
+        # Everything that has just restarted the service must wait for the
+        # port; only the status view may look without waiting.
+        self.assertNotIn("check_runtime(true)", BACKEND)
         self.assertIn("restore_update_files(backups", BACKEND)
         self.assertIn("apk не смог обновить", BACKEND)
         self.assertIn("restore_update_files(backups, true)", BACKEND)
+
+    def test_apply_drives_and_verifies_the_live_firewall_sets(self):
+        # A reload leaves existing set contents alone, so apply must flush and
+        # repopulate them and then read back what the kernel actually holds.
+        self.assertIn("function sync_live_sets(", BACKEND)
+        self.assertIn("function live_clients_match(", BACKEND)
+        self.assertIn("nft flush set inet fw4 ", BACKEND)
+        self.assertIn("!sync_live_sets(live_clients) || !live_clients_match(live_clients)", BACKEND)
+        # The rollback path has to converge the kernel too.
+        self.assertIn("sync_live_sets(read_clients())", BACKEND)
+
+    def test_the_kill_switch_outlives_the_master_switch(self):
+        # A selected device must not reach the WAN directly just because the
+        # proxy was switched off; only deselecting it opens that path. The
+        # TProxy redirect is the part tied to the proxy running, since sending
+        # traffic to a dead port would swallow it instead of rejecting it.
+        self.assertIn("validate_candidate(parsed_result.config, client_result.clients, enabled)", BACKEND)
+        self.assertIn("let live_clients = client_result.clients;", BACKEND)
+        self.assertIn("if (proxying)", BACKEND)
+        self.assertNotIn("enabled ? client_result.clients : []", BACKEND)
+        view = (PACKAGE_ROOT / "htdocs/luci-static/resources/view/zarap/overview.js").read_text()
+        self.assertIn("device.kill_switch = !!(status.firewall && device.selected)", view)
+
+    def test_deselecting_a_device_releases_its_managed_lease(self):
+        # zarap_managed was written and read but never acted on, so a static
+        # lease outlived the selection that created it with no way to clear it.
+        self.assertIn("uci.delete('dhcp', section)", BACKEND)
+        self.assertIn("section.zarap_managed == '1' && !selected[", BACKEND)
 
     def test_device_discovery_uses_hostapd_and_dhcp_leases(self):
         self.assertIn('/bin/ubus list "hostapd.*"', BACKEND)

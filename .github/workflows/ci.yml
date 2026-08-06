@@ -85,10 +85,13 @@ jobs:
 
       # Needs the interpreter built above, so it runs after the syntax check
       # rather than with the other contract tests.
-      - name: Check VLESS link parsing
+      - name: Check VLESS parsing and the runtime health check
         env:
           UCODE_BIN: /tmp/ucode/build/ucode
-        run: python3 -m unittest discover -s tests -p 'test_parse_vless.py' -v
+        run: |
+          python3 -m unittest discover -s tests -p 'test_parse_vless.py' -v
+          python3 -m unittest discover -s tests -p 'test_runtime_check.py' -v
+          python3 -m unittest discover -s tests -p 'test_resource_conflict.py' -v
 
       - name: Check generated firewall rules
         env:

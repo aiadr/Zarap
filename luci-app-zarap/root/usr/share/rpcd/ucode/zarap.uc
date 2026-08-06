@@ -17,6 +17,9 @@ const UCI_CANDIDATE_DELTA = '/tmp/.zarap-uci';
 const UCI_CONFIGS = ['zarap', 'dhcp', 'sing-box'];
 const COMPONENTS = { 'luci-app-zarap': true, 'sing-box': true };
 const LOCK_FILE = '/var/lock/zarap.lock';
+// Seconds a freshly started sing-box gets to open its TProxy port. Kept well
+// inside the LuCI RPC deadline.
+const LISTENER_WAIT = 5;
 
 function result_error(message, details, kind) {
 	return { ok: false, error: message, details: details || '', kind: kind || 'operation_error' };
@@ -289,7 +292,11 @@ function nft_set(name, type_name, flags, elements) {
 	return text + '}\n\n';
 }
 
-function nft_config(clients, listen_port) {
+// A selected device must never reach the WAN directly, so the kill switch holds
+// whether or not the proxy is running. The TProxy redirect is the part that
+// depends on it: pointing traffic at a port nothing listens on would swallow it
+// silently, while leaving only the kill switch rejects it outright.
+function nft_config(clients, listen_port, proxying) {
 	let ips = map(clients, function(client) { return client.ip; });
 	let macs = map(clients, function(client) { return client.mac; });
 	let direct = direct_networks();
@@ -302,7 +309,8 @@ function nft_config(clients, listen_port) {
 	text += 'chain zarap_prerouting {\n';
 	text += '\ttype filter hook prerouting priority mangle; policy accept;\n';
 	text += '\tip saddr @zarap_clients_v4 ip daddr @zarap_direct_v4 return\n';
-	text += '\tip saddr @zarap_clients_v4 meta l4proto { tcp, udp } meta mark set 0x5a52 tproxy ip to 127.0.0.1:' + listen_port + ' accept\n';
+	if (proxying)
+		text += '\tip saddr @zarap_clients_v4 meta l4proto { tcp, udp } meta mark set 0x5a52 tproxy ip to 127.0.0.1:' + listen_port + ' accept\n';
 	text += '}\n\n';
 	text += 'chain zarap_killswitch_forward {\n';
 	text += '\ttype filter hook forward priority filter + 10; policy accept;\n';
@@ -415,6 +423,24 @@ function configure_uci(uci, parsed, enabled, clients) {
 		uci.set('zarap', section, 'name', client.name);
 	}
 	uci.load('dhcp');
+
+	// Zarap marks the static leases it creates with zarap_managed. Nothing ever
+	// removed them, so a device kept its pinned address after being deselected
+	// and there was no way to release it from the interface. Drop the marked
+	// leases whose device is no longer in the list; the ones still selected stay,
+	// because resolve_static_leases has already recognised them.
+	let selected = {};
+	for (let client in clients)
+		selected[client.mac] = true;
+	let stale = [];
+	uci.foreach('dhcp', 'host', function(section) {
+		let raw_mac = type(section.mac) == 'array' ? section.mac[0] : section.mac;
+		if (section.zarap_managed == '1' && !selected[normalize_mac(raw_mac)])
+			push(stale, section['.name']);
+	});
+	for (let section in stale)
+		uci.delete('dhcp', section);
+
 	for (let client in clients) {
 		if (client.has_static_lease)
 			continue;
@@ -517,13 +543,25 @@ function masked_proxy(parsed) {
 		(parsed.flow ? '&flow=' + parsed.flow : '') + '#Zarap';
 }
 
-function check_runtime(enabled) {
+function tproxy_listening() {
+	let listeners = capture('/usr/sbin/ss -H -lntup sport = :7893').output;
+	return !!(listeners && index(lc(listeners), 'sing-box') >= 0);
+}
+
+// procd returns from a restart once it has signalled the service, not once the
+// service is ready, and sing-box needs a moment to bind ("started (0.22s)").
+// Checking straight away failed a working configuration and rolled it back, so
+// callers that have just started the service wait a little for the port.
+function check_runtime(enabled, wait_seconds) {
 	if (!enabled)
 		return { ok: true, running: false, listener: false, firewall: false, routing: false };
 
 	let running = system(['/etc/init.d/sing-box', 'running']) == 0;
-	let listeners = capture('/usr/sbin/ss -H -lntup sport = :7893').output;
-	let listener = listeners && index(lc(listeners), 'sing-box') >= 0;
+	let listener = tproxy_listening();
+	for (let waited = 0; !listener && waited < (wait_seconds || 0); waited++) {
+		system(['/bin/sleep', '1']);
+		listener = tproxy_listening();
+	}
 	let firewall = system('/usr/sbin/nft list chain inet fw4 zarap_killswitch_forward >/dev/null 2>&1') == 0 &&
 		system('/usr/sbin/nft list chain inet fw4 zarap_prerouting >/dev/null 2>&1') == 0;
 	let rule = system('/sbin/ip -4 rule show | grep -q "fwmark 0x5a52.*lookup 2022"') == 0;
@@ -548,11 +586,11 @@ function recent_connection_error() {
 	return false;
 }
 
-function validate_candidate(parsed, clients) {
+function validate_candidate(parsed, clients, proxying) {
 	mkdir('/etc/zarap');
 	chmod('/etc/zarap', 0700);
 	let sing_box = sprintf('%J', sing_box_config(parsed, 7893)) + '\n';
-	let nft = nft_config(clients, 7893);
+	let nft = nft_config(clients, 7893, proxying);
 	let config_written = writefile(CONFIG_TMP, sing_box);
 	let nft_written = writefile(NFT_TMP, nft);
 	if (config_written == null || nft_written == null) {
@@ -576,6 +614,47 @@ function validate_candidate(parsed, clients) {
 	return { ok: true, sing_box: sing_box, nft: nft };
 }
 
+// firewall4 rebuilds the chains from the generated file but leaves the contents
+// of existing sets alone: a set declared without elements does not clear one
+// that is already populated. Reloading with an empty client list therefore left
+// the previous addresses in the kernel, so a deselected device stayed in the
+// kill switch and kept having its traffic sent to a TProxy port nothing was
+// listening on. Drive the live sets to the intended contents explicitly.
+function sync_live_sets(clients) {
+	let ips = [], macs = [], direct = direct_networks();
+	for (let client in clients) {
+		if (client.ip) push(ips, client.ip);
+		if (client.mac) push(macs, client.mac);
+	}
+	let wanted = {
+		zarap_clients_v4: ips,
+		zarap_clients_mac: macs,
+		zarap_direct_v4: direct.v4,
+		zarap_direct_v6: direct.v6
+	};
+	for (let name, elements in wanted) {
+		if (system('/usr/sbin/nft flush set inet fw4 ' + name + ' >/dev/null 2>&1') != 0)
+			return false;
+		if (length(elements) &&
+			system('/usr/sbin/nft add element inet fw4 ' + name +
+				' { ' + join(', ', elements) + ' } >/dev/null 2>&1') != 0)
+			return false;
+	}
+	return true;
+}
+
+// Reads back what the kernel holds, so an apply cannot report success while the
+// device is still caught by rules that were only cleared on paper.
+function live_clients_match(clients) {
+	let live = capture('/usr/sbin/nft list set inet fw4 zarap_clients_v4').output;
+	for (let client in clients)
+		if (client.ip && index(live, client.ip) < 0)
+			return false;
+	if (!length(clients) && index(live, 'elements') >= 0)
+		return false;
+	return true;
+}
+
 function rollback(backups) {
 	let ok = true;
 	for (let path, content in backups) {
@@ -587,6 +666,9 @@ function rollback(backups) {
 	chmod('/etc/config/zarap', 0600);
 	unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
 	if (system(['/etc/init.d/firewall', 'reload']) != 0) ok = false;
+	// The restored selection keeps its kill switch whatever the master switch says.
+	if (!sync_live_sets(read_clients()))
+		ok = false;
 	if (system(['/etc/init.d/dnsmasq', 'restart']) != 0) ok = false;
 	if (system(['/etc/init.d/zarap', 'restart']) != 0) ok = false;
 	if (system(['/etc/init.d/sing-box', 'restart']) != 0) ok = false;
@@ -628,10 +710,15 @@ function resource_conflict() {
 		if (index(line, 'fwmark 0x5a52') >= 0 && index(line, 'lookup 2022') < 0)
 			return result_error('Packet mark 0x5a52 уже используется другой таблицей маршрутизации');
 
+	// nft prints the mark zero-padded, as "0x00005a52", so looking for the
+	// literal 0x5a52 never matched and this guard did nothing. Zarap's own mark
+	// also appears in zarap_protect_tproxy, which has to count as ours or every
+	// apply would report a conflict against itself.
 	let nft_rules = capture('/usr/sbin/nft -a list ruleset').output;
-	let own_chain = capture('/usr/sbin/nft -a list chain inet fw4 zarap_prerouting').output;
+	let own_rules = capture('/usr/sbin/nft -a list chain inet fw4 zarap_prerouting').output +
+		capture('/usr/sbin/nft -a list chain inet fw4 zarap_protect_tproxy').output;
 	for (let line in split(nft_rules, '\n'))
-		if (index(line, '0x5a52') >= 0 && index(own_chain, trim(line)) < 0)
+		if (match(line, /0x0*5a52/) && index(own_rules, trim(line)) < 0)
 			return result_error('Packet mark 0x5a52 уже используется другим правилом nftables');
 
 	return { ok: true };
@@ -662,7 +749,7 @@ function apply_configuration(args) {
 		return conflict;
 
 	let enabled = !!args?.enabled;
-	let candidate = validate_candidate(parsed_result.config, enabled ? client_result.clients : []);
+	let candidate = validate_candidate(parsed_result.config, client_result.clients, enabled);
 	if (!candidate.ok)
 		return candidate;
 	let uci_candidate = prepare_uci_candidate(parsed_result.config, enabled, client_result.clients);
@@ -703,6 +790,16 @@ function apply_configuration(args) {
 		return result_error(restored ? 'firewall4 не принял правила Zarap; восстановлена предыдущая конфигурация' :
 			'Критическая ошибка firewall4 и rollback; загруженный kill switch не отключался', '', 'startup_error');
 	}
+
+	// Selected devices stay in the sets even with Zarap switched off; releasing
+	// one means deselecting it, which is the only thing that opens its WAN path.
+	let live_clients = client_result.clients;
+	if (!sync_live_sets(live_clients) || !live_clients_match(live_clients)) {
+		let restored = rollback(backups);
+		return result_error(restored ? 'Правила firewall в ядре не совпали с сохранёнными; восстановлена предыдущая конфигурация' :
+			'Критическая ошибка синхронизации правил и rollback; kill switch оставлен активным', '', 'startup_error');
+	}
+
 	let service_code;
 	if (enabled) {
 		service_code = system(['/etc/init.d/zarap', 'restart']);
@@ -719,7 +816,7 @@ function apply_configuration(args) {
 			'Критическая ошибка запуска и rollback; kill switch оставлен активным', '', 'startup_error');
 	}
 
-	let health = check_runtime(enabled);
+	let health = check_runtime(enabled, LISTENER_WAIT);
 	if (!health.ok) {
 		let restored = rollback(backups);
 		return result_error(restored ? 'Локальная инфраструктура Zarap не прошла проверку; конфигурация восстановлена' :
@@ -802,6 +899,7 @@ function status() {
 	let configured = !!uci.get('zarap', 'main', 'server');
 	let health = check_runtime(enabled);
 	let state = 'disabled', message = 'Zarap выключен';
+	let held = !enabled && length(read_clients()) > 0;
 	if (!configured) {
 		state = 'not_configured';
 		message = unmanaged_sing_box() ?
@@ -823,6 +921,9 @@ function status() {
 	else if (enabled) {
 		state = 'working';
 		message = 'Zarap работает';
+	}
+	else if (held) {
+		message = 'Zarap выключен. Отмеченные устройства остаются без выхода в интернет: kill switch не пускает их напрямую. Снимите отметку с устройства, чтобы вернуть ему прямой доступ';
 	}
 	let saved = saved_proxy_config();
 
@@ -972,7 +1073,7 @@ function update_component(name) {
 			restore_update_files(backups, true);
 			return result_error('Пакет обновлён, но сервис не запустился; файлы восстановлены, kill switch активен', '', 'startup_error');
 		}
-		let health = check_runtime(true);
+		let health = check_runtime(true, LISTENER_WAIT);
 		if (!health.ok) {
 			restore_update_files(backups, true);
 			return result_error('После обновления не прошла проверка процесса, TProxy, nftables или маршрутизации; файлы восстановлены', sprintf('%J', health), 'startup_error');
@@ -1002,7 +1103,7 @@ const methods = {
 			if (!clients.ok) return clients;
 			let conflict = resource_conflict();
 			if (!conflict.ok) return conflict;
-			let candidate = validate_candidate(parsed.config, clients.clients);
+			let candidate = validate_candidate(parsed.config, clients.clients, true);
 			if (!candidate.ok) return candidate;
 			let uci_candidate = prepare_uci_candidate(parsed.config, true, clients.clients);
 			unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
@@ -1025,7 +1126,7 @@ const methods = {
 			let code = system(['/etc/init.d/zarap', 'restart']);
 			if (code == 0)
 				code = system(['/etc/init.d/sing-box', 'restart']);
-			let health = code == 0 ? check_runtime(true) : { ok: false };
+			let health = code == 0 ? check_runtime(true, LISTENER_WAIT) : { ok: false };
 			return code == 0 && health.ok ? { ok: true, health: health } :
 				result_error('После перезапуска не прошла проверка процесса, TProxy, nftables или маршрутизации', sprintf('%J', health), 'startup_error');
 		}

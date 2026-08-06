@@ -1,0 +1,7 @@
+table inet fw4 {
+	chain zarap_prerouting { # handle 1
+		type filter hook prerouting priority mangle; policy accept;
+		ip saddr @zarap_clients_v4 ip daddr @zarap_direct_v4 return # handle 7
+		ip saddr @zarap_clients_v4 meta l4proto { tcp, udp } meta mark set 0x00005a52 tproxy ip to 127.0.0.1:7893 accept # handle 9
+	}
+}

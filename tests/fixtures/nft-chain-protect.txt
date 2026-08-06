@@ -1,0 +1,6 @@
+table inet fw4 {
+	chain zarap_protect_tproxy { # handle 2
+		type filter hook input priority filter - 10; policy accept;
+		meta l4proto { tcp, udp } th dport 7893 meta mark != 0x00005a52 drop # handle 11
+	}
+}

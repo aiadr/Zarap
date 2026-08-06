@@ -191,7 +191,9 @@ return view.extend({
 		const updates = (data[1] && data[1].components) || {};
 		const logs = (data[2] && data[2].logs) || '';
 		devices.forEach(function(device) {
-			device.kill_switch = !!(status.enabled && status.firewall && device.selected);
+			// Holds even with Zarap switched off: only deselecting a device
+			// opens its direct path to the WAN.
+			device.kill_switch = !!(status.firewall && device.selected);
 		});
 		const configuredText = status.configured
 			? _('Сохранено: %s. Оставьте поле пустым, чтобы не менять подключение.').format(status.masked_link || 'vless://********')
