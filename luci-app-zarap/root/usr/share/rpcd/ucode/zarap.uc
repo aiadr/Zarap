@@ -72,6 +72,14 @@ function valid_ipv4(value) {
 
 function parse_vless(link) {
 	link = trim('' + (link || ''));
+
+	// Links arrive pasted from chats and web pages, which slip in non-breaking
+	// spaces, zero-width characters and a leading BOM. A stray one next to the
+	// port made it read as "443 " and the link was rejected for an out-of-range
+	// port. Everything a link needs outside its display fragment is printable
+	// ASCII, and that fragment is dropped below, so discard the rest.
+	link = replace(link, /[^!-~]+/g, '');
+
 	if (!match(link, /^vless:\/\//))
 		return input_error('Ссылка должна начинаться с vless://');
 
@@ -80,8 +88,14 @@ function parse_vless(link) {
 		link = substr(link, 0, fragment_at);
 
 	let query_at = index(link, '?');
-	let authority = query_at >= 0 ? substr(link, 8, query_at - 8) : substr(link, 8);
+	let rest = query_at >= 0 ? substr(link, 8, query_at - 8) : substr(link, 8);
 	let query = query_at >= 0 ? substr(link, query_at + 1) : '';
+
+	// RFC 3986: the authority ends at the first '/'. Share links routinely
+	// carry an empty path there, and leaving it in put the slash inside the
+	// port and rejected the link.
+	let path_at = index(rest, '/');
+	let authority = path_at >= 0 ? substr(rest, 0, path_at) : rest;
 	let at = rindex(authority, '@');
 	if (at <= 0)
 		return input_error('В ссылке отсутствуют UUID или адрес сервера');

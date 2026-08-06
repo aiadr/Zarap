@@ -83,6 +83,13 @@ jobs:
       - name: Check nftables syntax
         run: sudo nft -c -f tests/nftables.conf
 
+      # Needs the interpreter built above, so it runs after the syntax check
+      # rather than with the other contract tests.
+      - name: Check VLESS link parsing
+        env:
+          UCODE_BIN: /tmp/ucode/build/ucode
+        run: python3 -m unittest discover -s tests -p 'test_parse_vless.py' -v
+
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 20
