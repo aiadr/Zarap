@@ -90,6 +90,11 @@ jobs:
           UCODE_BIN: /tmp/ucode/build/ucode
         run: python3 -m unittest discover -s tests -p 'test_parse_vless.py' -v
 
+      - name: Check generated firewall rules
+        env:
+          UCODE_BIN: /tmp/ucode/build/ucode
+        run: python3 -m unittest discover -s tests -p 'test_nft_rules.py' -v
+
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 20

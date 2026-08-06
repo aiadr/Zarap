@@ -276,8 +276,14 @@ function direct_networks() {
 
 function nft_set(name, type_name, flags, elements) {
 	let text = 'set ' + name + ' {\n\ttype ' + type_name + '\n';
-	if (flags)
+	if (flags) {
 		text += '\tflags ' + flags + '\n';
+		// The LAN prefixes discovered at runtime normally sit inside the static
+		// RFC1918 and fc00::/7 entries, and an interval set rejects overlapping
+		// elements outright. Have nftables merge them instead of failing.
+		if (index(flags, 'interval') >= 0)
+			text += '\tauto-merge\n';
+	}
 	if (length(elements))
 		text += '\telements = { ' + join(', ', elements) + ' }\n';
 	return text + '}\n\n';
