@@ -152,6 +152,15 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("uci.delete('dhcp', section)", BACKEND)
         self.assertIn("section.zarap_managed == '1' && !selected[", BACKEND)
 
+    def test_rpcd_is_reloaded_rather_than_restarted(self):
+        # A restart drops every ubus session and signs the user out of LuCI.
+        # On SIGHUP rpcd freezes its sessions, re-execs and thaws them, which
+        # picks up the plugin just the same.
+        self.assertNotIn("rpcd restart", BACKEND)
+        self.assertNotIn("rpcd restart", UCI_DEFAULTS)
+        self.assertIn("/etc/init.d/rpcd reload", BACKEND)
+        self.assertIn("/etc/init.d/rpcd reload", UCI_DEFAULTS)
+
     def test_device_discovery_uses_hostapd_and_dhcp_leases(self):
         self.assertIn('/bin/ubus list "hostapd.*"', BACKEND)
         self.assertIn("/tmp/dhcp.leases", BACKEND)

@@ -1093,7 +1093,9 @@ function update_component(name) {
 	}
 
 	if (name == 'luci-app-zarap')
-		system('(/bin/sleep 1; /etc/init.d/rpcd restart) >/dev/null 2>&1 &');
+		// reload rather than restart: rpcd re-execs on SIGHUP and thaws its sessions,
+		// so updating Zarap no longer signs the user out of LuCI.
+		system('(/bin/sleep 1; /etc/init.d/rpcd reload) >/dev/null 2>&1 &');
 	return { ok: true, component: name, reload_required: name == 'luci-app-zarap' };
 }
 
