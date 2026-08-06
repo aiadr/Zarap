@@ -1,6 +1,8 @@
 name: Release
 
 on:
+  # Manual trigger, so a release can be re-run without an empty commit.
+  workflow_dispatch:
   push:
     branches:
       - main
