@@ -577,8 +577,14 @@ function tproxy_listening() {
 // Checking straight away failed a working configuration and rolled it back, so
 // callers that have just started the service wait a little for the port.
 function check_runtime(enabled, wait_seconds) {
+	// The kill switch holds whether or not the proxy is running, so its state
+	// has to be reported truthfully even with Zarap switched off. Reporting a
+	// blanket false here made the page claim the rules were gone while they
+	// were still blocking the selected devices.
+	let firewall = system('/usr/sbin/nft list chain inet fw4 zarap_killswitch_forward >/dev/null 2>&1') == 0 &&
+		system('/usr/sbin/nft list chain inet fw4 zarap_prerouting >/dev/null 2>&1') == 0;
 	if (!enabled)
-		return { ok: true, running: false, listener: false, firewall: false, routing: false };
+		return { ok: true, running: false, listener: false, firewall: firewall, routing: false };
 
 	let running = system(['/etc/init.d/sing-box', 'running']) == 0;
 	let listener = tproxy_listening();
@@ -586,8 +592,6 @@ function check_runtime(enabled, wait_seconds) {
 		system(['/bin/sleep', '1']);
 		listener = tproxy_listening();
 	}
-	let firewall = system('/usr/sbin/nft list chain inet fw4 zarap_killswitch_forward >/dev/null 2>&1') == 0 &&
-		system('/usr/sbin/nft list chain inet fw4 zarap_prerouting >/dev/null 2>&1') == 0;
 	let rule = system('/sbin/ip -4 rule show | grep -q "fwmark 0x5a52.*lookup 2022"') == 0;
 	let route = system('/sbin/ip -4 route show table 2022 | grep -Eq "^local (default|0.0.0.0/0) dev lo"') == 0;
 	return {

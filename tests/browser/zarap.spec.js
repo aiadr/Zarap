@@ -150,3 +150,16 @@ test('names the failure when the update RPC itself does not complete', async ({ 
   await expect(page.getByText(/Timeout \(7\)/)).toBeVisible();
   await expect(page.getByText('Неизвестная ошибка')).toHaveCount(0);
 });
+
+test('keeps showing the kill switch while Zarap is switched off', async ({ page }) => {
+  // The kill switch holds regardless of the master switch, so hiding its
+  // badges here told the user the device was free when it was still blocked.
+  await page.addInitScript(() => {
+    window.__statusOverride = { enabled: false, running: false, listener: false, routing: false };
+  });
+  await openZarap(page);
+
+  await expect(page.getByText('kill switch активен')).toBeVisible();
+  const held = page.locator('tr[data-mac="00:11:22:33:44:55"]');
+  await expect(held).toContainText('kill switch');
+});

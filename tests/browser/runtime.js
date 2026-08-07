@@ -63,7 +63,7 @@ function clone(value) {
 }
 
 const handlers = {
-  status: () => clone(fixtures.status),
+  status: () => Object.assign(clone(fixtures.status), window.__statusOverride || {}),
   logs: () => ({ ok: true, logs: 'sing-box запущен\nUUID: [скрыто]\nReality key: [скрыто]' }),
   updates: refresh => (refresh && window.__mockState.updatesRpcStatus != null
     ? window.__mockState.updatesRpcStatus

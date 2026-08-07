@@ -34,6 +34,9 @@ function capture(command) {
 	return { code: 0, output: '' };
 }
 function system(command) {
+	if (index(command, 'zarap_killswitch_forward') >= 0 ||
+		index(command, 'zarap_prerouting') >= 0)
+		return %d;
 	return 0;
 }
 """
@@ -47,12 +50,12 @@ class RuntimeCheckTests(unittest.TestCase):
             raise unittest.SkipTest("no ucode interpreter available")
         cls.source = BACKEND.read_text()
 
-    def run_check(self, appears_at, wait_seconds):
-        script = "%s\n%s\nprintf('%%J', { health: check_runtime(true, %d), probes: probes });\n" % (
-            STUBS % appears_at,
+    def run_check(self, appears_at, wait_seconds, enabled="true", nft_code=0):
+        script = "%s\n%s\nprintf('%%J', { health: check_runtime(%s, %d), probes: probes });\n" % (
+            STUBS % (appears_at, nft_code),
             "\n".join(lift(self.source, name)
                       for name in ("tproxy_listening", "check_runtime")),
-            wait_seconds)
+            enabled, wait_seconds)
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name
@@ -79,6 +82,19 @@ class RuntimeCheckTests(unittest.TestCase):
         result = self.run_check(appears_at=1, wait_seconds=5)
         self.assertTrue(result["health"]["listener"])
         self.assertEqual(result["probes"], 1)
+
+    def test_the_firewall_state_is_reported_with_the_proxy_switched_off(self):
+        # The kill switch holds regardless of the master switch. Returning a
+        # blanket false here turned off both the status pill and the per-device
+        # badge while the rules were still blocking.
+        result = self.run_check(appears_at=99, wait_seconds=0, enabled="false")
+        self.assertTrue(result["health"]["firewall"])
+        self.assertFalse(result["health"]["running"])
+        self.assertFalse(result["health"]["routing"])
+
+    def test_a_missing_chain_is_reported_with_the_proxy_switched_off(self):
+        result = self.run_check(appears_at=99, wait_seconds=0, enabled="false", nft_code=1)
+        self.assertFalse(result["health"]["firewall"])
 
     def test_waiting_is_bounded_when_the_port_never_opens(self):
         result = self.run_check(appears_at=99, wait_seconds=3)
