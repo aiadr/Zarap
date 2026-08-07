@@ -77,19 +77,27 @@ function valid_ipv4(value) {
 function parse_vless(link) {
 	link = trim('' + (link || ''));
 
+	// The fragment carries the name the client gave the connection. Take it
+	// before the filter below, which would eat the spaces in it, and keep it
+	// readable: it is shown back to the user and stored in uci, so control
+	// characters have to go and the length needs a bound.
+	let name = '';
+	let fragment_at = index(link, '#');
+	if (fragment_at >= 0) {
+		name = trim(replace(urldecode(substr(link, fragment_at + 1)) || '', /[[:cntrl:]]/g, ''));
+		if (length(name) > 64)
+			name = trim(substr(name, 0, 64));
+		link = substr(link, 0, fragment_at);
+	}
+
 	// Links arrive pasted from chats and web pages, which slip in non-breaking
 	// spaces, zero-width characters and a leading BOM. A stray one next to the
 	// port made it read as "443 " and the link was rejected for an out-of-range
-	// port. Everything a link needs outside its display fragment is printable
-	// ASCII, and that fragment is dropped below, so discard the rest.
+	// port. Everything a link needs outside the fragment is printable ASCII.
 	link = replace(link, /[^!-~]+/g, '');
 
 	if (!match(link, /^vless:\/\//))
 		return input_error('Ссылка должна начинаться с vless://');
-
-	let fragment_at = index(link, '#');
-	if (fragment_at >= 0)
-		link = substr(link, 0, fragment_at);
 
 	let query_at = index(link, '?');
 	let rest = query_at >= 0 ? substr(link, 8, query_at - 8) : substr(link, 8);
@@ -163,6 +171,7 @@ function parse_vless(link) {
 	return {
 		ok: true,
 		config: {
+			name: name,
 			server: server,
 			server_port: port,
 			uuid: uuid,
@@ -430,7 +439,7 @@ function configure_uci(uci, parsed, enabled, clients) {
 	uci.load('zarap');
 	uci.set('zarap', 'main', 'zarap');
 	uci.set('zarap', 'main', 'enabled', enabled ? '1' : '0');
-	for (let key in ['server', 'server_port', 'uuid', 'flow', 'server_name', 'public_key', 'short_id', 'fingerprint'])
+	for (let key in ['name', 'server', 'server_port', 'uuid', 'flow', 'server_name', 'public_key', 'short_id', 'fingerprint'])
 		uci.set('zarap', 'main', key, '' + parsed[key]);
 	uci.set('zarap', 'main', 'listen_port', '7893');
 	uci.set('zarap', 'main', 'mark', '0x5a52');
@@ -548,6 +557,7 @@ function saved_proxy_config() {
 	if (!server)
 		return null;
 	return {
+		name: uci.get('zarap', 'main', 'name') || '',
 		server: server,
 		server_port: int(uci.get('zarap', 'main', 'server_port') || 0),
 		uuid: uci.get('zarap', 'main', 'uuid') || '',
@@ -564,7 +574,7 @@ function masked_proxy(parsed) {
 		return '';
 	return 'vless://********@' + parsed.server + ':' + parsed.server_port +
 		'?security=reality&type=tcp&sni=' + parsed.server_name +
-		(parsed.flow ? '&flow=' + parsed.flow : '') + '#Zarap';
+		(parsed.flow ? '&flow=' + parsed.flow : '') + '#' + (parsed.name || 'Zarap');
 }
 
 function tproxy_listening() {

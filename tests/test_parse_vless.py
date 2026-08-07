@@ -133,6 +133,30 @@ class ParseVlessTests(unittest.TestCase):
         result = self.parse(f"\ufeffvless://{UUID}@proxy.example.test:443?{BASE_PARAMS}")
         self.assertTrue(result["ok"], result.get("error"))
 
+    def test_keeps_the_connection_name_from_the_fragment(self):
+        result = self.parse(f"vless://{UUID}@proxy.example.test:443?{BASE_PARAMS}#My%20Server")
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["config"]["name"], "My Server")
+
+    def test_keeps_a_name_written_in_another_script(self):
+        result = self.parse(f"vless://{UUID}@proxy.example.test:443?{BASE_PARAMS}#Мой сервер")
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["config"]["name"], "Мой сервер")
+
+    def test_a_link_without_a_fragment_has_no_name(self):
+        result = self.parse(f"vless://{UUID}@proxy.example.test:443?{BASE_PARAMS}")
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["config"]["name"], "")
+
+    def test_a_name_is_stripped_of_control_characters_and_bounded(self):
+        # It goes into uci and back onto the page, so a newline would corrupt
+        # the config file and an unbounded string would not belong in either.
+        result = self.parse(f"vless://{UUID}@proxy.example.test:443?{BASE_PARAMS}#one\ntwo")
+        self.assertEqual(result["config"]["name"], "onetwo")
+        long_name = "x" * 200
+        result = self.parse(f"vless://{UUID}@proxy.example.test:443?{BASE_PARAMS}#{long_name}")
+        self.assertEqual(len(result["config"]["name"]), 64)
+
     def test_rejects_a_port_outside_the_valid_range(self):
         for port in ("0", "70000"):
             result = self.parse(f"vless://{UUID}@proxy.example.test:{port}?{BASE_PARAMS}")

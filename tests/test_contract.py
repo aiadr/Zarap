@@ -183,6 +183,13 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("ip saddr @zarap_clients_v4 reject", NFT)
         self.assertIn("ether saddr @zarap_clients_mac ether type ip6 reject", NFT)
 
+    def test_the_masked_link_carries_the_saved_connection_name(self):
+        # It used to end in a hardcoded #Zarap, discarding the name the link came
+        # with. The name is a label, not a secret, so it survives round-tripping.
+        self.assertIn("'#' + (parsed.name || 'Zarap')", BACKEND)
+        self.assertIn("name: uci.get('zarap', 'main', 'name')", BACKEND)
+        self.assertIn("for (let key in ['name', 'server'", BACKEND)
+
     def test_status_does_not_return_proxy_secrets(self):
         status_body = BACKEND.split("function status()", 1)[1].split("function logs()", 1)[0]
         for secret_field in ("uuid:", "public_key:", "short_id:"):
