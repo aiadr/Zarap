@@ -132,6 +132,11 @@ pnpm test:browser:headed
 - private/randomized MAC не поддерживаются;
 - фоновые обновления и общий `apk upgrade` не выполняются.
 
+Часть этих ограничений снимается запланированным переходом на список
+подключений и список правил маршрутизации: схема, маппинг на `outbounds` и
+`route.rules` в sing-box, миграция и этапы описаны в
+[`docs/routing-design.md`](docs/routing-design.md).
+
 ## Лицензия
 
 GPL-3.0-or-later.
