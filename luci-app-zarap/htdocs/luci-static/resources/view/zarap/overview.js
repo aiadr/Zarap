@@ -5,8 +5,8 @@
 'require view';
 
 const callStatus = rpc.declare({ object: 'zarap', method: 'status' });
-const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'link', 'clients' ] });
-const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'link', 'enabled', 'clients' ] });
+const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'clients', 'final' ] });
+const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'clients', 'final' ] });
 const callRestart = rpc.declare({ object: 'zarap', method: 'restart' });
 const callStop = rpc.declare({ object: 'zarap', method: 'stop' });
 const callLogs = rpc.declare({ object: 'zarap', method: 'logs' });
@@ -87,12 +87,11 @@ function statusPill(ok, yesText, noText) {
 	}, ok ? yesText : noText);
 }
 
-function selectedClients() {
+// Only devices a rule names carry a lease, and those are exactly the rows the
+// apply has to send back. The rest of the table is there to be looked at.
+function leasedClients() {
 	const clients = [];
-	document.querySelectorAll('#zarap-devices tbody tr').forEach(function(row) {
-		const checkbox = row.querySelector('input[type="checkbox"]');
-		if (!checkbox.checked)
-			return;
+	document.querySelectorAll('#zarap-devices tbody tr[data-guarded="1"]').forEach(function(row) {
 		clients.push({
 			mac: row.getAttribute('data-mac'),
 			name: row.querySelector('input[data-field="name"]').value.trim(),
@@ -102,37 +101,73 @@ function selectedClients() {
 	return clients;
 }
 
-function deviceRow(device) {
+// Connections round-trip by tag with an empty link, which tells the router to
+// keep the secret it already holds. A pasted link adds one.
+function submittedOutbounds(outbounds) {
+	const sent = outbounds.map(function(outbound) {
+		return { tag: outbound.tag, label: outbound.label || '', link: '' };
+	});
+	const added = document.querySelector('#zarap-link').value.trim();
+	if (added)
+		sent.push({ tag: '', label: '', link: added });
+	return sent;
+}
+
+function targetLabel(target, outbounds) {
+	if (target === 'direct')
+		return _('напрямую');
+	if (target === 'block')
+		return _('заблокировано');
+	const match = outbounds.filter(function(outbound) { return outbound.tag === target; })[0];
+	return match && match.label ? '%s (%s)'.format(match.label, target) : target;
+}
+
+function deviceRow(device, outbounds) {
 	const unavailable = device.private_mac;
 	const reason = unavailable ? _('Приватный MAC: отключите рандомизацию MAC на устройстве') : '';
-	return E('tr', { 'class': 'tr', 'data-mac': device.mac }, [
-		E('td', { 'class': 'td' }, [
-			E('input', {
-				'type': 'checkbox',
-				'checked': device.selected && !unavailable ? '' : null,
-				'disabled': unavailable ? '' : null,
-				'title': reason
-			})
-		]),
-		E('td', { 'class': 'td' }, [
+	const editable = !!device.guarded;
+	return E('tr', {
+		'class': 'tr', 'data-mac': device.mac, 'data-guarded': editable ? '1' : '0'
+	}, [
+		E('td', { 'class': 'td' }, editable ? [
 			E('input', {
 				'class': 'cbi-input-text', 'data-field': 'name',
 				'value': device.name || '', 'placeholder': _('Имя устройства')
 			})
-		]),
+		] : (device.name || '')),
 		E('td', { 'class': 'td' }, device.mac),
-		E('td', { 'class': 'td' }, [
+		E('td', { 'class': 'td' }, editable ? [
 			E('input', {
 				'class': 'cbi-input-text', 'data-field': 'ip',
 				'value': device.ip || '', 'placeholder': '192.168.1.100'
 			})
-		]),
+		] : (device.ip || '')),
+		E('td', { 'class': 'td' }, targetLabel(device.resolved_target, outbounds)),
 		E('td', { 'class': 'td' }, [
 			device.connected ? statusPill(true, _('в сети'), '') : statusPill(false, '', _('не в сети')),
 			device.kill_switch ? statusPill(true, _(' kill switch'), '') : '',
 			device.wireless && device.network ? E('small', {}, ' Wi-Fi: ' + device.network) : '',
 			unavailable ? E('div', { 'class': 'error' }, reason) : ''
 		])
+	]);
+}
+
+function outboundRow(outbound) {
+	return E('tr', { 'class': 'tr' }, [
+		E('td', { 'class': 'td' }, outbound.tag),
+		E('td', { 'class': 'td' }, outbound.label || '—'),
+		E('td', { 'class': 'td' }, E('code', {}, outbound.masked_link || '')),
+		E('td', { 'class': 'td' }, outbound.in_use
+			? statusPill(true, _('используется'), '')
+			: statusPill(false, '', _('не используется')))
+	]);
+}
+
+function ruleRow(rule, index, outbounds) {
+	return E('tr', { 'class': 'tr' }, [
+		E('td', { 'class': 'td' }, String(index + 1)),
+		E('td', { 'class': 'td' }, (rule.clients || []).join(', ')),
+		E('td', { 'class': 'td' }, targetLabel(rule.target, outbounds))
 	]);
 }
 
@@ -188,16 +223,16 @@ return view.extend({
 	render: function(data) {
 		const status = data[0] || {};
 		const devices = status.devices || [];
+		const outbounds = status.outbounds || [];
+		const rules = status.rules || [];
+		const final = status.final || 'direct';
 		const updates = (data[1] && data[1].components) || {};
 		const logs = (data[2] && data[2].logs) || '';
 		devices.forEach(function(device) {
-			// Holds even with Zarap switched off: only deselecting a device
-			// opens its direct path to the WAN.
-			device.kill_switch = !!(status.firewall && device.selected);
+			// Holds even with Zarap switched off: only deleting the rule that
+			// names a device opens its direct path to the WAN.
+			device.kill_switch = !!(status.firewall && device.guarded);
 		});
-		const configuredText = status.configured
-			? _('Сохранено: %s. Оставьте поле пустым, чтобы не менять подключение.').format(status.masked_link || 'vless://********')
-			: _('Вставьте VLESS Reality-ссылку. Ссылка разбирается на роутере и не возвращается в браузер.');
 
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, 'Zarap'),
@@ -210,6 +245,9 @@ return view.extend({
 					statusPill(status.firewall, _('kill switch активен'), _('нет правил firewall')),
 					statusPill(status.routing, _('маршрутизация активна'), _('нет policy routing'))
 				]),
+				E('p', {}, status.capture && status.capture.interface
+					? _('Захват трафика: интерфейс %s').format(status.capture.interface)
+					: _('LAN-интерфейс не определён')),
 				E('div', { 'class': 'right', 'style': ACTION_ROW }, [
 					E('button', {
 						'class': 'btn cbi-button-action',
@@ -233,10 +271,21 @@ return view.extend({
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('Подключение')),
-				E('p', {}, configuredText),
+				E('h3', {}, _('Подключения')),
+				E('p', {}, _('Ссылка разбирается на роутере и обратно в браузер не возвращается. Сохранённые подключения показаны в замаскированном виде.')),
+				E('table', { 'class': 'table', 'id': 'zarap-outbounds' }, [
+					E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
+						E('th', { 'class': 'th' }, _('Тег')),
+						E('th', { 'class': 'th' }, _('Название')),
+						E('th', { 'class': 'th' }, _('Ссылка')),
+						E('th', { 'class': 'th' }, _('Состояние'))
+					])),
+					E('tbody', {}, outbounds.length
+						? outbounds.map(outboundRow)
+						: E('tr', {}, E('td', { 'colspan': 4 }, _('Подключений пока нет'))))
+				]),
 				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'zarap-link' }, _('VLESS Reality-ссылка')),
+					E('label', { 'class': 'cbi-value-title', 'for': 'zarap-link' }, _('Добавить подключение')),
 					E('div', { 'class': 'cbi-value-field' }, [
 						E('input', {
 							'id': 'zarap-link', 'class': 'cbi-input-password', 'type': 'password',
@@ -253,24 +302,43 @@ return view.extend({
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('Правила')),
+				E('p', {}, _('Применяется первое подходящее правило. Устройство, названное правилом, остаётся под kill switch даже при выключенном Zarap: прямой доступ возвращает только удаление правила.')),
+				E('table', { 'class': 'table', 'id': 'zarap-rules' }, [
+					E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
+						E('th', { 'class': 'th' }, '#'),
+						E('th', { 'class': 'th' }, _('Устройства')),
+						E('th', { 'class': 'th' }, _('Куда'))
+					])),
+					E('tbody', {}, rules.length
+						? rules.map(function(rule, index) { return ruleRow(rule, index, outbounds); })
+						: E('tr', {}, E('td', { 'colspan': 3 }, _('Правил пока нет: весь трафик идёт по умолчанию'))))
+				]),
+				E('p', {}, _('Остальной трафик: %s').format(targetLabel(final, outbounds))),
+				E('p', { 'class': 'cbi-value-description' }, _('Редактирование правил появится в следующей версии; пока их задаёт uci в /etc/config/zarap.'))
+			]),
+
+			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, _('Устройства')),
-				E('p', {}, _('Выберите устройства и укажите постоянный IPv4-адрес. Zarap создаст для них статические DHCP-аренды. При недоступности прокси внешний трафик этих устройств будет заблокирован.')),
+				E('p', {}, _('Весь трафик локальной сети проходит через Zarap. Адрес можно менять только у устройств, названных правилом: Zarap держит для них статическую DHCP-аренду, на которую правило и опирается.')),
 				E('table', { 'class': 'table', 'id': 'zarap-devices' }, [
 					E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
-						E('th', { 'class': 'th' }, _('Через Zarap')),
 						E('th', { 'class': 'th' }, _('Имя')),
 						E('th', { 'class': 'th' }, _('MAC')),
 						E('th', { 'class': 'th' }, _('Статический IPv4')),
+						E('th', { 'class': 'th' }, _('Куда идёт')),
 						E('th', { 'class': 'th' }, _('Состояние'))
 					])),
-					E('tbody', {}, devices.length ? devices.map(deviceRow) : E('tr', {}, E('td', { 'colspan': 5 }, _('Устройства пока не обнаружены'))))
+					E('tbody', {}, devices.length
+						? devices.map(function(device) { return deviceRow(device, outbounds); })
+						: E('tr', {}, E('td', { 'colspan': 5 }, _('Устройства пока не обнаружены'))))
 				]),
 				E('div', { 'class': 'cbi-page-actions', 'style': ACTION_ROW }, [
 					E('button', {
 						'class': 'btn cbi-button-neutral',
 						'click': ui.createHandlerFn(this, async function() {
-							const link = document.querySelector('#zarap-link').value;
-							notify(await callValidate(link, selectedClients()), _('Ссылка и список устройств корректны'));
+							notify(await callValidate(submittedOutbounds(outbounds), rules,
+								leasedClients(), final), _('Конфигурация корректна'));
 						})
 					}, _('Проверить конфигурацию')),
 					E('button', {
@@ -278,9 +346,11 @@ return view.extend({
 						'click': ui.createHandlerFn(this, async function(ev) {
 							ev.currentTarget.disabled = true;
 							const result = await callApply(
-								document.querySelector('#zarap-link').value,
 								document.querySelector('#zarap-enabled').checked,
-								selectedClients()
+								submittedOutbounds(outbounds),
+								rules,
+								leasedClients(),
+								final
 							);
 							if (notify(result, _('Конфигурация применена'))) {
 								if ((result.clients || []).some(function(client) { return client.reconnect_required; }))

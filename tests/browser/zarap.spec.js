@@ -16,14 +16,23 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
   await expect(page.getByText('kill switch активен')).toBeVisible();
   await expect(page.getByText('маршрутизация активна')).toBeVisible();
 
+  await expect(page.getByText('Захват трафика: интерфейс br-lan')).toBeVisible();
+
   await expect(page.locator('#zarap-devices tbody tr')).toHaveCount(3);
   const privateDevice = page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"]');
-  await expect(privateDevice.getByRole('checkbox')).toBeDisabled();
   await expect(privateDevice).toContainText('Приватный MAC');
+  // Not named by any rule, so it carries no lease to edit and no kill switch.
+  await expect(privateDevice.locator('input[data-field="ip"]')).toHaveCount(0);
+  await expect(privateDevice).not.toContainText('kill switch');
 
-  const selectedDevice = page.locator('tr[data-mac="00:11:22:33:44:55"]');
-  await expect(selectedDevice.getByRole('checkbox')).toBeChecked();
-  await expect(selectedDevice).toContainText('kill switch');
+  const guarded = page.locator('tr[data-mac="00:11:22:33:44:55"]');
+  await expect(guarded).toContainText('kill switch');
+  await expect(guarded).toContainText('Нидерланды');
+  await expect(guarded.locator('input[data-field="ip"]')).toHaveValue('192.168.1.50');
+
+  await expect(page.locator('#zarap-outbounds tbody tr')).toHaveCount(2);
+  await expect(page.locator('#zarap-rules tbody tr')).toHaveCount(2);
+  await expect(page.getByText('Остальной трафик: напрямую')).toBeVisible();
 
   await expect(page.locator('body')).not.toContainText('123e4567-e89b-42d3-a456-426614174000');
   await expect(page.locator('body')).not.toContainText('0123456789abcdefghijklmnopqrstuvwxyzABCDE');
@@ -33,38 +42,47 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
   expect(calls.some(call => call.method === 'devices')).toBe(false);
 });
 
-test('validates and applies the exact selected devices', async ({ page }) => {
+test('sends the leases of guarded devices and keeps saved connections masked', async ({ page }) => {
   await openZarap(page);
 
-  await page.getByLabel('VLESS Reality-ссылка').fill(validLink);
+  await page.getByLabel('Добавить подключение').fill(validLink);
   const tablet = page.locator('tr[data-mac="10:20:30:40:50:60"]');
-  await tablet.getByRole('checkbox').check();
   await tablet.locator('input[data-field="name"]').fill('Планшет ребёнка');
   await tablet.locator('input[data-field="ip"]').fill('192.168.1.62');
 
   await page.getByRole('button', { name: 'Проверить конфигурацию', exact: true }).click();
-  await expect(page.getByText('Ссылка и список устройств корректны')).toBeVisible();
+  await expect(page.getByText('Конфигурация корректна')).toBeVisible();
 
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const validate = calls.find(call => call.method === 'validate');
   const apply = calls.find(call => call.method === 'apply');
-  expect(validate.args[0]).toBe(validLink);
-  expect(apply.args[0]).toBe(validLink);
-  expect(apply.args[1]).toBe(true);
+  expect(apply.args[0]).toBe(true);
+  // Saved connections round-trip by tag with an empty link, so their secrets
+  // never leave the router; the pasted one is the only link on the wire.
+  expect(apply.args[1]).toEqual([
+    { tag: 'out_1', label: 'Нидерланды', link: '' },
+    { tag: 'out_2', label: 'Германия', link: '' },
+    { tag: '', label: '', link: validLink }
+  ]);
   expect(apply.args[2]).toEqual([
+    { clients: ['00:11:22:33:44:55'], target: 'out_1' },
+    { clients: ['10:20:30:40:50:60'], target: 'block' }
+  ]);
+  // Only devices a rule names carry a lease.
+  expect(apply.args[3]).toEqual([
     { mac: '00:11:22:33:44:55', name: 'Телевизор', ip: '192.168.1.50' },
     { mac: '10:20:30:40:50:60', name: 'Планшет ребёнка', ip: '192.168.1.62' }
   ]);
-  expect(apply.args[2].some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
+  expect(apply.args[3].some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
+  expect(apply.args[4]).toBe('direct');
 });
 
 test('shows backend validation errors without applying configuration', async ({ page }) => {
   await openZarap(page);
   await page.evaluate(() => { window.__mockState.validateError = 'MVP поддерживает только транспорт TCP'; });
-  await page.getByLabel('VLESS Reality-ссылка').fill(validLink.replace('type=tcp', 'type=ws'));
+  await page.getByLabel('Добавить подключение').fill(validLink.replace('type=tcp', 'type=ws'));
   await page.getByRole('button', { name: 'Проверить конфигурацию', exact: true }).click();
 
   await expect(page.getByText('MVP поддерживает только транспорт TCP')).toBeVisible();
@@ -162,4 +180,6 @@ test('keeps showing the kill switch while Zarap is switched off', async ({ page 
   await expect(page.getByText('kill switch активен')).toBeVisible();
   const held = page.locator('tr[data-mac="00:11:22:33:44:55"]');
   await expect(held).toContainText('kill switch');
+  // Only deleting the rule releases it, which stage 1 does not offer yet.
+  await expect(page.getByText(/Редактирование правил появится/)).toBeVisible();
 });

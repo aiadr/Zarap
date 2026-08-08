@@ -99,7 +99,9 @@ class PackageContractTests(unittest.TestCase):
         for type_name in ("'bool'", "'string'", "'number'", "'array'", "'boolean'"):
             self.assertNotIn(type_name, methods_body)
         self.assertIn("args: { refresh: true }", methods_body)
-        self.assertIn("args: { link: '', enabled: true, clients: [] }", methods_body)
+        self.assertIn(
+            "args: { enabled: true, outbounds: [], rules: [], clients: [], final: '' }",
+            methods_body)
 
     def test_atomic_temporary_files_share_target_directories(self):
         self.assertIn("const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp'", BACKEND)
@@ -130,21 +132,34 @@ class PackageContractTests(unittest.TestCase):
         # earlier version sent it to /dev/null and left a failure unexplained.
         self.assertIn("/usr/sbin/nft -f ' + NFT_SYNC + ' 2>&1", BACKEND)
         self.assertIn("synced.output", BACKEND)
-        self.assertIn("!synced.ok || !live_clients_match(live_clients)", BACKEND)
-        # The rollback path has to converge the kernel too.
-        self.assertIn("sync_live_sets(read_clients())", BACKEND)
+        self.assertIn("!synced.ok || !live_clients_match(live_guarded)", BACKEND)
+        # The rollback path has to converge the kernel too, from the rules that
+        # were restored rather than from the ones being applied.
+        self.assertIn("guarded_macs(saved_rules())", BACKEND)
+        self.assertIn("sync_live_sets(restored_guarded)", BACKEND)
 
     def test_the_kill_switch_outlives_the_master_switch(self):
-        # A selected device must not reach the WAN directly just because the
-        # proxy was switched off; only deselecting it opens that path. The
-        # TProxy redirect is the part tied to the proxy running, since sending
-        # traffic to a dead port would swallow it instead of rejecting it.
-        self.assertIn("validate_candidate(parsed_result.config, client_result.clients, enabled)", BACKEND)
-        self.assertIn("let live_clients = client_result.clients;", BACKEND)
+        # A device named by a rule must not reach the WAN directly just because
+        # the proxy was switched off; only deleting the rule opens that path.
+        # The TProxy redirect is the part tied to the proxy running, since
+        # sending traffic to a dead port would swallow it instead of rejecting.
+        self.assertIn(
+            "validate_candidate(request.outbounds, request.rules, request.final,",
+            BACKEND)
+        self.assertIn("let live_guarded = candidate.guarded;", BACKEND)
         self.assertIn("if (proxying)", BACKEND)
-        self.assertNotIn("enabled ? client_result.clients : []", BACKEND)
+        self.assertNotIn("enabled ? request.rules : []", BACKEND)
         view = (PACKAGE_ROOT / "htdocs/luci-static/resources/view/zarap/overview.js").read_text()
-        self.assertIn("device.kill_switch = !!(status.firewall && device.selected)", view)
+        self.assertIn("device.kill_switch = !!(status.firewall && device.guarded)", view)
+
+    def test_the_guarded_set_comes_only_from_the_rules(self):
+        # Invariant 2: capture is a property of the network, the kill switch a
+        # property of a device, and only a rule puts a device under it.
+        self.assertIn("function guarded_macs(rules)", BACKEND)
+        self.assertIn("for (let mac in guarded_macs(rules))", BACKEND)
+        # Nothing may pull the set out of the device list or the capture.
+        self.assertNotIn("zarap_clients_v4", BACKEND)
+        self.assertNotIn("function read_clients()", BACKEND)
 
     def test_deselecting_a_device_releases_its_managed_lease(self):
         # zarap_managed was written and read but never acted on, so a static
@@ -192,9 +207,15 @@ class PackageContractTests(unittest.TestCase):
     def test_the_masked_link_carries_the_saved_connection_name(self):
         # It used to end in a hardcoded #Zarap, discarding the name the link came
         # with. The name is a label, not a secret, so it survives round-tripping.
-        self.assertIn("'#' + (parsed.name || 'Zarap')", BACKEND)
-        self.assertIn("name: uci.get('zarap', 'main', 'name')", BACKEND)
-        self.assertIn("for (let key in ['name', 'server'", BACKEND)
+        self.assertIn("'#' + (outbound.label || 'Zarap')", BACKEND)
+        self.assertIn("label: section.label || ''", BACKEND)
+
+    def test_logs_scrub_every_connection(self):
+        # Walking only the first section would leak the uuid of a second proxy
+        # into the log the user copies out.
+        logs_body = BACKEND.split("function logs()", 1)[1].split("function package_version", 1)[0]
+        self.assertIn("for (let outbound in saved_outbounds())", logs_body)
+        self.assertNotIn("uci.get('zarap', 'main', 'uuid')", logs_body)
 
     def test_status_does_not_return_proxy_secrets(self):
         status_body = BACKEND.split("function status()", 1)[1].split("function logs()", 1)[0]
