@@ -176,12 +176,18 @@ class PackageContractTests(unittest.TestCase):
         self.assertNotRegex("00:11:22:33:44:55", pattern)
 
     def test_fixed_tproxy_resources(self):
-        for value in ("7893", "0x5a52", "2022", "zarap_clients_v4"):
+        for value in ("7893", "0x5a52", "2022", "zarap_guarded_v4"):
             self.assertIn(value, BACKEND + NFT)
 
     def test_kill_switch_covers_ipv4_and_ipv6(self):
-        self.assertIn("ip saddr @zarap_clients_v4 reject", NFT)
-        self.assertIn("ether saddr @zarap_clients_mac ether type ip6 reject", NFT)
+        # The shipped file is the empty-but-safe state: the kill switch chain
+        # exists with nothing in its set, and there is no capture yet. IPv6 is
+        # barred for the whole LAN, which needs the interface the backend reads
+        # at generation time, so those rules appear only in generated output.
+        self.assertIn("ip saddr @zarap_guarded_v4 reject", NFT)
+        self.assertNotIn("tproxy ip to", NFT)
+        self.assertIn('ether type ip6 reject', BACKEND)
+        self.assertNotIn("zarap_clients_mac", BACKEND + NFT)
 
     def test_the_masked_link_carries_the_saved_connection_name(self):
         # It used to end in a hardcoded #Zarap, discarding the name the link came

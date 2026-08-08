@@ -22,6 +22,19 @@ const LOCK_FILE = '/var/lock/zarap.lock';
 // inside the LuCI RPC deadline.
 const LISTENER_WAIT = 5;
 
+// Fixed resources. These used to live in uci and read like settings, but every
+// consumer here substituted the literals anyway, so changing one produced a
+// broken system complaining about a port it was no longer using. They are
+// constants; /etc/init.d/zarap carries the same values for the policy routing.
+const CAPTURE_PORT = 7893;
+const MARK = '0x5a52';
+const ROUTE_TABLE = 2022;
+const INBOUND_TAG = 'zarap-tproxy';
+
+// Outbound section names double as sing-box tags, so they have to stay clear of
+// the tags sing-box gives its own meanings.
+const RESERVED_TAGS = { direct: true, block: true, dns: true, main: true, [INBOUND_TAG]: true };
+
 function result_error(message, details, kind) {
 	return { ok: false, error: message, details: details || '', kind: kind || 'operation_error' };
 }
@@ -215,36 +228,97 @@ function validate_clients(clients) {
 	return { ok: true, clients: result };
 }
 
-function sing_box_config(parsed, listen_port) {
-	let outbound = {
+function valid_outbound_tag(tag) {
+	return !!match(tag || '', /^out_[0-9]+$/) && !RESERVED_TAGS[tag];
+}
+
+function outbound_json(outbound) {
+	let json = {
 		type: 'vless',
-		tag: 'zarap-proxy',
-		server: parsed.server,
-		server_port: parsed.server_port,
-		uuid: parsed.uuid,
+		tag: outbound.tag,
+		server: outbound.server,
+		server_port: outbound.server_port,
+		uuid: outbound.uuid,
 		tls: {
 			enabled: true,
-			server_name: parsed.server_name,
-			utls: { enabled: true, fingerprint: parsed.fingerprint },
-			reality: { enabled: true, public_key: parsed.public_key }
+			server_name: outbound.server_name,
+			utls: { enabled: true, fingerprint: outbound.fingerprint || 'chrome' },
+			reality: { enabled: true, public_key: outbound.public_key }
 		}
 	};
 
-	if (parsed.flow)
-		outbound.flow = parsed.flow;
-	if (parsed.short_id)
-		outbound.tls.reality.short_id = parsed.short_id;
+	if (outbound.flow)
+		json.flow = outbound.flow;
+	if (outbound.short_id)
+		json.tls.reality.short_id = outbound.short_id;
+	return json;
+}
+
+// sing-box cannot match a source by MAC, so a device is represented by the
+// address its static lease pins. address_of maps one to the other.
+function rule_json(rule, address_of) {
+	let sources = [];
+	for (let mac in (rule.clients || [])) {
+		let address = address_of[mac];
+		if (address)
+			push(sources, address + '/32');
+	}
+
+	// The inbound is the only one there is, so naming it changes nothing today.
+	// It is written from the start so that splitting the capture across several
+	// TProxy ports later does not mean rewriting every rule.
+	let json = { inbound: [INBOUND_TAG] };
+	if (length(sources))
+		json.source_ip_cidr = sources;
+	// The special `block` outbound was deprecated in sing-box 1.11 and removed
+	// in 1.13; the rule action replaces it.
+	if (rule.target == 'block')
+		json.action = 'reject';
+	else
+		json.outbound = rule.target;
+	return json;
+}
+
+function sing_box_config(outbounds, rules, final, address_of) {
+	let emitted = [], route_rules = [], wants_direct = false;
+
+	for (let outbound in outbounds)
+		push(emitted, outbound_json(outbound));
+
+	for (let rule in rules) {
+		push(route_rules, rule_json(rule, address_of || {}));
+		if (rule.target == 'direct')
+			wants_direct = true;
+	}
+
+	// `final` takes an outbound tag, and `block` is no longer one. Blocking the
+	// remainder is therefore a trailing rule that matches everything, with the
+	// field itself filled by a declared tag so it stays valid — the flow never
+	// reaches it.
+	let final_tag = final;
+	if (final == 'block') {
+		push(route_rules, { inbound: [INBOUND_TAG], action: 'reject' });
+		final_tag = length(outbounds) ? outbounds[0].tag : 'direct';
+	}
+	if (final_tag == 'direct')
+		wants_direct = true;
+
+	// Declared only when something points at it: an unreferenced `direct` would
+	// turn a mistyped tag into a silent path to the WAN, while an undeclared one
+	// makes `sing-box check` reject the configuration outright.
+	if (wants_direct)
+		push(emitted, { type: 'direct', tag: 'direct' });
 
 	return {
 		log: { level: 'info', timestamp: true },
 		inbounds: [{
 			type: 'tproxy',
-			tag: 'zarap-tproxy',
+			tag: INBOUND_TAG,
 			listen: '0.0.0.0',
-			listen_port: listen_port
+			listen_port: CAPTURE_PORT
 		}],
-		outbounds: [outbound],
-		route: { auto_detect_interface: true, final: 'zarap-proxy' }
+		outbounds: emitted,
+		route: { auto_detect_interface: true, rules: route_rules, final: final_tag }
 	};
 }
 
@@ -325,36 +399,56 @@ function nft_set(name, type_name, flags, elements) {
 	return text + '}\n\n';
 }
 
-// A selected device must never reach the WAN directly, so the kill switch holds
-// whether or not the proxy is running. The TProxy redirect is the part that
-// depends on it: pointing traffic at a port nothing listens on would swallow it
-// silently, while leaving only the kill switch rejects it outright.
-function nft_config(clients, listen_port, proxying) {
-	let ips = map(clients, function(client) { return client.ip; });
-	let macs = map(clients, function(client) { return client.mac; });
+// The device the LAN is bridged onto. Read on every generation rather than
+// baked in: a redirect rule without an interface condition would capture
+// traffic arriving from the WAN too, so an unanswered ubus has to fail the
+// apply instead of producing an unrestricted rule.
+function lan_device() {
+	let ubus = connect();
+	if (!ubus)
+		return '';
+	let lan = ubus.call('network.interface.lan', 'status') || {};
+	ubus.disconnect();
+	let device = trim('' + (lan.l3_device || lan.device || ''));
+	return match(device, /^[A-Za-z0-9._-]+$/) ? device : '';
+}
+
+// Two different jobs, two different sources. The redirect captures everything
+// arriving from the LAN and knows nothing about devices. The kill switch holds
+// only the devices named in a rule, and holds them whether or not the proxy is
+// running — releasing one means deleting its rule.
+//
+// The redirect itself is the part tied to the master switch: pointing traffic
+// at a port nothing listens on would swallow it silently, so switching Zarap
+// off drops the rule and the LAN forwards normally again.
+function nft_config(guarded_ips, lan, proxying) {
 	let direct = direct_networks();
 	let text = '# Generated by Zarap. Manual changes will be overwritten.\n';
 
-	text += nft_set('zarap_clients_v4', 'ipv4_addr', '', ips);
-	text += nft_set('zarap_clients_mac', 'ether_addr', '', macs);
+	text += nft_set('zarap_guarded_v4', 'ipv4_addr', '', guarded_ips);
 	text += nft_set('zarap_direct_v4', 'ipv4_addr', 'interval', direct.v4);
 	text += nft_set('zarap_direct_v6', 'ipv6_addr', 'interval', direct.v6);
 	text += 'chain zarap_prerouting {\n';
 	text += '\ttype filter hook prerouting priority mangle; policy accept;\n';
-	text += '\tip saddr @zarap_clients_v4 ip daddr @zarap_direct_v4 return\n';
+	// Keeps the router itself, traffic between LAN subnets, multicast and
+	// broadcast out of the capture. Without it dnsmasq's own port goes to TProxy.
+	text += '\tiifname "' + lan + '" ip daddr @zarap_direct_v4 return\n';
 	if (proxying)
-		text += '\tip saddr @zarap_clients_v4 meta l4proto { tcp, udp } meta mark set 0x5a52 tproxy ip to 127.0.0.1:' + listen_port + ' accept\n';
+		text += '\tiifname "' + lan + '" meta l4proto { tcp, udp } meta mark set ' + MARK + ' tproxy ip to 127.0.0.1:' + CAPTURE_PORT + ' accept\n';
 	text += '}\n\n';
 	text += 'chain zarap_killswitch_forward {\n';
 	text += '\ttype filter hook forward priority filter + 10; policy accept;\n';
-	text += '\tip saddr @zarap_clients_v4 ip daddr @zarap_direct_v4 return\n';
-	text += '\tip saddr @zarap_clients_v4 reject\n';
-	text += '\tether saddr @zarap_clients_mac ether type ip6 ip6 daddr @zarap_direct_v6 return\n';
-	text += '\tether saddr @zarap_clients_mac ether type ip6 reject\n';
+	text += '\tip saddr @zarap_guarded_v4 ip daddr @zarap_direct_v4 return\n';
+	text += '\tip saddr @zarap_guarded_v4 reject\n';
+	// IPv6 is not proxied, and it is not handed out to the LAN either, so there
+	// is no device to single out here: the whole LAN is barred from routing it.
+	// That also covers an address someone configured by hand.
+	text += '\tiifname "' + lan + '" ether type ip6 ip6 daddr @zarap_direct_v6 return\n';
+	text += '\tiifname "' + lan + '" ether type ip6 reject\n';
 	text += '}\n\n';
 	text += 'chain zarap_protect_tproxy {\n';
 	text += '\ttype filter hook input priority filter - 10; policy accept;\n';
-	text += '\tmeta l4proto { tcp, udp } th dport ' + listen_port + ' meta mark != 0x5a52 drop\n';
+	text += '\tmeta l4proto { tcp, udp } th dport ' + CAPTURE_PORT + ' meta mark != ' + MARK + ' drop\n';
 	text += '}\n';
 	return text;
 }
@@ -658,15 +752,10 @@ function validate_candidate(parsed, clients, proxying) {
 // the previous addresses in the kernel, so a deselected device stayed in the
 // kill switch and kept having its traffic sent to a TProxy port nothing was
 // listening on. Drive the live sets to the intended contents explicitly.
-function sync_live_sets(clients) {
-	let ips = [], macs = [], direct = direct_networks();
-	for (let client in clients) {
-		if (client.ip) push(ips, client.ip);
-		if (client.mac) push(macs, client.mac);
-	}
+function sync_live_sets(guarded_ips) {
+	let direct = direct_networks();
 	let wanted = {
-		zarap_clients_v4: ips,
-		zarap_clients_mac: macs,
+		zarap_guarded_v4: guarded_ips,
 		zarap_direct_v4: direct.v4,
 		zarap_direct_v6: direct.v6
 	};
@@ -689,12 +778,12 @@ function sync_live_sets(clients) {
 
 // Reads back what the kernel holds, so an apply cannot report success while the
 // device is still caught by rules that were only cleared on paper.
-function live_clients_match(clients) {
-	let live = capture('/usr/sbin/nft list set inet fw4 zarap_clients_v4').output;
-	for (let client in clients)
-		if (client.ip && index(live, client.ip) < 0)
+function live_clients_match(guarded_ips) {
+	let live = capture('/usr/sbin/nft list set inet fw4 zarap_guarded_v4').output;
+	for (let address in guarded_ips)
+		if (index(live, address) < 0)
 			return false;
-	if (!length(clients) && index(live, 'elements') >= 0)
+	if (!length(guarded_ips) && index(live, 'elements') >= 0)
 		return false;
 	return true;
 }
