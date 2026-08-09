@@ -217,6 +217,28 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("for (let outbound in saved_outbounds())", logs_body)
         self.assertNotIn("uci.get('zarap', 'main', 'uuid')", logs_body)
 
+    def test_ipv6_advertisement_is_turned_off_and_handed_back(self):
+        # The capture is IPv4 only, so an advertised IPv6 would be a path around
+        # sing-box for the whole LAN. It is somebody else's setting, so the
+        # previous value is recorded on the first apply and restored on removal.
+        self.assertIn("for (let key in ['ra', 'dhcpv6', 'ndp'])", BACKEND)
+        self.assertIn("uci.set('dhcp', 'lan', key, 'disabled')", BACKEND)
+        self.assertIn("uci.set('zarap', 'main', 'saved_' + key", BACKEND)
+        self.assertIn("define Package/luci-app-zarap/prerm", MAKEFILE)
+        self.assertIn("zarap.main.saved_$$key", MAKEFILE)
+
+    def test_fixed_resources_are_not_pretend_settings(self):
+        # They used to sit in uci looking configurable while every consumer
+        # substituted the literal, so changing one produced a system that
+        # disagreed with itself.
+        config = (PACKAGE_ROOT / "root/etc/config/zarap").read_text()
+        init = (PACKAGE_ROOT / "root/etc/init.d/zarap").read_text()
+        for option in ("listen_port", "mark", "route_table"):
+            self.assertNotIn(option, config)
+        self.assertNotIn("config_get mark", init)
+        self.assertNotIn("config_get route_table", init)
+        self.assertIn("const CAPTURE_PORT = 7893", BACKEND)
+
     def test_status_does_not_return_proxy_secrets(self):
         status_body = BACKEND.split("function status()", 1)[1].split("function logs()", 1)[0]
         for secret_field in ("uuid:", "public_key:", "short_id:"):

@@ -714,6 +714,23 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients) {
 		uci.set('dhcp', section, 'ip', client.ip);
 		uci.set('dhcp', section, 'zarap_managed', '1');
 	}
+
+	// The capture is IPv4 only, so an advertised IPv6 would be a path around
+	// sing-box for the whole LAN. Not handing it out beats rejecting it packet
+	// by packet: a device that never gets a global address never tries to use
+	// one, instead of falling back to IPv4 on every connection.
+	//
+	// This holds whether or not Zarap is enabled, to match the blanket IPv6
+	// reject in the kill switch chain — restoring advertisement while that rule
+	// stands would hand out addresses that cannot work.
+	for (let key in ['ra', 'dhcpv6', 'ndp']) {
+		let previous = uci.get('dhcp', 'lan', key);
+		// Recorded once, on the first apply, so removing the package can put
+		// back what the router had rather than a guess at the default.
+		if (uci.get('zarap', 'main', 'saved_' + key) == null)
+			uci.set('zarap', 'main', 'saved_' + key, previous == null ? '' : previous);
+		uci.set('dhcp', 'lan', key, 'disabled');
+	}
 	uci.load('sing-box');
 	uci.set('sing-box', 'main', 'sing-box');
 	uci.set('sing-box', 'main', 'enabled', enabled ? '1' : '0');
