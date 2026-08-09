@@ -176,6 +176,53 @@ class RouteMappingTests(unittest.TestCase):
         self.assertEqual(inbounds[0]["tag"], "zarap-tproxy")
         self.assertEqual(inbounds[0]["listen_port"], 7893)
 
+    def resolve(self, rules, final, macs):
+        source = BACKEND.read_text()
+        script = "%s\n%s\nfor (let mac in %s) printf('%%s ', resolved_target(mac, %s, %s));\n" % (
+            "\n".join(lift(source, name)
+                       for name in ("guarded_macs", "resolved_target")),
+            "", json.dumps(macs), json.dumps(rules), json.dumps(final))
+        with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run([self.ucode, path], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout.split()
+        finally:
+            os.unlink(path)
+
+    def test_first_matching_rule_decides_where_a_device_goes(self):
+        rules = [
+            {"clients": ["00:11:22:33:44:55"], "target": "out_1"},
+            {"clients": ["00:11:22:33:44:55", "AA:BB:CC:DD:EE:FF"], "target": "block"},
+        ]
+        self.assertEqual(
+            self.resolve(rules, "direct",
+                         ["00:11:22:33:44:55", "AA:BB:CC:DD:EE:FF", "10:20:30:40:50:60"]),
+            ["out_1", "block", "direct"])
+
+    def test_guarded_macs_collects_every_named_device(self):
+        source = BACKEND.read_text()
+        rules = [
+            {"clients": ["00:11:22:33:44:55"], "target": "direct"},
+            {"clients": ["AA:BB:CC:DD:EE:FF", "00:11:22:33:44:55"], "target": "block"},
+        ]
+        # Iterating an object in ucode yields keys, and the set has to come out
+        # deduplicated regardless of what the rules target.
+        script = "%s\nlet macs = [];\nfor (let mac in guarded_macs(%s)) push(macs, mac);\nprintf('%%J', sort(macs));\n" % (
+            lift(source, "guarded_macs"), json.dumps(rules))
+        with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run([self.ucode, path], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(json.loads(done.stdout),
+                             ["00:11:22:33:44:55", "AA:BB:CC:DD:EE:FF"])
+        finally:
+            os.unlink(path)
+
     def test_outbound_tags_are_validated(self):
         script = "%s\nfor (let tag in %s) printf('%%s ', valid_outbound_tag(tag));\n" % (
             self.prelude,
