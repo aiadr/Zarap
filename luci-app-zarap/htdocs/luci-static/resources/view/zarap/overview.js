@@ -235,11 +235,242 @@ function outboundRow(outbound) {
 	]);
 }
 
-function ruleRow(rule, index) {
-	return E('tr', { 'class': 'tr' }, [
+// Deleting a rule is the only way to release a device: rules have no switch,
+// precisely so that editing one cannot open a path out by accident. Say what it
+// costs before doing it.
+function confirmRuleRemoval(index, owner) {
+	const rule = state.rules[index];
+	const losing = (rule.clients || []).filter(function(mac) {
+		return !state.rules.some(function(other, position) {
+			return position !== index && (other.clients || []).indexOf(mac) >= 0;
+		});
+	});
+
+	ui.showModal(_('Удалить правило?'), [
+		E('p', {}, losing.length
+			? _('Устройства получат прямой выход в интернет и лишатся закреплённого адреса: %s.')
+				.format(losing.map(deviceLabel).join(', '))
+			: _('Эти устройства названы и другими правилами, поэтому останутся под kill switch.')),
+		E('div', { 'class': 'right', 'style': ACTION_ROW }, [
+			E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Отмена')),
+			E('button', {
+				'class': 'btn cbi-button-negative important',
+				'click': ui.createHandlerFn(owner, function() {
+					state.rules.splice(index, 1);
+					ui.hideModal();
+					refresh();
+				})
+			}, _('Удалить'))
+		])
+	]);
+}
+
+const MAC_PATTERN = /^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/;
+
+function normalizeMac(value) {
+	const mac = String(value || '').trim().toUpperCase();
+	return MAC_PATTERN.test(mac) ? mac : null;
+}
+
+// A private MAC changes on every association, so a lease cannot pin it and the
+// backend refuses it outright. Better said here than after an apply.
+function isPrivateMac(mac) {
+	return /^[0-9A-F][2367ABEF]:/.test(mac || '');
+}
+
+function deviceLabel(mac) {
+	const known = state.devices.filter(function(device) { return device.mac === mac; })[0];
+	return known && known.name ? '%s (%s)'.format(known.name, mac) : mac;
+}
+
+// Picks the devices for one rule. Opened per rule rather than driven from the
+// device table: a device belongs to a rule, and several rules may name it.
+//
+// The address is deliberately not editable here. One device has one lease, so
+// letting two rules each edit it would give two places for one fact; the picker
+// shows it, the device table owns it.
+function devicePicker(rule, owner, onDone) {
+	const chosen = {};
+	(rule.clients || []).forEach(function(mac) { chosen[mac] = true; });
+
+	// Devices already named by the rule but never discovered still have to show,
+	// or opening the picker would silently drop them.
+	const known = {};
+	state.devices.forEach(function(device) { known[device.mac] = device; });
+	const listed = state.devices.slice();
+	Object.keys(chosen).forEach(function(mac) {
+		if (!known[mac])
+			listed.push({ mac: mac, name: '', ip: '', private_mac: isPrivateMac(mac) });
+	});
+
+	const body = E('tbody', {});
+	const filter = E('input', {
+		'class': 'cbi-input-text', 'style': 'width:100%',
+		'placeholder': _('Поиск по имени, MAC или адресу')
+	});
+	const manual = E('input', { 'class': 'cbi-input-text', 'placeholder': '00:11:22:33:44:55' });
+	const manualError = E('div', { 'class': 'error', 'style': 'display:none' });
+
+	function draw() {
+		const needle = filter.value.trim().toLowerCase();
+		const rows = listed.filter(function(device) {
+			if (!needle)
+				return true;
+			return [device.mac, device.name, device.ip].join(' ').toLowerCase().indexOf(needle) >= 0;
+		}).map(function(device) {
+			const blocked = device.private_mac;
+			const box = E('input', {
+				'type': 'checkbox',
+				'data-mac': device.mac,
+				'checked': chosen[device.mac] ? '' : null,
+				'disabled': blocked ? '' : null,
+				'title': blocked ? _('Приватный MAC: правило для него создать нельзя') : ''
+			});
+			box.addEventListener('change', function() {
+				if (box.checked)
+					chosen[device.mac] = true;
+				else
+					delete chosen[device.mac];
+			});
+			return E('tr', { 'class': 'tr' }, [
+				E('td', { 'class': 'td' }, [ box ]),
+				E('td', { 'class': 'td' }, device.name || '—'),
+				E('td', { 'class': 'td' }, device.mac),
+				E('td', { 'class': 'td' }, device.ip || '—'),
+				E('td', { 'class': 'td' }, blocked
+					? E('span', { 'class': 'label warning' }, _('приватный MAC'))
+					: (device.connected ? _('в сети') : ''))
+			]);
+		});
+		dom.content(body, rows.length ? rows
+			: E('tr', {}, E('td', { 'colspan': 5 }, _('Ничего не найдено'))));
+	}
+
+	filter.addEventListener('input', draw);
+	draw();
+
+	ui.showModal(_('Устройства правила'), [
+		E('p', {}, _('Адрес здесь не редактируется: аренда у устройства одна, и правится она в таблице устройств.')),
+		E('div', { 'class': 'cbi-value' }, [ filter ]),
+		E('div', { 'style': 'max-height:20em;overflow:auto' }, [
+			E('table', { 'class': 'table', 'id': 'zarap-picker' }, [
+				E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
+					E('th', { 'class': 'th' }, ''),
+					E('th', { 'class': 'th' }, _('Имя')),
+					E('th', { 'class': 'th' }, _('MAC')),
+					E('th', { 'class': 'th' }, _('Адрес')),
+					E('th', { 'class': 'th' }, _('Состояние'))
+				])),
+				body
+			])
+		]),
+		E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title' }, _('Добавить MAC вручную')),
+			E('div', { 'class': 'cbi-value-field' }, [
+				manual,
+				E('button', {
+					'class': 'btn cbi-button-neutral',
+					'style': 'margin-left:.5em',
+					'click': function() {
+						const mac = normalizeMac(manual.value);
+						if (!mac) {
+							manualError.style.display = '';
+							dom.content(manualError, _('Некорректный MAC-адрес'));
+							return;
+						}
+						if (isPrivateMac(mac)) {
+							manualError.style.display = '';
+							dom.content(manualError, _('Приватный MAC: правило для него создать нельзя'));
+							return;
+						}
+						manualError.style.display = 'none';
+						manual.value = '';
+						chosen[mac] = true;
+						if (!listed.some(function(device) { return device.mac === mac; }))
+							listed.push({ mac: mac, name: '', ip: '', private_mac: false });
+						filter.value = '';
+						draw();
+					}
+				}, _('Добавить')),
+				manualError
+			])
+		]),
+		E('div', { 'class': 'right', 'style': ACTION_ROW }, [
+			E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Отмена')),
+			E('button', {
+				'class': 'btn cbi-button-positive important',
+				'click': ui.createHandlerFn(owner, function() {
+					rule.clients = Object.keys(chosen);
+					ui.hideModal();
+					onDone();
+				})
+			}, _('Готово'))
+		])
+	]);
+}
+
+function targetSelect(current, onChange) {
+	const select = E('select', { 'class': 'cbi-input-select' });
+	const options = [ { value: 'direct', text: _('напрямую') } ]
+		.concat(state.outbounds.map(function(outbound) {
+			return { value: outbound.tag, text: outbound.label || outbound.tag };
+		}))
+		.concat([ { value: 'block', text: _('заблокировать') } ]);
+	options.forEach(function(option) {
+		select.appendChild(E('option', {
+			'value': option.value, 'selected': option.value === current ? '' : null
+		}, option.text));
+	});
+	select.addEventListener('change', function() { onChange(select.value); });
+	return select;
+}
+
+function moveRule(index, delta) {
+	const target = index + delta;
+	if (target < 0 || target >= state.rules.length)
+		return;
+	const moved = state.rules.splice(index, 1)[0];
+	state.rules.splice(target, 0, moved);
+	refresh();
+}
+
+function ruleRow(rule, index, owner) {
+	return E('tr', { 'class': 'tr', 'data-rule': String(index) }, [
 		E('td', { 'class': 'td' }, String(index + 1)),
-		E('td', { 'class': 'td' }, (rule.clients || []).join(', ')),
-		E('td', { 'class': 'td' }, targetLabel(rule.target))
+		E('td', { 'class': 'td' }, [
+			E('span', { 'data-field': 'clients' }, (rule.clients || []).length
+				? (rule.clients || []).map(deviceLabel).join(', ')
+				: _('устройства не выбраны')),
+			E('button', {
+				'class': 'btn cbi-button-neutral',
+				'style': 'margin-left:.5em',
+				'click': ui.createHandlerFn(owner, function() {
+					devicePicker(rule, owner, refresh);
+				})
+			}, _('Устройства…'))
+		]),
+		E('td', { 'class': 'td' }, [
+			targetSelect(rule.target, function(value) { rule.target = value; refresh(); })
+		]),
+		E('td', { 'class': 'td' }, [
+			E('button', {
+				'class': 'btn cbi-button-neutral',
+				'title': _('Выше'),
+				'disabled': index === 0 ? '' : null,
+				'click': ui.createHandlerFn(owner, function() { moveRule(index, -1); })
+			}, '↑'),
+			E('button', {
+				'class': 'btn cbi-button-neutral',
+				'title': _('Ниже'),
+				'disabled': index === state.rules.length - 1 ? '' : null,
+				'click': ui.createHandlerFn(owner, function() { moveRule(index, 1); })
+			}, '↓'),
+			E('button', {
+				'class': 'btn cbi-button-negative',
+				'style': 'margin-left:.5em',
+				'click': ui.createHandlerFn(owner, function() { confirmRuleRemoval(index, owner); })
+			}, _('Удалить'))
+		])
 	]);
 }
 
@@ -251,10 +482,16 @@ function renderOutbounds() {
 		: E('tr', {}, E('td', { 'colspan': 4 }, _('Подключений пока нет')));
 }
 
-function renderRules() {
+// The owner is the view instance ui.createHandlerFn binds handlers to. A redraw
+// triggered from a handler has no view in scope, so the one from the first
+// render is kept here.
+function renderRules(owner) {
+	if (owner)
+		renderRules.owner = owner;
+	const context = renderRules.owner;
 	return state.rules.length
-		? state.rules.map(ruleRow)
-		: E('tr', {}, E('td', { 'colspan': 3 }, _('Правил пока нет: весь трафик идёт по умолчанию')));
+		? state.rules.map(function(rule, index) { return ruleRow(rule, index, context); })
+		: E('tr', {}, E('td', { 'colspan': 4 }, _('Правил пока нет: весь трафик идёт по умолчанию')));
 }
 
 function renderDevices() {
@@ -439,12 +676,23 @@ return view.extend({
 						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
 							E('th', { 'class': 'th' }, '#'),
 							E('th', { 'class': 'th' }, _('Устройства')),
-							E('th', { 'class': 'th' }, _('Куда'))
+							E('th', { 'class': 'th' }, _('Куда')),
+							E('th', { 'class': 'th' }, '')
 						])),
-						E('tbody', { 'id': 'zarap-rules-body' }, renderRules())
+						E('tbody', { 'id': 'zarap-rules-body' }, renderRules(this))
 					]),
-					E('p', { 'id': 'zarap-final' }, _('Остальной трафик: %s').format(targetLabel(state.final))),
-					E('p', { 'class': 'cbi-value-description' }, _('Редактирование правил появится в следующей версии; пока их задаёт uci в /etc/config/zarap.'))
+					E('div', { 'style': ACTION_ROW }, [
+						E('button', {
+							'id': 'zarap-add-rule',
+							'class': 'btn cbi-button-add',
+							'click': ui.createHandlerFn(this, function() {
+								state.rules.push({ clients: [], target: state.outbounds.length
+									? state.outbounds[0].tag : 'direct' });
+								refresh();
+							})
+						}, _('Добавить правило'))
+					]),
+					E('p', { 'id': 'zarap-final' }, _('Остальной трафик: %s').format(targetLabel(state.final)))
 				]),
 
 				E('div', { 'class': 'cbi-section' }, [

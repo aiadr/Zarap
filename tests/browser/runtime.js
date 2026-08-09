@@ -55,6 +55,12 @@ const fixtures = {
         connected: true, wireless: true, network: 'Home', signal: -55,
         has_static_lease: false, private_mac: true,
         guarded: false, resolved_target: 'direct'
+      },
+      {
+        mac: 'AA:BB:CC:DD:EE:FF', name: 'Принтер', ip: '192.168.1.80',
+        connected: true, wireless: false,
+        has_static_lease: false, private_mac: false,
+        guarded: false, resolved_target: 'direct'
       }
     ]
   },

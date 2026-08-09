@@ -28,7 +28,7 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
   await expect(page.locator('#zarap-tab-setup')).toBeVisible();
   await expect(page.locator('#zarap-tab-maintenance')).toBeHidden();
 
-  await expect(page.locator('#zarap-devices tbody tr')).toHaveCount(3);
+  await expect(page.locator('#zarap-devices tbody tr')).toHaveCount(4);
   const privateDevice = page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"]');
   await expect(privateDevice).toContainText('Приватный MAC');
   // Not named by any rule, so it carries no lease to edit and no kill switch.
@@ -194,6 +194,78 @@ test('keeps showing the kill switch while Zarap is switched off', async ({ page 
   await expect(page.getByText('kill switch активен')).toBeVisible();
   const held = page.locator('tr[data-mac="00:11:22:33:44:55"]');
   await expect(held).toContainText('kill switch');
-  // Only deleting the rule releases it, which stage 1 does not offer yet.
-  await expect(page.getByText(/Редактирование правил появится/)).toBeVisible();
+});
+
+test('adds a rule and picks its devices without touching the router', async ({ page }) => {
+  await openZarap(page);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await expect(page.locator('#zarap-rules-body tr')).toHaveCount(3);
+
+  const added = page.locator('#zarap-rules-body tr[data-rule="2"]');
+  await expect(added).toContainText('устройства не выбраны');
+  await added.getByRole('button', { name: 'Устройства…' }).click();
+
+  // The phone is unguarded before this and has no address field.
+  await expect(page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"] input[data-field="ip"]')).toHaveCount(0);
+  await page.locator('#zarap-picker input[data-mac="10:20:30:40:50:60"]').check();
+  await page.getByRole('button', { name: 'Готово' }).click();
+
+  await expect(added).toContainText('10:20:30:40:50:60');
+  // Nothing reaches the router until the configuration is applied.
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.some(call => call.method === 'apply')).toBe(false);
+});
+
+test('a device added to a rule immediately gets an address field', async ({ page }) => {
+  await openZarap(page);
+  const phone = page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"]');
+  await expect(phone.locator('input[data-field="ip"]')).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await page.locator('#zarap-rules-body tr[data-rule="2"]')
+    .getByRole('button', { name: 'Устройства…' }).click();
+  // A private MAC cannot be pinned by a lease, so it is refused here rather
+  // than after an apply.
+  await expect(page.locator('#zarap-picker input[data-mac="02:AA:BB:CC:DD:EE"]')).toBeDisabled();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+
+  // A device that can be pinned gets the field as soon as a rule names it.
+  await page.locator('#zarap-rules-body tr[data-rule="2"]')
+    .getByRole('button', { name: 'Устройства…' }).click();
+  await page.locator('#zarap-picker input[data-mac="AA:BB:CC:DD:EE:FF"]').check();
+  await page.getByRole('button', { name: 'Готово' }).click();
+  await expect(page.locator('tr[data-mac="AA:BB:CC:DD:EE:FF"] input[data-field="ip"]')).toHaveCount(1);
+});
+
+test('reorders rules and applies them in the shown order', async ({ page }) => {
+  await openZarap(page);
+
+  const first = page.locator('#zarap-rules-body tr[data-rule="0"]');
+  await first.getByRole('button', { name: '↓' }).click();
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  expect(apply.args[2]).toEqual([
+    { clients: ['10:20:30:40:50:60'], target: 'block' },
+    { clients: ['00:11:22:33:44:55'], target: 'out_1' }
+  ]);
+});
+
+test('deleting a rule warns what the device loses', async ({ page }) => {
+  await openZarap(page);
+
+  await page.locator('#zarap-rules-body tr[data-rule="0"]')
+    .getByRole('button', { name: 'Удалить' }).click();
+  const dialog = page.locator('#modal');
+  await expect(dialog).toContainText('получат прямой выход в интернет и лишатся закреплённого адреса');
+  await expect(dialog).toContainText('Телевизор (00:11:22:33:44:55)');
+
+  await page.locator('#modal').getByRole('button', { name: 'Удалить' }).click();
+  await expect(page.locator('#zarap-rules-body tr')).toHaveCount(1);
+  // The television is no longer guarded, so its lease is no longer editable.
+  await expect(page.locator('tr[data-mac="00:11:22:33:44:55"] input[data-field="ip"]')).toHaveCount(0);
 });
