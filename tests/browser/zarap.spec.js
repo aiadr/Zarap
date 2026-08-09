@@ -28,7 +28,7 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
   await expect(page.locator('#zarap-tab-setup')).toBeVisible();
   await expect(page.locator('#zarap-tab-maintenance')).toBeHidden();
 
-  await expect(page.locator('#zarap-devices tbody tr')).toHaveCount(4);
+  await expect(page.locator('#zarap-devices tbody tr')).toHaveCount(5);
   const privateDevice = page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"]');
   await expect(privateDevice).toContainText('Приватный MAC');
   // Not named by any rule, so it carries no lease to edit and no kill switch.
@@ -267,6 +267,54 @@ test('names a device while picking it for a rule', async ({ page }) => {
   expect(apply.args[3]).toContainEqual({
     mac: 'AA:BB:CC:DD:EE:FF', name: 'realme', ip: '192.168.1.81'
   });
+});
+
+test('a device with no lease is offered a free address when a rule names it', async ({ page }) => {
+  await openZarap(page);
+
+  // Nothing to show and nothing to edit until a rule names it.
+  const phone = page.locator('tr[data-mac="FC:D2:02:D3:28:63"]');
+  await expect(phone.locator('input[data-field="ip"]')).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await page.locator('#zarap-rules-body tr[data-rule="2"]')
+    .getByRole('button', { name: 'Устройства…' }).click();
+  await page.locator('#zarap-picker input[data-mac="FC:D2:02:D3:28:63"]').check();
+  await page.getByRole('button', { name: 'Готово' }).click();
+
+  // The field is answerable straight away rather than an empty box that only
+  // fails on apply.
+  await expect(phone.locator('input[data-field="ip"]')).toHaveValue('192.168.1.90');
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  expect(apply.args[3]).toContainEqual({
+    mac: 'FC:D2:02:D3:28:63', name: 'Устройство FC:D2:02:D3:28:63', ip: '192.168.1.90'
+  });
+});
+
+test('refuses to send a rule whose device has no address', async ({ page }) => {
+  await openZarap(page);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await page.locator('#zarap-rules-body tr[data-rule="2"]')
+    .getByRole('button', { name: 'Устройства…' }).click();
+  // A MAC typed by hand is on no lease and has no suggestion behind it.
+  await page.getByPlaceholder('00:11:22:33:44:55').fill('10:34:56:78:9a:bc');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await page.getByRole('button', { name: 'Готово' }).click();
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  // The router can only name the MAC in its refusal, and only after a round
+  // trip; the page says which device and puts the cursor in the field.
+  await expect(page.getByText(/10:34:56:78:9A:BC нужен статический IPv4-адрес/)).toBeVisible();
+  await expect(page.locator('tr[data-mac="10:34:56:78:9A:BC"] input[data-field="ip"]')).toBeFocused();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.some(call => call.method === 'apply')).toBe(false);
 });
 
 test('a MAC typed by hand gets a row to carry its address', async ({ page }) => {

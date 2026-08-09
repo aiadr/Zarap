@@ -61,6 +61,15 @@ const fixtures = {
         connected: true, wireless: false,
         has_static_lease: false, private_mac: false,
         guarded: false, resolved_target: 'direct'
+      },
+      // Associated but never took a lease, so it has neither name nor address
+      // and the router offers a free one with the list.
+      {
+        mac: 'FC:D2:02:D3:28:63', name: 'Устройство FC:D2:02:D3:28:63', ip: '',
+        suggested_ip: '192.168.1.90',
+        connected: true, wireless: true, network: 'Home', signal: -61,
+        has_static_lease: false, private_mac: false,
+        guarded: false, resolved_target: 'direct'
       }
     ]
   },
