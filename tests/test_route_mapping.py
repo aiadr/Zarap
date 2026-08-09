@@ -53,7 +53,7 @@ class RouteMappingTests(unittest.TestCase):
                                 "const RESERVED_TAGS")))
         cls.prelude = constants + "\n" + "\n".join(
             lift(source, name) for name in
-            ("valid_outbound_tag", "outbound_json", "rule_json", "sing_box_config"))
+            ("valid_outbound_tag", "outbound_json", "rule_jsons", "sing_box_config"))
 
     def generate(self, outbounds, rules, final, addresses=None):
         script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s));\n" % (
@@ -178,9 +178,9 @@ class RouteMappingTests(unittest.TestCase):
 
     def resolve(self, rules, final, macs):
         source = BACKEND.read_text()
-        script = "%s\n%s\nfor (let mac in %s) printf('%%s ', resolved_target(mac, %s, %s));\n" % (
-            "\n".join(lift(source, name)
-                       for name in ("guarded_macs", "resolved_target")),
+        script = "%s\n%s\nfor (let mac in %s) printf('%%s ', device_routing(mac, %s, %s).target);\n" % (
+            "\n".join(lift(source, name) for name in
+                      ("guarded_macs", "conditional_rule", "device_routing")),
             "", json.dumps(macs), json.dumps(rules), json.dumps(final))
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
@@ -192,6 +192,44 @@ class RouteMappingTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_source_range_and_port_meet_in_one_element(self):
+        # Source, destination and qualifiers are anded, which is what sing-box
+        # does with the fields of a single rule anyway. The second element of a
+        # group appears only once a second kind of destination exists, so there
+        # is one element here and nothing to say about adjacency yet.
+        rules = [{"clients": ["00:11:22:33:44:55"], "ip_cidr": ["149.154.160.0/20"],
+                  "ports": ["443"], "target": "out_1"}]
+        emitted = self.generate([OUT_1], rules, "direct")["route"]["rules"]
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]["ip_cidr"], ["149.154.160.0/20"])
+        self.assertEqual(emitted[0]["source_ip_cidr"], ["192.168.1.50/32"])
+        self.assertEqual(emitted[0]["port"], [443])
+        self.assertEqual(emitted[0]["outbound"], "out_1")
+
+    def test_ports_and_ranges_land_in_their_own_fields(self):
+        rules = [{"clients": [], "ports": ["443", "1000:2000"], "network": "udp",
+                  "target": "block"}]
+        emitted = self.generate([OUT_1], rules, "direct")["route"]["rules"]
+        self.assertEqual(emitted[0]["port"], [443])
+        self.assertEqual(emitted[0]["port_range"], ["1000:2000"])
+        self.assertEqual(emitted[0]["network"], ["udp"])
+        self.assertEqual(emitted[0]["action"], "reject")
+
+    def test_a_rule_without_devices_carries_no_source(self):
+        # An empty array would read as "from nowhere" rather than "from anyone".
+        rules = [{"clients": [], "ip_cidr": ["10.0.0.0/8"], "target": "direct"}]
+        emitted = self.generate([OUT_1], rules, "out_1")["route"]["rules"]
+        self.assertNotIn("source_ip_cidr", emitted[0])
+
+    def test_an_unresolvable_device_leaves_the_rule_without_a_source(self):
+        # The lease is what turns a MAC into an address. Without one there is
+        # nothing to match on, and the rule must not silently widen to everyone
+        # — that case is refused before generation, in validate_request.
+        rules = [{"clients": ["FF:FF:FF:FF:FF:FF"], "ip_cidr": ["10.0.0.0/8"],
+                  "target": "out_1"}]
+        emitted = self.generate([OUT_1], rules, "direct")["route"]["rules"]
+        self.assertNotIn("source_ip_cidr", emitted[0])
+
     def test_first_matching_rule_decides_where_a_device_goes(self):
         rules = [
             {"clients": ["00:11:22:33:44:55"], "target": "out_1"},
@@ -201,6 +239,46 @@ class RouteMappingTests(unittest.TestCase):
             self.resolve(rules, "direct",
                          ["00:11:22:33:44:55", "AA:BB:CC:DD:EE:FF", "10:20:30:40:50:60"]),
             ["out_1", "block", "direct"])
+
+    def routing(self, rules, final, mac):
+        source = BACKEND.read_text()
+        script = "%s\nprintf('%%J', device_routing(%s, %s, %s));\n" % (
+            "\n".join(lift(source, name)
+                      for name in ("conditional_rule", "device_routing")),
+            json.dumps(mac), json.dumps(rules), json.dumps(final))
+        with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run([self.ucode, path], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return json.loads(done.stdout)
+        finally:
+            os.unlink(path)
+
+    def test_a_conditional_rule_does_not_decide_where_a_device_goes(self):
+        # It speaks about part of the traffic, so it is listed rather than
+        # answered with: the device still falls through to the remainder.
+        rules = [{"clients": ["00:11:22:33:44:55"], "ip_cidr": ["10.0.0.0/8"],
+                  "target": "out_1"}]
+        self.assertEqual(self.routing(rules, "direct", "00:11:22:33:44:55"),
+                         {"target": "direct", "partial": [1]})
+
+    def test_a_rule_naming_no_device_is_partial_for_everyone(self):
+        rules = [{"clients": [], "ports": ["443"], "network": "udp", "target": "block"}]
+        self.assertEqual(self.routing(rules, "out_1", "00:11:22:33:44:55"),
+                         {"target": "out_1", "partial": [1]})
+
+    def test_collecting_partial_rules_stops_at_the_rule_that_takes_it_whole(self):
+        # Anything after the rule that catches the device unconditionally never
+        # sees its traffic, so listing it would send the reader hunting.
+        rules = [
+            {"clients": ["00:11:22:33:44:55"], "ports": ["443"], "target": "out_1"},
+            {"clients": ["00:11:22:33:44:55"], "target": "block"},
+            {"clients": ["00:11:22:33:44:55"], "ip_cidr": ["10.0.0.0/8"], "target": "out_1"},
+        ]
+        self.assertEqual(self.routing(rules, "direct", "00:11:22:33:44:55"),
+                         {"target": "block", "partial": [1]})
 
     def test_guarded_macs_collects_every_named_device(self):
         source = BACKEND.read_text()
@@ -222,6 +300,40 @@ class RouteMappingTests(unittest.TestCase):
                              ["00:11:22:33:44:55", "AA:BB:CC:DD:EE:FF"])
         finally:
             os.unlink(path)
+
+    def guarded(self, rules):
+        source = BACKEND.read_text()
+        script = "%s\nlet macs = [];\nfor (let mac in guarded_macs(%s)) push(macs, mac);\nprintf('%%J', sort(macs));\n" % (
+            lift(source, "guarded_macs"), json.dumps(rules))
+        with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run([self.ucode, path], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return json.loads(done.stdout)
+        finally:
+            os.unlink(path)
+
+    def test_a_rule_limited_by_destination_still_guards_its_device(self):
+        """Invariant 6: the guarantee is a property of the device, not a flow.
+
+        Otherwise switching Zarap off would hand the device a direct path to
+        the WAN for exactly the connections its rule was written about.
+        """
+        rules = [{"clients": ["00:11:22:33:44:55"], "ip_cidr": ["10.0.0.0/8"],
+                  "ports": ["443"], "target": "out_1"}]
+        self.assertEqual(self.guarded(rules), ["00:11:22:33:44:55"])
+
+    def test_a_rule_naming_no_device_guards_nobody(self):
+        """Invariant 7: a destination condition names no device.
+
+        It routes while Zarap runs and leaves no trace when it is switched off,
+        which is the same thing main.final does.
+        """
+        rules = [{"clients": [], "ip_cidr": ["10.0.0.0/8"], "target": "out_1"},
+                 {"clients": [], "ports": ["443"], "network": "udp", "target": "block"}]
+        self.assertEqual(self.guarded(rules), [])
 
     def test_outbound_tags_are_validated(self):
         script = "%s\nfor (let tag in %s) printf('%%s ', valid_outbound_tag(tag));\n" % (

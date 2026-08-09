@@ -87,6 +87,45 @@ function valid_ipv4(value) {
 	return true;
 }
 
+// A destination range as sing-box wants it: a bare address is its own /32, and
+// a prefix keeps whatever mask it came with. IPv6 is refused by name rather than
+// by the generic "некорректный": it is not routed and not handed out, so an
+// entry for it would sit in the configuration doing nothing.
+function normalize_cidr(value) {
+	let text = trim('' + (value || ''));
+	if (index(text, ':') >= 0)
+		return { error: 'IPv6-диапазон ' + text + ' не поддерживается: IPv6 не маршрутизируется и в LAN не раздаётся' };
+
+	let parts = split(text, '/');
+	let address = parts[0] || '';
+	if (!valid_ipv4(address) || length(parts) > 2)
+		return { error: 'Некорректный диапазон адресов: ' + (text || '—') };
+	if (length(parts) == 1)
+		return { value: address + '/32' };
+	if (!match(parts[1], /^[0-9]{1,2}$/) || int(parts[1]) > 32)
+		return { error: 'Некорректная маска в диапазоне: ' + text };
+	return { value: address + '/' + int(parts[1]) };
+}
+
+// One port or a range, kept in the form it was written: the generator splits
+// them into `port` and `port_range`, which is where the difference matters.
+function normalize_port(value) {
+	let text = trim('' + (value || ''));
+	let bounds = split(text, ':');
+	if (length(bounds) > 2)
+		return { error: 'Некорректный порт: ' + (text || '—') };
+
+	let numbers = [];
+	for (let bound in bounds) {
+		if (!match(bound, /^[0-9]{1,5}$/) || int(bound) < 1 || int(bound) > 65535)
+			return { error: 'Порт должен быть от 1 до 65535: ' + (text || '—') };
+		push(numbers, int(bound));
+	}
+	if (length(numbers) == 2 && numbers[0] > numbers[1])
+		return { error: 'В диапазоне портов начало больше конца: ' + text };
+	return { value: length(numbers) == 2 ? numbers[0] + ':' + numbers[1] : '' + numbers[0] };
+}
+
 function parse_vless(link) {
 	link = trim('' + (link || ''));
 
@@ -315,6 +354,27 @@ function valid_target(target, tags) {
 	return target == 'direct' || target == 'block' || !!tags[target];
 }
 
+// Each list is validated the same way: normalise every entry, refuse a repeat
+// within the rule, and keep the order it was written in.
+function validate_rule_list(raw, kind, normalize) {
+	if (raw == null)
+		raw = [];
+	if (type(raw) != 'array')
+		return { error: 'Список «' + kind + '» в правиле имеет неверный формат' };
+
+	let seen = {}, values = [];
+	for (let entry in raw) {
+		let checked = normalize(entry);
+		if (checked.error)
+			return checked;
+		if (seen[checked.value])
+			return { error: 'Запись ' + checked.value + ' указана в правиле дважды' };
+		seen[checked.value] = true;
+		push(values, checked.value);
+	}
+	return { values: values };
+}
+
 function validate_rules(input, tags) {
 	if (input == null)
 		input = [];
@@ -345,11 +405,31 @@ function validate_rules(input, tags) {
 			seen[mac] = true;
 			push(clients, mac);
 		}
-		// A rule with no condition would match everything and duplicate the
-		// remainder, which main.final already covers.
-		if (!length(clients))
-			return input_error('В правиле должно быть хотя бы одно устройство');
-		push(result, { clients: clients, target: target });
+
+		let ranges = validate_rule_list(entry?.ip_cidr, 'диапазоны адресов', normalize_cidr);
+		if (ranges.error)
+			return input_error(ranges.error);
+		let ports = validate_rule_list(entry?.ports, 'порты', normalize_port);
+		if (ports.error)
+			return input_error(ports.error);
+
+		let network = lc(trim('' + (entry?.network || '')));
+		if (network != '' && network != 'tcp' && network != 'udp')
+			return input_error('Протокол правила может быть только tcp или udp: ' + network);
+
+		// A rule with no condition at all would match everything and duplicate
+		// the remainder, which main.final already covers. Any one condition is
+		// enough: a rule naming only a destination applies to the whole LAN,
+		// and that is a legitimate thing to write.
+		if (!length(clients) && !length(ranges.values) && !length(ports.values) && network == '')
+			return input_error('В правиле должно быть хотя бы одно условие: устройства, диапазон адресов, порт или протокол');
+		push(result, {
+			clients: clients,
+			ip_cidr: ranges.values,
+			ports: ports.values,
+			network: network,
+			target: target
+		});
 	}
 	return { ok: true, rules: result };
 }
@@ -378,7 +458,14 @@ function outbound_json(outbound) {
 
 // sing-box cannot match a source by MAC, so a device is represented by the
 // address its static lease pins. address_of maps one to the other.
-function rule_json(rule, address_of) {
+//
+// One section becomes a *group* of route rules, one per kind of destination
+// condition, because sing-box ands the fields of a single rule together: a rule
+// carrying both a range and a domain would demand that the traffic match both
+// and would fire for nothing. Adjacency is what expresses the or — the group is
+// contiguous and every element carries the same target, so which one matched
+// makes no difference.
+function rule_jsons(rule, address_of) {
 	let sources = [];
 	for (let mac in (rule.clients || [])) {
 		let address = address_of[mac];
@@ -389,16 +476,50 @@ function rule_json(rule, address_of) {
 	// The inbound is the only one there is, so naming it changes nothing today.
 	// It is written from the start so that splitting the capture across several
 	// TProxy ports later does not mean rewriting every rule.
-	let json = { inbound: [INBOUND_TAG] };
+	let shared = { inbound: [INBOUND_TAG] };
 	if (length(sources))
-		json.source_ip_cidr = sources;
-	// The special `block` outbound was deprecated in sing-box 1.11 and removed
-	// in 1.13; the rule action replaces it.
-	if (rule.target == 'block')
-		json.action = 'reject';
-	else
-		json.outbound = rule.target;
-	return json;
+		shared.source_ip_cidr = sources;
+	if (rule.network)
+		shared.network = [rule.network];
+
+	// Ports qualify whatever else the rule says, so they belong to every
+	// element of the group rather than being a destination of their own.
+	let ports = [], ranges = [];
+	for (let port in (rule.ports || [])) {
+		if (index(port, ':') >= 0)
+			push(ranges, port);
+		else
+			push(ports, int(port));
+	}
+	if (length(ports))
+		shared.port = ports;
+	if (length(ranges))
+		shared.port_range = ranges;
+
+	// One entry per kind of destination; an empty list leaves a single element
+	// whose only conditions are the shared ones.
+	let destinations = [];
+	if (length(rule.ip_cidr || []))
+		push(destinations, { ip_cidr: rule.ip_cidr });
+	if (!length(destinations))
+		push(destinations, {});
+
+	let emitted = [];
+	for (let destination in destinations) {
+		let json = {};
+		for (let key, value in shared)
+			json[key] = value;
+		for (let key, value in destination)
+			json[key] = value;
+		// The special `block` outbound was deprecated in sing-box 1.11 and
+		// removed in 1.13; the rule action replaces it.
+		if (rule.target == 'block')
+			json.action = 'reject';
+		else
+			json.outbound = rule.target;
+		push(emitted, json);
+	}
+	return emitted;
 }
 
 function sing_box_config(outbounds, rules, final, address_of) {
@@ -408,7 +529,8 @@ function sing_box_config(outbounds, rules, final, address_of) {
 		push(emitted, outbound_json(outbound));
 
 	for (let rule in rules) {
-		push(route_rules, rule_json(rule, address_of || {}));
+		for (let json in rule_jsons(rule, address_of || {}))
+			push(route_rules, json);
 		if (rule.target == 'direct')
 			wants_direct = true;
 	}
@@ -697,7 +819,13 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients) {
 	}
 	for (let rule in rules) {
 		let section = uci.add('zarap', 'rule');
-		uci.set('zarap', section, 'client', rule.clients);
+		// An empty list is deleted rather than written: uci keeps an empty
+		// option as an empty string, which would read back as one blank entry.
+		for (let key, values in { client: rule.clients, ip_cidr: rule.ip_cidr, port: rule.ports })
+			if (length(values || []))
+				uci.set('zarap', section, key, values);
+		if (rule.network)
+			uci.set('zarap', section, 'network', rule.network);
 		uci.set('zarap', section, 'target', rule.target);
 	}
 	uci.load('dhcp');
@@ -802,22 +930,48 @@ function activate_uci_candidate() {
 	return true;
 }
 
+// uci hands a single-element list back as a bare string, so every list option
+// has to be read through this.
+function uci_list(value) {
+	if (type(value) == 'array')
+		return value;
+	return value ? [value] : [];
+}
+
 // The order of the sections in the file is the order of the rules, and the
 // first match wins — so this must not be sorted or deduplicated on the way out.
 function saved_rules() {
 	let uci = cursor(), rules = [];
 	uci.load('zarap');
 	uci.foreach('zarap', 'rule', function(section) {
-		let raw = section.client;
-		if (type(raw) != 'array')
-			raw = raw ? [raw] : [];
 		let clients = [];
-		for (let value in raw) {
+		for (let value in uci_list(section.client)) {
 			let mac = normalize_mac(value);
 			if (mac)
 				push(clients, mac);
 		}
-		push(rules, { clients: clients, target: section.target || '' });
+		// Written by hand into /etc/config/zarap, a condition can be anything;
+		// what does not normalise is dropped rather than carried into the
+		// generator, which would put it in front of sing-box unchecked.
+		let ranges = [], ports = [];
+		for (let value in uci_list(section.ip_cidr)) {
+			let checked = normalize_cidr(value);
+			if (!checked.error)
+				push(ranges, checked.value);
+		}
+		for (let value in uci_list(section.port)) {
+			let checked = normalize_port(value);
+			if (!checked.error)
+				push(ports, checked.value);
+		}
+		let network = lc(trim('' + (section.network || '')));
+		push(rules, {
+			clients: clients,
+			ip_cidr: ranges,
+			ports: ports,
+			network: (network == 'tcp' || network == 'udp') ? network : '',
+			target: section.target || ''
+		});
 	});
 	return rules;
 }
@@ -845,14 +999,37 @@ function lease_addresses() {
 	return address_of;
 }
 
-// Which target a device's traffic actually reaches: the first rule naming it
-// wins, and a device no rule names falls through to the configured remainder.
-function resolved_target(mac, rules, final) {
-	for (let rule in rules)
-		for (let named in rule.clients)
-			if (named == mac)
-				return rule.target;
-	return final;
+// True when a rule speaks about part of the traffic rather than all of it. Such
+// a rule can never be the answer to "where does this device go", only to "where
+// does some of it go".
+function conditional_rule(rule) {
+	return !!length(rule.ip_cidr || []) || !!length(rule.ports || []) || !!(rule.network || '');
+}
+
+// Where a device's traffic goes, in two parts, because one value would be a
+// lie as soon as conditions by destination exist: `target` is where everything
+// not covered by a narrower rule ends up, and `partial` numbers the rules that
+// catch some of it on the way. Rules are numbered from one, as the page shows
+// them, and collecting stops at the first rule that takes the device whole —
+// anything after it is unreachable for this device.
+function device_routing(mac, rules, final) {
+	let partial = [], position = 0;
+	for (let rule in rules) {
+		position++;
+		// A rule that names no device names every device.
+		let named = !length(rule.clients || []);
+		for (let value in (rule.clients || []))
+			if (value == mac)
+				named = true;
+		if (!named)
+			continue;
+		if (conditional_rule(rule)) {
+			push(partial, position);
+			continue;
+		}
+		return { target: rule.target, partial: partial };
+	}
+	return { target: final, partial: partial };
 }
 
 // The link as saved, rebuilt from the section. One shape of a connection on the
@@ -1301,6 +1478,7 @@ function device_list(rules, final) {
 		if (!devices[mac]) {
 			let lease = leases.by_mac[mac] || {};
 			let dynamic = dynamic_leases[mac] || {};
+			let routing = device_routing(mac, rules, final);
 			devices[mac] = {
 				mac: mac,
 				name: lease.name || dynamic.name || ('Устройство ' + mac),
@@ -1310,7 +1488,8 @@ function device_list(rules, final) {
 				has_static_lease: !!lease.ip,
 				private_mac: is_private_mac(mac),
 				guarded: !!guarded[mac],
-				resolved_target: resolved_target(mac, rules, final)
+				resolved_target: routing.target,
+				partial_rules: routing.partial
 			};
 		}
 		return devices[mac];

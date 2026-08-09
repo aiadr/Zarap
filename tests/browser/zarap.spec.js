@@ -87,9 +87,12 @@ test('sends the leases of guarded devices and the connections as they stand', as
     { tag: 'out_1', label: 'Нидерланды', link: savedLink('out_1') },
     { tag: 'out_2', label: 'Германия', link: savedLink('out_2') }
   ]);
+  // Every condition goes back, including the ones the page cannot edit yet:
+  // what is submitted is the list held here, so anything dropped on the way in
+  // would be deleted from the router on the way out.
   expect(apply.args[2]).toEqual([
-    { clients: ['00:11:22:33:44:55'], target: 'out_1' },
-    { clients: ['10:20:30:40:50:60'], target: 'block' }
+    { clients: ['00:11:22:33:44:55'], ip_cidr: [], ports: [], network: '', target: 'out_1' },
+    { clients: ['10:20:30:40:50:60'], ip_cidr: [], ports: [], network: '', target: 'block' }
   ]);
   // Only devices a rule names carry a lease.
   expect(apply.args[3]).toEqual([
@@ -144,7 +147,8 @@ test('adds a connection without the router and lets a rule use it', async ({ pag
   // Nameless until the router reads the link, and sent alongside the saved ones
   // in exactly the same shape.
   expect(apply.args[1]).toContainEqual({ tag: 'out_3', label: '', link: validLink });
-  expect(apply.args[2]).toContainEqual({ clients: ['AA:BB:CC:DD:EE:FF'], target: 'out_3' });
+  expect(apply.args[2]).toContainEqual(
+    { clients: ['AA:BB:CC:DD:EE:FF'], ip_cidr: [], ports: [], network: '', target: 'out_3' });
 });
 
 test('keeps a link folded away until it is asked for', async ({ page }) => {
@@ -267,6 +271,45 @@ test('keeps showing the kill switch while Zarap is switched off', async ({ page 
   await expect(page.getByText('kill switch активен')).toBeVisible();
   const held = page.locator('tr[data-mac="00:11:22:33:44:55"]');
   await expect(held).toContainText('kill switch');
+});
+
+test('shows conditions by destination and hands them back untouched', async ({ page }) => {
+  // Ranges, ports and protocol can only be written in /etc/config/zarap for
+  // now. The page still submits the whole rule list, so a condition it failed
+  // to carry would be a condition deleted by the next save — and a rule shown
+  // as if it covered everything the device does would be a lie in the meantime.
+  await page.addInitScript(() => {
+    window.__statusOverride = {
+      rules: [
+        { clients: ['00:11:22:33:44:55'], ip_cidr: ['149.154.160.0/20'],
+          ports: ['443', '1000:2000'], network: 'udp', target: 'out_1' },
+        { clients: ['10:20:30:40:50:60'], target: 'block' }
+      ]
+    };
+  });
+  await openZarap(page);
+
+  const conditioned = page.locator('#zarap-rules-body tr[data-rule="0"]');
+  await expect(conditioned.locator('[data-field="destination"]'))
+    .toHaveText('149.154.160.0/20 · порт 443, 1000:2000 · udp');
+  await expect(page.locator('#zarap-rules-body tr[data-rule="1"] [data-field="destination"]'))
+    .toHaveText('любой адрес');
+
+  // The device is named by a rule that only covers part of its traffic, so the
+  // column says where the rest goes and which rule catches the part.
+  const tv = page.locator('tr[data-mac="00:11:22:33:44:55"]');
+  await expect(tv.locator('[data-field="target"]')).toContainText('напрямую');
+  await expect(tv.locator('[data-field="partial"]')).toHaveText(' кроме правил 1');
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.find(call => call.method === 'apply').args[2]).toEqual([
+    { clients: ['00:11:22:33:44:55'], ip_cidr: ['149.154.160.0/20'],
+      ports: ['443', '1000:2000'], network: 'udp', target: 'out_1' },
+    { clients: ['10:20:30:40:50:60'], ip_cidr: [], ports: [], network: '', target: 'block' }
+  ]);
 });
 
 test('adds a rule and picks its devices without touching the router', async ({ page }) => {
@@ -431,8 +474,8 @@ test('reorders rules and applies them in the shown order', async ({ page }) => {
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
   expect(apply.args[2]).toEqual([
-    { clients: ['10:20:30:40:50:60'], target: 'block' },
-    { clients: ['00:11:22:33:44:55'], target: 'out_1' }
+    { clients: ['10:20:30:40:50:60'], ip_cidr: [], ports: [], network: '', target: 'block' },
+    { clients: ['00:11:22:33:44:55'], ip_cidr: [], ports: [], network: '', target: 'out_1' }
   ]);
 });
 

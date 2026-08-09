@@ -113,8 +113,17 @@ function loadState(status) {
 			pending: false
 		};
 	});
+	// Every condition is carried, including the ones this page cannot edit yet:
+	// what an apply submits is this list, so a condition dropped here would be a
+	// condition deleted from the router on the next save.
 	state.rules = (status.rules || []).map(function(rule) {
-		return { clients: (rule.clients || []).slice(), target: rule.target };
+		return {
+			clients: (rule.clients || []).slice(),
+			ip_cidr: (rule.ip_cidr || []).slice(),
+			ports: (rule.ports || []).slice(),
+			network: rule.network || '',
+			target: rule.target
+		};
 	});
 	state.final = status.final || 'direct';
 	state.firewall = !!status.firewall;
@@ -193,13 +202,33 @@ function addressesReady() {
 	return false;
 }
 
-// The first rule naming a device decides where its traffic goes; a device no
-// rule names falls through to the remainder.
-function resolvedTarget(mac) {
-	for (let index = 0; index < state.rules.length; index++)
-		if ((state.rules[index].clients || []).indexOf(mac) >= 0)
-			return state.rules[index].target;
-	return state.final;
+// A rule that speaks about part of the traffic — a range, a port, a protocol —
+// can never answer "where does this device go", only "where does some of it go".
+function isConditional(rule) {
+	return !!(rule.ip_cidr || []).length
+		|| !!(rule.ports || []).length
+		|| !!rule.network;
+}
+
+// Where a device's traffic goes, in two parts, mirroring device_routing on the
+// router: the target everything not covered by a narrower rule reaches, and the
+// numbers of the rules that catch some of it on the way. Collecting stops at the
+// first rule that takes the device whole — anything after it never sees it.
+function deviceRouting(mac) {
+	const partial = [];
+	for (let index = 0; index < state.rules.length; index++) {
+		const rule = state.rules[index];
+		const clients = rule.clients || [];
+		// A rule that names no device names every device.
+		if (clients.length && clients.indexOf(mac) < 0)
+			continue;
+		if (isConditional(rule)) {
+			partial.push(index + 1);
+			continue;
+		}
+		return { target: rule.target, partial: partial };
+	}
+	return { target: state.final, partial: partial };
 }
 
 function isUsed(tag) {
@@ -265,6 +294,22 @@ function bindField(device, field, placeholder) {
 	return input;
 }
 
+// Where the device goes, and what catches part of it on the way. A single value
+// stopped being true once rules could be limited by destination, and this column
+// is the only answer to "what happens to this device" — so it must not round the
+// answer off.
+function routingCell(mac) {
+	const routing = deviceRouting(mac);
+	const label = targetLabel(routing.target);
+	if (!routing.partial.length)
+		return E('span', { 'data-field': 'target' }, label);
+	return E('span', { 'data-field': 'target' }, [
+		label,
+		E('small', { 'data-field': 'partial' },
+			' ' + _('кроме правил %s').format(routing.partial.join(', ')))
+	]);
+}
+
 function deviceRow(device) {
 	const unavailable = device.private_mac;
 	const reason = unavailable ? _('Приватный MAC: отключите рандомизацию MAC на устройстве') : '';
@@ -282,7 +327,7 @@ function deviceRow(device) {
 		E('td', { 'class': 'td' }, guarded
 			? [ bindField(device, 'ip', '192.168.1.100') ]
 			: (device.ip || '')),
-		E('td', { 'class': 'td' }, targetLabel(resolvedTarget(device.mac))),
+		E('td', { 'class': 'td' }, [ routingCell(device.mac) ]),
 		E('td', { 'class': 'td' }, [
 			device.connected ? statusPill(true, _('в сети'), '') : statusPill(false, '', _('не в сети')),
 			killSwitch ? statusPill(true, _(' kill switch'), '') : '',
@@ -588,13 +633,34 @@ function moveRule(index, delta) {
 	refresh();
 }
 
+// A rule with no devices but with a destination applies to the whole LAN, which
+// is a different thing from a rule nobody has finished writing yet. Saying
+// "устройства не выбраны" for both would hide the first behind the second.
+function sourceSummary(rule) {
+	if ((rule.clients || []).length)
+		return (rule.clients || []).map(deviceLabel).join(', ');
+	return isConditional(rule) ? _('любое устройство') : _('устройства не выбраны');
+}
+
+// The conditions by destination, in words. They cannot be edited on this page
+// yet — they arrive from /etc/config/zarap — but a rule that quietly looks like
+// it covers everything a device does would be a lie about what is applied.
+function destinationSummary(rule) {
+	const parts = [];
+	if ((rule.ip_cidr || []).length)
+		parts.push((rule.ip_cidr || []).join(', '));
+	if ((rule.ports || []).length)
+		parts.push(_('порт %s').format((rule.ports || []).join(', ')));
+	if (rule.network)
+		parts.push(rule.network);
+	return parts.length ? parts.join(' · ') : _('любой адрес');
+}
+
 function ruleRow(rule, index, owner) {
 	return E('tr', { 'class': 'tr', 'data-rule': String(index) }, [
 		E('td', { 'class': 'td' }, String(index + 1)),
 		E('td', { 'class': 'td' }, [
-			E('span', { 'data-field': 'clients' }, (rule.clients || []).length
-				? (rule.clients || []).map(deviceLabel).join(', ')
-				: _('устройства не выбраны')),
+			E('span', { 'data-field': 'clients' }, sourceSummary(rule)),
 			E('button', {
 				'class': 'btn cbi-button-neutral',
 				'style': 'margin-left:.5em',
@@ -602,6 +668,9 @@ function ruleRow(rule, index, owner) {
 					devicePicker(rule, owner, refresh);
 				})
 			}, _('Устройства…'))
+		]),
+		E('td', { 'class': 'td' }, [
+			E('span', { 'data-field': 'destination' }, destinationSummary(rule))
 		]),
 		E('td', { 'class': 'td' }, [
 			targetSelect(rule.target, function(value) { rule.target = value; refresh(); })
@@ -699,7 +768,7 @@ function renderRules(owner) {
 	const context = renderRules.owner;
 	return state.rules.length
 		? state.rules.map(function(rule, index) { return ruleRow(rule, index, context); })
-		: E('tr', {}, E('td', { 'colspan': 4 }, _('Правил пока нет: весь трафик идёт по умолчанию')));
+		: E('tr', {}, E('td', { 'colspan': 5 }, _('Правил пока нет: весь трафик идёт по умолчанию')));
 }
 
 function renderDevices() {
@@ -912,12 +981,14 @@ return view.extend({
 
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('Правила')),
-					E('p', {}, _('Применяется первое подходящее правило. Устройство, названное правилом, остаётся под kill switch даже при выключенном Zarap: прямой доступ возвращает только удаление правила.')),
+					E('p', {}, _('Применяется первое подходящее правило. Условия «Откуда» и «Куда» соединяются через «и»: правило срабатывает, когда трафик пришёл от названного устройства и идёт к названному месту. Устройство, названное правилом, остаётся под kill switch даже при выключенном Zarap: прямой доступ возвращает только удаление правила.')),
+					E('p', {}, E('small', {}, _('Условия «Куда» — диапазоны адресов, порты, протокол — пока задаются только в /etc/config/zarap. Страница их показывает и сохраняет без изменений.'))),
 					E('table', { 'class': 'table', 'id': 'zarap-rules' }, [
 						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
 							E('th', { 'class': 'th' }, '#'),
-							E('th', { 'class': 'th' }, _('Устройства')),
+							E('th', { 'class': 'th' }, _('Откуда')),
 							E('th', { 'class': 'th' }, _('Куда')),
+							E('th', { 'class': 'th' }, _('Цель')),
 							E('th', { 'class': 'th' }, '')
 						])),
 						E('tbody', { 'id': 'zarap-rules-body' }, renderRules(this))
@@ -927,8 +998,11 @@ return view.extend({
 							'id': 'zarap-add-rule',
 							'class': 'btn cbi-button-add',
 							'click': ui.createHandlerFn(this, function() {
-								state.rules.push({ clients: [], target: state.outbounds.length
-									? state.outbounds[0].tag : 'direct' });
+								state.rules.push({
+									clients: [], ip_cidr: [], ports: [], network: '',
+									target: state.outbounds.length
+										? state.outbounds[0].tag : 'direct'
+								});
 								refresh();
 							})
 						}, _('Добавить правило'))
