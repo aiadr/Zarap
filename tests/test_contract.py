@@ -258,6 +258,35 @@ class PackageContractTests(unittest.TestCase):
         for secret_field in ("uuid:", "public_key:", "short_id:"):
             self.assertNotIn(secret_field, status_body)
 
+    def test_every_function_is_defined_before_it_is_called(self):
+        # ucode resolves a name where the call is compiled and does not hoist
+        # function declarations, so a call placed above its own definition is
+        # compiled as a global lookup, finds nothing and raises at runtime.
+        # rpcd can only report that as UBUS_STATUS_UNKNOWN_ERROR, which reaches
+        # the page as "Unspecified error (9)" — the whole of apply and validate
+        # broke that way once validate_outbounds started calling
+        # saved_outbounds, defined 500 lines below it.
+        lines = BACKEND.split("\n")
+        # Only top-level declarations: a nested one belongs to its enclosing
+        # function and is not in scope for the rest of the file at all.
+        declared = {}
+        for number, line in enumerate(lines, 1):
+            declaration = re.match(r"function ([A-Za-z_][A-Za-z0-9_]*)\(", line)
+            if declaration:
+                declared.setdefault(declaration.group(1), number)
+        self.assertIn("saved_outbounds", declared)
+
+        called_too_early = []
+        for number, line in enumerate(lines, 1):
+            code = re.sub(r"//.*", "", line)
+            code = re.sub(r"'[^']*'|\"[^\"]*\"", "", code)
+            for name in re.findall(r"(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)\s*\(", code):
+                if name in declared and declared[name] > number:
+                    called_too_early.append(
+                        f"line {number} calls {name}(), defined at line {declared[name]}"
+                    )
+        self.assertEqual(called_too_early, [])
+
 
 if __name__ == "__main__":
     unittest.main()
