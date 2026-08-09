@@ -228,16 +228,6 @@ function validate_clients(clients) {
 	return { ok: true, clients: result };
 }
 
-// Connections are addressed by their section name, which is also their sing-box
-// tag, so a name has to survive editing the link behind it. New ones get the
-// lowest free number; the ones already saved keep what they have.
-function allocate_tag(taken) {
-	for (let n = 1; n <= 999; n++)
-		if (!taken['out_' + n])
-			return 'out_' + n;
-	return null;
-}
-
 // ucode resolves a name where the call is compiled, not where it runs, and it
 // does not hoist function declarations: a function called from above its own
 // definition is looked up as a global, is not found, and raises an exception the
@@ -271,58 +261,38 @@ function saved_outbounds() {
 	return outbounds;
 }
 
-// An entry with an empty link keeps the secret already saved under that tag, so
-// applying an unchanged connection never sends its uuid through the browser.
+// Every entry arrives named and with its link. The tag is what a rule points
+// at, so it has to exist while the page is still being edited, long before an
+// apply — which is why the page names a connection the moment it adds one, and
+// why naming one here as well would be a second allocator for one fact.
 function validate_outbounds(input) {
 	if (input == null)
 		input = [];
 	if (type(input) != 'array')
 		return input_error('Список подключений имеет неверный формат');
 
-	let saved = {}, taken = {}, result = [];
-	for (let outbound in saved_outbounds())
-		saved[outbound.tag] = outbound;
-
+	let taken = {}, result = [];
 	for (let entry in input) {
 		let tag = trim('' + (entry?.tag || ''));
+		let link = trim('' + (entry?.link || ''));
+		let label = trim(replace('' + (entry?.label || ''), /[[:cntrl:]]/g, ''));
+
 		if (!tag)
-			continue;
+			return input_error('Подключение прислано без имени');
 		if (!valid_outbound_tag(tag))
 			return input_error('Некорректное имя подключения: ' + tag);
 		if (taken[tag])
 			return input_error('Подключения не должны повторяться: ' + tag);
 		taken[tag] = true;
-	}
+		if (!link)
+			return input_error('Для подключения ' + tag + ' нужна VLESS Reality-ссылка');
 
-	for (let entry in input) {
-		let tag = trim('' + (entry?.tag || ''));
-		let link = trim('' + (entry?.link || ''));
-		let label = trim(replace('' + (entry?.label || ''), /[[:cntrl:]]/g, ''));
-		let config;
-
-		if (link) {
-			let parsed = parse_vless(link);
-			if (!parsed.ok)
-				return parsed;
-			config = parsed.config;
-			if (!label)
-				label = config.name;
-		}
-		else {
-			if (!tag || !saved[tag])
-				return input_error('Для нового подключения нужна VLESS Reality-ссылка');
-			config = saved[tag];
-			if (!label)
-				label = config.label;
-		}
-
-		if (!tag) {
-			tag = allocate_tag(taken);
-			if (!tag)
-				return input_error('Слишком много подключений');
-			taken[tag] = true;
-		}
-
+		let parsed = parse_vless(link);
+		if (!parsed.ok)
+			return parsed;
+		let config = parsed.config;
+		if (!label)
+			label = config.name;
 		if (length(label) > 64)
 			label = trim(substr(label, 0, 64));
 		push(result, {
@@ -885,13 +855,23 @@ function resolved_target(mac, rules, final) {
 	return final;
 }
 
-function masked_link(outbound) {
+// The link as saved, rebuilt from the section. One shape of a connection on the
+// wire in both directions: the page shows this and sends it back, instead of a
+// masked form going out and a real one coming in, with a rule about empty links
+// holding the two together.
+//
+// It carries no fragment. The name is a field of its own on both sides, so the
+// link needs no place to put one, and there is nothing to percent-encode.
+function outbound_link(outbound) {
 	if (!outbound)
 		return '';
-	return 'vless://********@' + outbound.server + ':' + outbound.server_port +
-		'?security=reality&type=tcp&sni=' + outbound.server_name +
-		(outbound.flow ? '&flow=' + outbound.flow : '') +
-		'#' + (outbound.label || 'Zarap');
+	return 'vless://' + outbound.uuid + '@' + outbound.server + ':' + outbound.server_port +
+		'?encryption=none&security=reality&type=tcp' +
+		'&sni=' + outbound.server_name +
+		'&fp=' + (outbound.fingerprint || 'chrome') +
+		'&pbk=' + outbound.public_key +
+		(outbound.short_id ? '&sid=' + outbound.short_id : '') +
+		(outbound.flow ? '&flow=' + outbound.flow : '');
 }
 
 function tproxy_listening() {
@@ -1438,7 +1418,7 @@ function status() {
 		push(listed, {
 			tag: outbound.tag,
 			label: outbound.label,
-			masked_link: masked_link(outbound),
+			link: outbound_link(outbound),
 			in_use: !!in_use[outbound.tag]
 		});
 

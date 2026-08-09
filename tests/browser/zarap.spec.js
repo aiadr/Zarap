@@ -1,5 +1,16 @@
 import { expect, test } from '@playwright/test';
 
+// What the fixture has the router return for a saved connection, rebuilt from
+// its section: the page shows this and sends it straight back.
+function savedLink(tag) {
+  const uuid = tag === 'out_1'
+    ? '123e4567-e89b-42d3-a456-426614174000'
+    : '123e4567-e89b-42d3-a456-426614174002';
+  const host = tag === 'out_1' ? 'proxy.example.test' : 'de.example.test';
+  return `vless://${uuid}@${host}:443?encryption=none&security=reality&type=tcp`
+    + '&sni=cdn.example.test&fp=chrome&pbk=0123456789abcdefghijklmnopqrstuvwxyzABCDE';
+}
+
 const validLink = 'vless://123e4567-e89b-42d3-a456-426614174000@proxy.example.test:443?encryption=none&security=reality&sni=cdn.example.test&fp=chrome&pbk=0123456789abcdefghijklmnopqrstuvwxyzABCDE&type=tcp';
 
 async function openZarap(page) {
@@ -44,18 +55,19 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
   await expect(page.locator('#zarap-rules tbody tr')).toHaveCount(2);
   await expect(page.getByText('Остальной трафик: напрямую')).toBeVisible();
 
+  // The link is on the page but folded away: a screenshot of the table catches
+  // the row, not the uuid or the Reality key.
   await expect(page.locator('body')).not.toContainText('123e4567-e89b-42d3-a456-426614174000');
   await expect(page.locator('body')).not.toContainText('0123456789abcdefghijklmnopqrstuvwxyzABCDE');
-  await expect(page.getByText(/vless:\/\/\*\*\*\*\*\*\*\*@proxy\.example\.test/)).toBeVisible();
+  await expect(page.locator('tr[data-tag="out_1"] code[data-field="link"]')).toHaveText(/^vless:\/\/•+$/);
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   expect(calls.some(call => call.method === 'devices')).toBe(false);
 });
 
-test('sends the leases of guarded devices and keeps saved connections masked', async ({ page }) => {
+test('sends the leases of guarded devices and the connections as they stand', async ({ page }) => {
   await openZarap(page);
 
-  await page.getByLabel('Добавить подключение').fill(validLink);
   const tablet = page.locator('tr[data-mac="10:20:30:40:50:60"]');
   await tablet.locator('input[data-field="name"]').fill('Планшет ребёнка');
   await tablet.locator('input[data-field="ip"]').fill('192.168.1.62');
@@ -69,12 +81,11 @@ test('sends the leases of guarded devices and keeps saved connections masked', a
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
   expect(apply.args[0]).toBe(true);
-  // Saved connections round-trip by tag with an empty link, so their secrets
-  // never leave the router; the pasted one is the only link on the wire.
+  // Saved or added a moment ago, a connection goes out the same way: its tag,
+  // its name and its link.
   expect(apply.args[1]).toEqual([
-    { tag: 'out_1', label: 'Нидерланды', link: '' },
-    { tag: 'out_2', label: 'Германия', link: '' },
-    { tag: '', label: '', link: validLink }
+    { tag: 'out_1', label: 'Нидерланды', link: savedLink('out_1') },
+    { tag: 'out_2', label: 'Германия', link: savedLink('out_2') }
   ]);
   expect(apply.args[2]).toEqual([
     { clients: ['00:11:22:33:44:55'], target: 'out_1' },
@@ -92,11 +103,73 @@ test('sends the leases of guarded devices and keeps saved connections masked', a
 test('shows backend validation errors without applying configuration', async ({ page }) => {
   await openZarap(page);
   await page.evaluate(() => { window.__mockState.validateError = 'MVP поддерживает только транспорт TCP'; });
-  await page.getByLabel('Добавить подключение').fill(validLink.replace('type=tcp', 'type=ws'));
   await page.getByRole('button', { name: 'Проверить конфигурацию', exact: true }).click();
 
   await expect(page.getByText('MVP поддерживает только транспорт TCP')).toBeVisible();
   await expect(page.getByText(/Ошибка входных данных/)).toBeVisible();
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.some(call => call.method === 'apply')).toBe(false);
+});
+
+test('adds a connection without the router and lets a rule use it', async ({ page }) => {
+  await openZarap(page);
+
+  await page.getByLabel('Добавить подключение').fill(validLink);
+  await page.locator('#zarap-add-outbound').click();
+  await expect(page.getByText(/Подключение добавлено/)).toBeVisible();
+
+  // Listed at once, marked as living only on this page until an apply.
+  const added = page.locator('tr[data-tag="out_3"]');
+  await expect(added).toContainText('не сохранено');
+  // Emptied, or the same link would go out a second time as another connection.
+  await expect(page.getByLabel('Добавить подключение')).toHaveValue('');
+
+  // Nothing reached the router: the whole thing happened in the page.
+  let calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.every(call => ['status', 'updates', 'logs'].includes(call.method))).toBe(true);
+
+  // The point of adding before applying: a rule can point at it now.
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  const rule = page.locator('#zarap-rules-body tr[data-rule="2"]');
+  await rule.getByRole('button', { name: 'Устройства…' }).click();
+  await page.locator('#zarap-picker input[data-mac="AA:BB:CC:DD:EE:FF"]').check();
+  await page.getByRole('button', { name: 'Готово' }).click();
+  await rule.locator('select').selectOption('out_3');
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  // Nameless until the router reads the link, and sent alongside the saved ones
+  // in exactly the same shape.
+  expect(apply.args[1]).toContainEqual({ tag: 'out_3', label: '', link: validLink });
+  expect(apply.args[2]).toContainEqual({ clients: ['AA:BB:CC:DD:EE:FF'], target: 'out_3' });
+});
+
+test('keeps a link folded away until it is asked for', async ({ page }) => {
+  await openZarap(page);
+
+  const row = page.locator('tr[data-tag="out_1"]');
+  const link = row.locator('code[data-field="link"]');
+  await expect(link).toHaveText(/^vless:\/\/•+$/);
+
+  await row.getByRole('button', { name: 'Показать' }).click();
+  await expect(link).toHaveText(savedLink('out_1'));
+
+  await row.getByRole('button', { name: 'Скрыть' }).click();
+  await expect(link).toHaveText(/^vless:\/\/•+$/);
+});
+
+test('refuses to apply a link that was never added', async ({ page }) => {
+  await openZarap(page);
+
+  await page.getByLabel('Добавить подключение').fill(validLink);
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+
+  // The field is not what gets submitted, so dropping it silently would lose
+  // the connection the user thought they were saving.
+  await expect(page.getByText(/подключение ещё не добавлено/)).toBeVisible();
   const calls = await page.evaluate(() => window.__rpcCalls);
   expect(calls.some(call => call.method === 'apply')).toBe(false);
 });
@@ -304,7 +377,7 @@ test('refuses to send a rule whose device has no address', async ({ page }) => {
     .getByRole('button', { name: 'Устройства…' }).click();
   // A MAC typed by hand is on no lease and has no suggestion behind it.
   await page.getByPlaceholder('00:11:22:33:44:55').fill('10:34:56:78:9a:bc');
-  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Добавить', exact: true }).click();
   await page.getByRole('button', { name: 'Готово' }).click();
 
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
@@ -325,7 +398,7 @@ test('a MAC typed by hand gets a row to carry its address', async ({ page }) => 
     .getByRole('button', { name: 'Устройства…' }).click();
 
   await page.getByPlaceholder('00:11:22:33:44:55').fill('10:34:56:78:9a:bc');
-  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Добавить', exact: true }).click();
   const row = page.locator('#zarap-picker tr')
     .filter({ has: page.locator('input[data-mac="10:34:56:78:9A:BC"]') });
   await row.locator('input[data-field="name"]').fill('Кладовка');
@@ -379,7 +452,7 @@ test('refuses to delete a connection a rule still points at', async ({ page }) =
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[1]).toEqual([{ tag: 'out_1', label: 'Нидерланды', link: '' }]);
+  expect(apply.args[1]).toEqual([{ tag: 'out_1', label: 'Нидерланды', link: savedLink('out_1') }]);
 });
 
 test('a connection stops being deletable once the remainder points at it', async ({ page }) => {
