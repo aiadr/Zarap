@@ -218,11 +218,31 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn('ether type ip6 reject', BACKEND)
         self.assertNotIn("zarap_clients_mac", BACKEND + NFT)
 
-    def test_the_masked_link_carries_the_saved_connection_name(self):
-        # It used to end in a hardcoded #Zarap, discarding the name the link came
-        # with. The name is a label, not a secret, so it survives round-tripping.
-        self.assertIn("'#' + (outbound.label || 'Zarap')", BACKEND)
+    def test_a_connection_has_one_shape_on_the_wire(self):
+        # The link goes out to the page as it is and comes back the same way.
+        # Masking it meant two shapes — a masked one out, a real one in — held
+        # together by a rule about what an empty link meant, and it protected
+        # nothing: whoever can open the page is an admin the ACL already lets
+        # read the same uuid straight out of uci. The page folds it away on
+        # screen instead, which is what shoulder and screenshot need.
+        self.assertNotIn("masked_link", BACKEND)
+        self.assertIn("function outbound_link(outbound)", BACKEND)
+        self.assertIn("link: outbound_link(outbound)", BACKEND)
         self.assertIn("label: section.label || ''", BACKEND)
+
+        overview = (PACKAGE_ROOT / "htdocs/luci-static/resources/view/zarap/overview.js").read_text()
+        self.assertIn("const HIDDEN_LINK", overview)
+        self.assertIn("shown ? outbound.link : HIDDEN_LINK", overview)
+
+    def test_connections_are_named_by_the_page(self):
+        # A rule points at a connection by tag, so the tag has to exist while
+        # the page is still being edited. Allocating one here as well would be
+        # a second allocator for one fact.
+        self.assertNotIn("allocate_tag", BACKEND)
+        self.assertIn("return input_error('Подключение прислано без имени')", BACKEND)
+
+        overview = (PACKAGE_ROOT / "htdocs/luci-static/resources/view/zarap/overview.js").read_text()
+        self.assertIn("function allocateTag()", overview)
 
     def test_logs_scrub_every_connection(self):
         # Walking only the first section would leak the uuid of a second proxy
@@ -253,10 +273,14 @@ class PackageContractTests(unittest.TestCase):
         self.assertNotIn("config_get route_table", init)
         self.assertIn("const CAPTURE_PORT = 7893", BACKEND)
 
-    def test_status_does_not_return_proxy_secrets(self):
-        status_body = BACKEND.split("function status()", 1)[1].split("function logs()", 1)[0]
-        for secret_field in ("uuid:", "public_key:", "short_id:"):
-            self.assertNotIn(secret_field, status_body)
+    def test_the_log_is_still_scrubbed(self):
+        # status hands the page the whole link now, but the log is a different
+        # exposure: it is copied out and given to somebody else, so the secrets
+        # in it stay hidden.
+        logs_body = BACKEND.split("function logs()", 1)[1].split("\n// apk 3", 1)[0]
+        for secret_field in ("uuid", "public_key", "short_id"):
+            self.assertIn(secret_field, logs_body)
+        self.assertIn("'vless://[скрыто]'", logs_body)
 
     def test_a_lease_zarap_owns_follows_the_page(self):
         # The device table offers a name and an address, and the rule picker

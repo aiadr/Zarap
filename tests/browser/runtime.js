@@ -24,11 +24,11 @@ const fixtures = {
     outbounds: [
       {
         tag: 'out_1', label: 'Нидерланды', in_use: true,
-        masked_link: 'vless://********@proxy.example.test:443?security=reality&type=tcp&sni=cdn.example.test#Нидерланды'
+        link: 'vless://123e4567-e89b-42d3-a456-426614174000@proxy.example.test:443?encryption=none&security=reality&type=tcp&sni=cdn.example.test&fp=chrome&pbk=0123456789abcdefghijklmnopqrstuvwxyzABCDE'
       },
       {
         tag: 'out_2', label: 'Германия', in_use: false,
-        masked_link: 'vless://********@de.example.test:443?security=reality&type=tcp&sni=cdn.example.test#Германия'
+        link: 'vless://123e4567-e89b-42d3-a456-426614174002@de.example.test:443?encryption=none&security=reality&type=tcp&sni=cdn.example.test&fp=chrome&pbk=0123456789abcdefghijklmnopqrstuvwxyzABCDE'
       }
     ],
     rules: [

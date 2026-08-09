@@ -108,7 +108,9 @@ function loadState(status) {
 		return {
 			tag: outbound.tag,
 			label: outbound.label || '',
-			masked_link: outbound.masked_link || ''
+			link: outbound.link || '',
+			// Everything status returns is already on the router.
+			pending: false
 		};
 	});
 	state.rules = (status.rules || []).map(function(rule) {
@@ -161,8 +163,21 @@ function devicesMissingAddress() {
 	});
 }
 
-// True when the page is ready to be sent. Otherwise it says which device is
-// short of an address and puts the cursor in the field that takes it.
+// Everything the page can answer on its own before a round trip. A link left in
+// the field was never turned into a connection, and the field is not what gets
+// submitted — the list is — so it would be dropped without a word.
+function readyToSend() {
+	const field = document.querySelector('#zarap-link');
+	if (field && field.value.trim()) {
+		ui.addNotification(null, E('p', {}, _('Ссылка вставлена, но подключение ещё не добавлено: нажмите «Добавить» рядом с полем.')), 'error');
+		field.focus();
+		return false;
+	}
+	return addressesReady();
+}
+
+// True when every device a rule names carries an address. Otherwise it says
+// which one is short and puts the cursor in the field that takes it.
 function addressesReady() {
 	const missing = devicesMissingAddress();
 	if (!missing.length)
@@ -207,16 +222,26 @@ function leasedClients() {
 		});
 }
 
-// Connections round-trip by tag with an empty link, which tells the router to
-// keep the secret it already holds. A pasted link adds one.
+// The list as it stands, each connection with its link. Saved or added a moment
+// ago, they go out the same way: one shape of a connection, no rule about what
+// an empty link means.
 function submittedOutbounds() {
-	const sent = state.outbounds.map(function(outbound) {
-		return { tag: outbound.tag, label: outbound.label || '', link: '' };
+	return state.outbounds.map(function(outbound) {
+		return { tag: outbound.tag, label: outbound.label || '', link: outbound.link };
 	});
-	const added = document.querySelector('#zarap-link').value.trim();
-	if (added)
-		sent.push({ tag: '', label: '', link: added });
-	return sent;
+}
+
+// Connections are named by the page, because the page owns the list: a rule
+// points at a connection by tag, so the tag has to exist as soon as the
+// connection does, which is long before an apply. Lowest free number, so
+// deleting one and adding another reuses it instead of counting up forever.
+function allocateTag() {
+	const taken = {};
+	state.outbounds.forEach(function(outbound) { taken[outbound.tag] = true; });
+	for (let number = 1; number <= 999; number++)
+		if (!taken['out_' + number])
+			return 'out_' + number;
+	return '';
 }
 
 function targetLabel(target) {
@@ -280,15 +305,47 @@ function referrers(tag) {
 	return found;
 }
 
+// The link holds the uuid and the Reality key, and it is shown as it is — the
+// router no longer masks it, because whoever can open this page is an admin who
+// could read the same values straight out of uci. What is left to protect is the
+// screen itself, so the link stays folded away until asked for: a shoulder or a
+// screenshot catches the row, not the secret.
+const HIDDEN_LINK = 'vless://••••••••••••';
+
+function linkCell(outbound) {
+	const text = E('code', {
+		'data-field': 'link', 'style': 'word-break:break-all'
+	}, HIDDEN_LINK);
+	let shown = false;
+	// Not ui.createHandlerFn: nothing is awaited, and the row must not be
+	// rebuilt underneath the button that was just clicked.
+	const toggle = E('button', {
+		'class': 'btn cbi-button-neutral',
+		'data-action': 'reveal-link',
+		'style': 'margin-left:.5em',
+		'click': function(ev) {
+			shown = !shown;
+			dom.content(text, shown ? outbound.link : HIDDEN_LINK);
+			dom.content(ev.currentTarget, shown ? _('Скрыть') : _('Показать'));
+		}
+	}, _('Показать'));
+	return E('td', { 'class': 'td' }, [ text, toggle ]);
+}
+
 function outboundRow(outbound, owner) {
 	const used = referrers(outbound.tag);
 	return E('tr', { 'class': 'tr', 'data-tag': outbound.tag }, [
 		E('td', { 'class': 'td' }, outbound.tag),
 		E('td', { 'class': 'td' }, outbound.label || '—'),
-		E('td', { 'class': 'td' }, E('code', {}, outbound.masked_link || '')),
-		E('td', { 'class': 'td' }, used.length
-			? statusPill(true, _('используется'), '')
-			: statusPill(false, '', _('не используется'))),
+		linkCell(outbound),
+		E('td', { 'class': 'td' }, [
+			// Usable in a rule already, but only on this page until an apply
+			// puts it on the router.
+			outbound.pending ? statusPill(false, '', _('не сохранено')) : '',
+			used.length
+				? statusPill(true, _('используется'), '')
+				: statusPill(false, '', _('не используется'))
+		]),
 		E('td', { 'class': 'td' }, [
 			E('button', {
 				'class': 'btn cbi-button-negative',
@@ -794,7 +851,7 @@ return view.extend({
 
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('Подключения')),
-					E('p', {}, _('Ссылка разбирается на роутере и обратно в браузер не возвращается. Сохранённые подключения показаны в замаскированном виде.')),
+					E('p', {}, _('Добавленное подключение сразу доступно в правилах, а на роутер попадает при применении. Ссылка в таблице скрыта: показать её можно кнопкой.')),
 					E('table', { 'class': 'table', 'id': 'zarap-outbounds' }, [
 						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
 							E('th', { 'class': 'th' }, _('Тег')),
@@ -811,7 +868,38 @@ return view.extend({
 							E('input', {
 								'id': 'zarap-link', 'class': 'cbi-input-password', 'type': 'password',
 								'autocomplete': 'off', 'style': 'width:100%', 'placeholder': 'vless://…'
-							})
+							}),
+							E('div', { 'style': ACTION_ROW }, [
+								E('button', {
+									'id': 'zarap-add-outbound',
+									'class': 'btn cbi-button-add',
+									// Nothing leaves the browser here. The connection is named
+									// and listed on the page; its link goes to the router with
+									// the apply, together with the rules that point at it.
+									'click': ui.createHandlerFn(this, function() {
+										const field = document.querySelector('#zarap-link');
+										const link = field.value.trim();
+										if (!link) {
+											ui.addNotification(null, E('p', {}, _('Вставьте ссылку VLESS Reality')), 'error');
+											field.focus();
+											return;
+										}
+										const tag = allocateTag();
+										if (!tag) {
+											ui.addNotification(null, E('p', {}, _('Слишком много подключений')), 'error');
+											return;
+										}
+										// The name comes from the router's reading of the link,
+										// so the row is nameless until it is applied.
+										state.outbounds.push({ tag: tag, label: '', link: link, pending: true });
+										// Emptied, or the same link would go out a second time as
+										// another connection when the configuration is applied.
+										field.value = '';
+										ui.addNotification(null, E('p', {}, _('Подключение добавлено: его уже можно выбрать в правиле. На роутер оно попадёт при применении')), 'info');
+										refresh();
+									})
+								}, _('Добавить'))
+							])
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
@@ -865,7 +953,7 @@ return view.extend({
 						E('button', {
 							'class': 'btn cbi-button-neutral',
 							'click': ui.createHandlerFn(this, async function() {
-								if (!addressesReady())
+								if (!readyToSend())
 									return;
 								notify(await callValidate(submittedOutbounds(), state.rules,
 									leasedClients(), state.final), _('Конфигурация корректна'));
@@ -874,7 +962,7 @@ return view.extend({
 						E('button', {
 							'class': 'btn cbi-button-save important',
 							'click': ui.createHandlerFn(this, async function(ev) {
-								if (!addressesReady())
+								if (!readyToSend())
 									return;
 								ev.currentTarget.disabled = true;
 								const result = await callApply(
