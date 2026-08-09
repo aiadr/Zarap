@@ -323,6 +323,138 @@ test('shows conditions by destination and hands them back untouched', async ({ p
   ]);
 });
 
+test('edits the destination of a rule and sends what was typed', async ({ page }) => {
+  await openZarap(page);
+
+  const rule = page.locator('#zarap-rules-body tr[data-rule="0"]');
+  await rule.getByRole('button', { name: 'Куда…' }).click();
+
+  await page.locator('textarea[data-field="Домены"]').fill('YouTube.com\n.googlevideo.com');
+  await page.locator('textarea[data-field="Диапазоны адресов"]').fill('149.154.160.0/20');
+  await page.locator('textarea[data-field="Порты"]').fill('443\n1000:2000');
+  await page.locator('select[data-field="network"]').selectOption('udp');
+  await page.locator('input[data-ruleset="rs_1"]').check();
+  await page.locator('button[data-action="save-destination"]').click();
+
+  // Записи нормализуются так же, как их принял бы роутер.
+  await expect(rule.locator('[data-field="destination"]'))
+    .toHaveText('youtube.com, .googlevideo.com · список «Реклама» · 149.154.160.0/20 · порт 443, 1000:2000 · udp');
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.find(call => call.method === 'apply').args[2][0]).toEqual({
+    clients: ['00:11:22:33:44:55'],
+    domains: ['youtube.com', '.googlevideo.com'],
+    rule_sets: ['rs_1'],
+    ip_cidr: ['149.154.160.0/20'],
+    ports: ['443', '1000:2000'],
+    network: 'udp',
+    target: 'out_1'
+  });
+});
+
+test('refuses a domain that is not one, in the words the router would use', async ({ page }) => {
+  // Круг запроса ради опечатки никому не нужен, а формулировка должна совпадать
+  // с той, что вернул бы бэкенд, иначе это выглядит как две разные ошибки.
+  await openZarap(page);
+  await page.locator('#zarap-rules-body tr[data-rule="0"]')
+    .getByRole('button', { name: 'Куда…' }).click();
+
+  await page.locator('textarea[data-field="Домены"]').fill('*.example.com');
+  await page.locator('button[data-action="save-destination"]').click();
+  await expect(page.getByText(/Звёздочка не нужна/)).toBeVisible();
+
+  await page.locator('textarea[data-field="Домены"]').fill('https://example.com');
+  await page.locator('button[data-action="save-destination"]').click();
+  await expect(page.getByText(/без схемы и пути/)).toBeVisible();
+
+  await page.locator('textarea[data-field="Домены"]').fill('example.com');
+  await page.locator('textarea[data-field="Диапазоны адресов"]').fill('2001:db8::/32');
+  await page.locator('button[data-action="save-destination"]').click();
+  await expect(page.getByText(/IPv6-диапазон/)).toBeVisible();
+
+  // Ничего не сохранилось: окно осталось открытым, правило нетронуто.
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.some(call => call.method === 'apply')).toBe(false);
+});
+
+test('adds a rule set and points a rule at it', async ({ page }) => {
+  await openZarap(page);
+
+  await page.locator('#zarap-ruleset-url').fill('https://example.org/geosite-ru.srs');
+  await page.locator('#zarap-ruleset-label').fill('Заблокированное');
+  await page.locator('#zarap-add-ruleset').click();
+
+  const added = page.locator('tr[data-ruleset="rs_2"]');
+  await expect(added).toContainText('Заблокированное');
+  // Источники списков заблокированы там же, где и всё остальное, поэтому по
+  // умолчанию предлагается подключение.
+  await expect(added).toContainText('Нидерланды');
+
+  // Ничего не ушло на роутер: список уезжает вместе с применением.
+  let calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.every(call => ['status', 'updates', 'logs'].includes(call.method))).toBe(true);
+
+  const rule = page.locator('#zarap-rules-body tr[data-rule="1"]');
+  await rule.getByRole('button', { name: 'Куда…' }).click();
+  await page.locator('input[data-ruleset="rs_2"]').check();
+  await page.locator('button[data-action="save-destination"]').click();
+  await expect(rule.locator('[data-field="destination"]')).toHaveText('список «Заблокированное»');
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  expect(apply.args[3]).toContainEqual({
+    tag: 'rs_2', label: 'Заблокированное', url: 'https://example.org/geosite-ru.srs',
+    detour: 'out_1', update_interval: '1d'
+  });
+  expect(apply.args[2][1].rule_sets).toEqual(['rs_2']);
+});
+
+test('refuses to delete a rule set a rule still points at', async ({ page }) => {
+  await openZarap(page);
+
+  const rule = page.locator('#zarap-rules-body tr[data-rule="0"]');
+  await rule.getByRole('button', { name: 'Куда…' }).click();
+  await page.locator('input[data-ruleset="rs_1"]').check();
+  await page.locator('button[data-action="save-destination"]').click();
+
+  const remove = page.locator('tr[data-ruleset="rs_1"] button[data-action="remove-ruleset"]');
+  await expect(remove).toBeDisabled();
+  await expect(remove).toHaveAttribute('title', /правило 1/);
+});
+
+test('blocking everything for the whole LAN is confirmed first', async ({ page }) => {
+  // Правило без устройств действует на весь дом, и «заблокировать» в нём —
+  // это «этого не будет ни у кого».
+  await openZarap(page);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  const added = page.locator('#zarap-rules-body tr[data-rule="2"]');
+  await added.getByRole('button', { name: 'Куда…' }).click();
+  await page.locator('textarea[data-field="Домены"]').fill('example.com');
+  await page.locator('button[data-action="save-destination"]').click();
+
+  await added.locator('select').selectOption('block');
+  await expect(page.getByText('Заблокировать для всех?')).toBeVisible();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+  await expect(page.locator('#zarap-rules-body tr[data-rule="2"] select')).not.toHaveValue('block');
+});
+
+test('says how much room the rule set cache leaves', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.__statusOverride = { cache: { size: 6291456, free: 4194304 } };
+  });
+  await openZarap(page);
+
+  await expect(page.locator('#zarap-cache')).toContainText('6.0 МиБ');
+  await expect(page.locator('[data-field="cache-warning"]')).toBeVisible();
+});
+
 test('adds a rule and picks its devices without touching the router', async ({ page }) => {
   await openZarap(page);
 

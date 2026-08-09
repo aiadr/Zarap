@@ -34,7 +34,7 @@ class RuleConditionTests(unittest.TestCase):
             "result_error", "input_error", "normalize_mac", "is_private_mac",
             "valid_ipv4", "normalize_domain", "normalize_cidr", "normalize_port",
             "valid_target", "valid_ruleset_tag", "validate_rulesets",
-            "validate_rule_list", "validate_rules"))
+            "validate_rule_list", "validate_rules", "startup_hint"))
 
     def validate(self, rules, tags=None, declared=None):
         script = "%s\nprintf('%%J', validate_rules(%s, %s, %s));\n" % (
@@ -220,6 +220,30 @@ class RuleConditionTests(unittest.TestCase):
         self.assertTrue(self.validate(
             [{"rule_sets": ["rs_1"], "target": "out_1"}],
             declared={"rs_1": True})["ok"])
+
+    def hint(self, rulesets):
+        script = "%s\nprintf('%%s', startup_hint(%s));\n" % (
+            self.prelude, json.dumps(rulesets))
+        with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run([self.ucode, path], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout
+        finally:
+            os.unlink(path)
+
+    def test_a_failed_start_names_the_rule_sets_as_a_suspect(self):
+        # Until a list reaches the cache, starting depends on somebody else's
+        # server, and a bare "could not start Zarap" sends the reader to the
+        # proxy settings instead.
+        message = self.hint([{"tag": "rs_1", "label": "Реклама"}])
+        self.assertIn("Реклама (rs_1)", message)
+        self.assertIn("журнале", message)
+
+    def test_without_rule_sets_the_failure_says_nothing_about_them(self):
+        self.assertEqual(self.hint([]), "")
 
     def test_the_order_of_the_rules_is_kept(self):
         result = self.validate([

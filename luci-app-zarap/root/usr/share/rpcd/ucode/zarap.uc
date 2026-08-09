@@ -1513,6 +1513,22 @@ function validate_request(args, enabled) {
 		clients: client_result.clients, rulesets: ruleset_result.rulesets };
 }
 
+// Списки скачивает sing-box, и до первой удачной загрузки старт зависит от
+// чужого сервера. Общее «не удалось запустить Zarap» отправляет искать причину
+// не туда, поэтому при объявленных списках отказ называет их — как подозрение,
+// а не как приговор: что именно случилось, знает только журнал.
+function startup_hint(rulesets) {
+	if (!length(rulesets || []))
+		return '';
+	let names = [];
+	for (let ruleset in rulesets)
+		push(names, ruleset.label ? (ruleset.label + ' (' + ruleset.tag + ')') : ruleset.tag);
+	return 'Проверьте наборы правил: ' + join(', ', names) +
+		'. Их скачивает sing-box, и пока список не попал в кэш, запуск зависит от ' +
+		'доступности его адреса — в том числе через выбранное для него подключение. ' +
+		'Причина отказа есть в журнале.';
+}
+
 function apply_configuration(args) {
 	let enabled = !!args?.enabled;
 	let request = validate_request(args, enabled);
@@ -1596,14 +1612,18 @@ function apply_configuration(args) {
 	if (service_code != 0) {
 		let restored = rollback(backups);
 		return result_error(restored ? 'Не удалось запустить Zarap; восстановлена предыдущая конфигурация' :
-			'Критическая ошибка запуска и rollback; kill switch оставлен активным', '', 'startup_error');
+			'Критическая ошибка запуска и rollback; kill switch оставлен активным',
+			startup_hint(request.rulesets), 'startup_error');
 	}
 
 	let health = check_runtime(enabled, LISTENER_WAIT);
 	if (!health.ok) {
 		let restored = rollback(backups);
+		let details = sprintf('%J', health);
+		let hint = startup_hint(request.rulesets);
 		return result_error(restored ? 'Локальная инфраструктура Zarap не прошла проверку; конфигурация восстановлена' :
-			'Критическая ошибка проверки и rollback; kill switch оставлен активным', sprintf('%J', health), 'startup_error');
+			'Критическая ошибка проверки и rollback; kill switch оставлен активным',
+			hint ? (hint + '\n' + details) : details, 'startup_error');
 	}
 
 	return { ok: true, enabled: enabled, clients: request.clients, health: health };

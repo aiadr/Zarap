@@ -96,6 +96,7 @@ const state = {
 	outbounds: [],
 	rules: [],
 	rulesets: [],
+	cache: { size: 0, free: 0 },
 	final: 'direct',
 	devices: [],
 	// Whether the kill switch chains are loaded, reported by the router. Only
@@ -114,9 +115,8 @@ function loadState(status) {
 			pending: false
 		};
 	});
-	// Every condition is carried, including the ones this page cannot edit yet:
-	// what an apply submits is this list, so a condition dropped here would be a
-	// condition deleted from the router on the next save.
+	// Every condition is carried: what an apply submits is this list, so one
+	// dropped here would be a condition deleted from the router on the next save.
 	state.rules = (status.rules || []).map(function(rule) {
 		return {
 			clients: (rule.clients || []).slice(),
@@ -128,8 +128,8 @@ function loadState(status) {
 			target: rule.target
 		};
 	});
-	// Наборы правил страница пока не редактирует, но отправляет обратно: apply
-	// переписывает секции целиком, и потерянный здесь набор был бы удалён.
+	// apply переписывает секции целиком, поэтому список уезжает обратно вместе
+	// со всем остальным — и потерянный здесь набор был бы удалён с роутера.
 	state.rulesets = (status.rulesets || []).map(function(ruleset) {
 		return {
 			tag: ruleset.tag,
@@ -139,6 +139,7 @@ function loadState(status) {
 			update_interval: ruleset.update_interval || ''
 		};
 	});
+	state.cache = status.cache || { size: 0, free: 0 };
 	state.final = status.final || 'direct';
 	state.firewall = !!status.firewall;
 	state.devices = (status.devices || []).map(function(device) {
@@ -289,6 +290,32 @@ function allocateTag() {
 	return '';
 }
 
+// Как и подключения, наборы называет страница: правило ссылается на набор по
+// тегу, и тег обязан существовать раньше, чем набор доедет до роутера.
+function allocateRulesetTag() {
+	const taken = {};
+	state.rulesets.forEach(function(ruleset) { taken[ruleset.tag] = true; });
+	for (let number = 1; number <= 999; number++)
+		if (!taken['rs_' + number])
+			return 'rs_' + number;
+	return '';
+}
+
+// Округление здесь, а не в форматной строке: %f у разных реализаций format
+// ведёт себя по-разному, а число надо показать одинаково везде.
+function formatBytes(value) {
+	const size = Number(value || 0);
+	if (size >= 1048576)
+		return (size / 1048576).toFixed(1) + ' ' + _('МиБ');
+	if (size >= 1024)
+		return Math.round(size / 1024) + ' ' + _('КиБ');
+	return size + ' ' + _('Б');
+}
+
+// Порог абсолютный, а не в процентах: на проверенном роутере /overlay — 44 МиБ,
+// и 10 % от него кончились бы уже после первого geosite-набора.
+const CACHE_WARNING = 8 * 1048576;
+
 function targetLabel(target) {
 	if (target === 'direct')
 		return _('напрямую');
@@ -351,6 +378,17 @@ function deviceRow(device) {
 			unavailable ? E('div', { 'class': 'error' }, reason) : ''
 		])
 	]);
+}
+
+// Кто ссылается на набор, словами: отказ «используется» без имён отправляет
+// пользователя искать вслепую.
+function rulesetReferrers(tag) {
+	const found = [];
+	state.rules.forEach(function(rule, index) {
+		if ((rule.rule_sets || []).indexOf(tag) >= 0)
+			found.push(_('правило %d').format(index + 1));
+	});
+	return found;
 }
 
 // Who points at this connection, in words. A refusal that only says "in use"
@@ -622,6 +660,34 @@ function devicePicker(rule, owner, onDone) {
 	]);
 }
 
+// Правило без устройств действует на весь LAN, поэтому блокировка в нём — это
+// «этого не будет ни у кого». Стоит сказать до сохранения, а не после звонка
+// от домашних.
+function confirmBlanketBlock(select, previous, rule, owner) {
+	ui.showModal(_('Заблокировать для всех?'), [
+		E('p', {}, _('Правило не называет устройств, поэтому запрет коснётся всей локальной сети: %s.')
+			.format(destinationSummary(rule))),
+		E('div', { 'class': 'right', 'style': ACTION_ROW }, [
+			E('button', {
+				'class': 'btn',
+				'click': ui.createHandlerFn(owner, function() {
+					rule.target = previous;
+					select.value = previous;
+					ui.hideModal();
+					refresh();
+				})
+			}, _('Отмена')),
+			E('button', {
+				'class': 'btn cbi-button-negative important',
+				'click': ui.createHandlerFn(owner, function() {
+					ui.hideModal();
+					refresh();
+				})
+			}, _('Заблокировать'))
+		])
+	]);
+}
+
 function targetSelect(current, onChange) {
 	const select = E('select', { 'class': 'cbi-input-select' });
 	const options = [ { value: 'direct', text: _('напрямую') } ]
@@ -684,6 +750,170 @@ function rulesetLabel(tag) {
 	return known && known.label ? _('список «%s»').format(known.label) : tag;
 }
 
+// Проверки ввода повторяют те, что стоят на роутере: круг запроса ради опечатки
+// в домене никому не нужен, а формулировка отказа должна быть той же, иначе
+// пользователь решит, что это две разные ошибки.
+function checkDomain(value) {
+	const text = value.trim().toLowerCase();
+	if (text.indexOf('://') >= 0 || text.indexOf('/') >= 0)
+		return _('Домен пишется без схемы и пути: %s').format(text);
+	if (text.indexOf('*') >= 0)
+		return _('Звёздочка не нужна: %s — запись и так покрывает поддомены. Для одних поддоменов начните с точки').format(text);
+	if (!/^[!-~]+$/.test(text))
+		return _('Домен %s записан не ASCII: укажите его в punycode (xn--…)').format(text);
+	if (!/^\.?[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$/.test(text))
+		return _('Некорректный домен: %s').format(text);
+	return '';
+}
+
+function checkRange(value) {
+	const text = value.trim();
+	if (text.indexOf(':') >= 0)
+		return _('IPv6-диапазон %s не поддерживается: IPv6 не маршрутизируется и в LAN не раздаётся').format(text);
+	const parts = text.split('/');
+	if (!isIpv4(parts[0]) || parts.length > 2)
+		return _('Некорректный диапазон адресов: %s').format(text);
+	if (parts.length === 2 && (!/^\d{1,2}$/.test(parts[1]) || Number(parts[1]) > 32))
+		return _('Некорректная маска в диапазоне: %s').format(text);
+	return '';
+}
+
+function checkPort(value) {
+	const text = value.trim();
+	const bounds = text.split(':');
+	if (bounds.length > 2)
+		return _('Некорректный порт: %s').format(text);
+	for (let index = 0; index < bounds.length; index++)
+		if (!/^\d{1,5}$/.test(bounds[index]) || Number(bounds[index]) < 1 || Number(bounds[index]) > 65535)
+			return _('Порт должен быть от 1 до 65535: %s').format(text);
+	if (bounds.length === 2 && Number(bounds[0]) > Number(bounds[1]))
+		return _('В диапазоне портов начало больше конца: %s').format(text);
+	return '';
+}
+
+// Многострочное поле: запись на строку. Возвращает список и первую ошибку —
+// пустые строки просто выбрасываются, чтобы лишний перевод строки не считался
+// пустой записью.
+function readEntries(area, check) {
+	const values = [], seen = {};
+	let error = '';
+	area.value.split('\n').forEach(function(line) {
+		const text = line.trim();
+		if (!text)
+			return;
+		const complaint = check(text);
+		if (complaint && !error)
+			error = complaint;
+		const normalized = text.toLowerCase();
+		if (seen[normalized]) {
+			if (!error)
+				error = _('Запись %s указана в правиле дважды').format(text);
+			return;
+		}
+		seen[normalized] = true;
+		values.push(normalized);
+	});
+	return { values: values, error: error };
+}
+
+function conditionField(label, hint, value) {
+	const area = E('textarea', {
+		'class': 'cbi-input-textarea', 'rows': 4, 'style': 'width:100%',
+		'data-field': label
+	});
+	area.value = (value || []).join('\n');
+	return {
+		area: area,
+		node: E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title' }, label),
+			E('div', { 'class': 'cbi-value-field' }, [
+				area, E('div', {}, E('small', {}, hint))
+			])
+		])
+	};
+}
+
+// Условия по назначению одного правила. Домены, адреса и порты — по записи на
+// строку; наборы правил отмечаются, потому что они уже объявлены отдельно.
+function destinationPicker(rule, owner, onDone) {
+	const domains = conditionField(_('Домены'),
+		_('youtube.com — имя и всё под ним, .googlevideo.com — только поддомены'),
+		rule.domains);
+	const ranges = conditionField(_('Диапазоны адресов'),
+		_('149.154.160.0/20 или один адрес; только IPv4'), rule.ip_cidr);
+	const ports = conditionField(_('Порты'),
+		_('443 или диапазон 1000:2000'), rule.ports);
+
+	const network = E('select', { 'class': 'cbi-input-select', 'data-field': 'network' });
+	[ { value: '', text: _('любой') }, { value: 'tcp', text: 'tcp' },
+	  { value: 'udp', text: 'udp' } ].forEach(function(option) {
+		network.appendChild(E('option', { 'value': option.value }, option.text));
+	});
+	network.value = rule.network || '';
+
+	const chosen = {};
+	(rule.rule_sets || []).forEach(function(tag) { chosen[tag] = true; });
+	const sets = state.rulesets.map(function(ruleset) {
+		const box = E('input', {
+			'type': 'checkbox', 'data-ruleset': ruleset.tag,
+			'checked': chosen[ruleset.tag] ? '' : null
+		});
+		box.addEventListener('change', function() {
+			if (box.checked)
+				chosen[ruleset.tag] = true;
+			else
+				delete chosen[ruleset.tag];
+		});
+		return E('div', {}, [ E('label', {}, [ box, ' ',
+			ruleset.label || ruleset.tag, E('small', {}, ' ' + ruleset.url) ]) ]);
+	});
+
+	const error = E('div', { 'class': 'error', 'style': 'display:none' });
+
+	ui.showModal(_('Куда идёт трафик'), [
+		E('p', {}, _('Домены, адреса и списки соединяются через «или»: подходит любое из перечисленного. Порт и протокол уточняют всё правило целиком.')),
+		E('p', {}, E('small', {}, _('Правило по домену действует на соединения, где имя видно в запросе, и не спасает, если домен блокируется в DNS: наружу уходит адрес, который клиент получил от DNS.'))),
+		domains.node,
+		ranges.node,
+		ports.node,
+		E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title' }, _('Протокол')),
+			E('div', { 'class': 'cbi-value-field' }, [ network ])
+		]),
+		E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title' }, _('Списки правил')),
+			E('div', { 'class': 'cbi-value-field' }, sets.length ? sets
+				: [ E('em', {}, _('Списков пока нет: добавьте их в секции «Списки правил»')) ])
+		]),
+		error,
+		E('div', { 'class': 'right', 'style': ACTION_ROW }, [
+			E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Отмена')),
+			E('button', {
+				'class': 'btn cbi-button-positive important',
+				'data-action': 'save-destination',
+				'click': ui.createHandlerFn(owner, function() {
+					const read = [ readEntries(domains.area, checkDomain),
+						readEntries(ranges.area, checkRange),
+						readEntries(ports.area, checkPort) ];
+					const complaint = read.filter(function(part) { return part.error; })[0];
+					if (complaint) {
+						error.style.display = '';
+						dom.content(error, complaint.error);
+						return;
+					}
+					rule.domains = read[0].values;
+					rule.ip_cidr = read[1].values;
+					rule.ports = read[2].values;
+					rule.network = network.value;
+					rule.rule_sets = Object.keys(chosen);
+					ui.hideModal();
+					onDone();
+				})
+			}, _('Готово'))
+		])
+	]);
+}
+
 function ruleRow(rule, index, owner) {
 	return E('tr', { 'class': 'tr', 'data-rule': String(index) }, [
 		E('td', { 'class': 'td' }, String(index + 1)),
@@ -698,10 +928,27 @@ function ruleRow(rule, index, owner) {
 			}, _('Устройства…'))
 		]),
 		E('td', { 'class': 'td' }, [
-			E('span', { 'data-field': 'destination' }, destinationSummary(rule))
+			E('span', { 'data-field': 'destination' }, destinationSummary(rule)),
+			E('button', {
+				'class': 'btn cbi-button-neutral',
+				'style': 'margin-left:.5em',
+				'click': ui.createHandlerFn(owner, function() {
+					destinationPicker(rule, owner, refresh);
+				})
+			}, _('Куда…'))
 		]),
 		E('td', { 'class': 'td' }, [
-			targetSelect(rule.target, function(value) { rule.target = value; refresh(); })
+			(function() {
+				const previous = rule.target;
+				const select = targetSelect(rule.target, function(value) {
+					rule.target = value;
+					if (value === 'block' && !(rule.clients || []).length)
+						confirmBlanketBlock(select, previous, rule, owner);
+					else
+						refresh();
+				});
+				return select;
+			})()
 		]),
 		E('td', { 'class': 'td' }, [
 			E('button', {
@@ -722,6 +969,65 @@ function ruleRow(rule, index, owner) {
 				'click': ui.createHandlerFn(owner, function() { confirmRuleRemoval(index, owner); })
 			}, _('Удалить'))
 		])
+	]);
+}
+
+function rulesetRow(ruleset, owner) {
+	const used = rulesetReferrers(ruleset.tag);
+	return E('tr', { 'class': 'tr', 'data-ruleset': ruleset.tag }, [
+		E('td', { 'class': 'td' }, ruleset.label || ruleset.tag),
+		E('td', { 'class': 'td' }, E('code', { 'style': 'word-break:break-all' }, ruleset.url)),
+		E('td', { 'class': 'td' }, [
+			ruleset.detour === 'direct' ? _('напрямую') : targetLabel(ruleset.detour),
+			// Подключение могли удалить, а набор остался на него ссылаться:
+			// тогда список просто перестанет обновляться, и молчать об этом
+			// нельзя.
+			ruleset.detour !== 'direct' && !state.outbounds.some(function(outbound) {
+				return outbound.tag === ruleset.detour;
+			}) ? E('div', { 'class': 'error' }, _('подключение удалено — список не обновится')) : ''
+		]),
+		E('td', { 'class': 'td' }, ruleset.update_interval || _('не обновлять')),
+		E('td', { 'class': 'td' }, used.length
+			? statusPill(true, _('используется'), '')
+			: statusPill(false, '', _('не используется'))),
+		E('td', { 'class': 'td' }, [
+			E('button', {
+				'class': 'btn cbi-button-negative',
+				'data-action': 'remove-ruleset',
+				'disabled': used.length ? '' : null,
+				'title': used.length
+					? _('Ссылаются: %s').format(used.join(', '))
+					: _('Удалить список'),
+				'click': ui.createHandlerFn(owner, function() {
+					state.rulesets = state.rulesets.filter(function(other) {
+						return other.tag !== ruleset.tag;
+					});
+					refresh();
+				})
+			}, _('Удалить'))
+		])
+	]);
+}
+
+function renderRulesets(owner) {
+	if (owner)
+		renderRulesets.owner = owner;
+	const context = renderRulesets.owner;
+	return state.rulesets.length
+		? state.rulesets.map(function(ruleset) { return rulesetRow(ruleset, context); })
+		: E('tr', {}, E('td', { 'colspan': 6 }, _('Списков пока нет')));
+}
+
+// Строка про место. Размер отдельного списка сказать нечем — файл принадлежит
+// sing-box, — поэтому здесь размер кэша целиком и остаток на разделе.
+function renderCache() {
+	const cache = state.cache || { size: 0, free: 0 };
+	const tight = cache.free && cache.free < CACHE_WARNING;
+	return E('span', {}, [
+		E('span', {}, _('Кэш списков: %s, свободно на /overlay: %s')
+			.format(formatBytes(cache.size), formatBytes(cache.free))),
+		tight ? E('div', { 'class': 'error', 'data-field': 'cache-warning' },
+			_('Места мало: список может не поместиться, а sing-box качает их сам при каждом запуске без кэша.')) : ''
 	]);
 }
 
@@ -811,6 +1117,8 @@ function refresh() {
 	fillSuggestedAddresses();
 	dom.content(document.querySelector('#zarap-outbounds-body'), renderOutbounds());
 	dom.content(document.querySelector('#zarap-rules-body'), renderRules());
+	dom.content(document.querySelector('#zarap-rulesets-body'), renderRulesets());
+	dom.content(document.querySelector('#zarap-cache'), renderCache());
 	dom.content(document.querySelector('#zarap-devices-body'), renderDevices());
 	dom.content(document.querySelector('#zarap-final'), finalRow(finalRow.owner));
 }
@@ -1010,7 +1318,7 @@ return view.extend({
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('Правила')),
 					E('p', {}, _('Применяется первое подходящее правило. Условия «Откуда» и «Куда» соединяются через «и»: правило срабатывает, когда трафик пришёл от названного устройства и идёт к названному месту. Устройство, названное правилом, остаётся под kill switch даже при выключенном Zarap: прямой доступ возвращает только удаление правила.')),
-					E('p', {}, E('small', {}, _('Условия «Куда» — домены, диапазоны адресов, порты, протокол — пока задаются только в /etc/config/zarap. Страница их показывает и сохраняет без изменений. Правило по домену действует на соединения, где имя видно в запросе, и не спасает, если домен блокируется в DNS.'))),
+					E('p', {}, E('small', {}, _('Правило по домену действует на соединения, где имя видно в запросе, и не спасает, если домен блокируется в DNS: наружу уходит адрес, который клиент получил от DNS.'))),
 					E('table', { 'class': 'table', 'id': 'zarap-rules' }, [
 						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
 							E('th', { 'class': 'th' }, '#'),
@@ -1036,6 +1344,70 @@ return view.extend({
 						}, _('Добавить правило'))
 					]),
 					E('p', { 'id': 'zarap-final' }, finalRow(this))
+				]),
+
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, _('Списки правил')),
+					E('p', {}, _('Готовые наборы доменов и подсетей в формате .srs. Скачивает и обновляет их сам sing-box через выбранное подключение — у Zarap своей копии нет, и проверить адрес заранее он не может: недоступный список выяснится на запуске и откатит применение.')),
+					E('table', { 'class': 'table', 'id': 'zarap-rulesets' }, [
+						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
+							E('th', { 'class': 'th' }, _('Название')),
+							E('th', { 'class': 'th' }, _('Адрес')),
+							E('th', { 'class': 'th' }, _('Скачивать через')),
+							E('th', { 'class': 'th' }, _('Обновлять')),
+							E('th', { 'class': 'th' }, _('Состояние')),
+							E('th', { 'class': 'th' }, '')
+						])),
+						E('tbody', { 'id': 'zarap-rulesets-body' }, renderRulesets(this))
+					]),
+					E('p', { 'id': 'zarap-cache' }, renderCache()),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-ruleset-url' }, _('Добавить список')),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'zarap-ruleset-url', 'class': 'cbi-input-text',
+								'style': 'width:100%', 'placeholder': 'https://example.org/geosite-ads.srs'
+							}),
+							E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:.5em;margin-top:.5em' }, [
+								E('input', { 'id': 'zarap-ruleset-label', 'class': 'cbi-input-text',
+									'placeholder': _('Название') }),
+								E('select', { 'id': 'zarap-ruleset-detour', 'class': 'cbi-input-select' }),
+								E('select', { 'id': 'zarap-ruleset-interval', 'class': 'cbi-input-select' })
+							]),
+							E('div', { 'style': ACTION_ROW }, [
+								E('button', {
+									'id': 'zarap-add-ruleset',
+									'class': 'btn cbi-button-add',
+									'click': ui.createHandlerFn(this, function() {
+										const url = document.querySelector('#zarap-ruleset-url');
+										const label = document.querySelector('#zarap-ruleset-label');
+										const detour = document.querySelector('#zarap-ruleset-detour');
+										const interval = document.querySelector('#zarap-ruleset-interval');
+										const address = url.value.trim();
+										if (!/^https?:\/\/[!-~]+$/.test(address)) {
+											ui.addNotification(null, E('p', {}, _('Адрес списка должен начинаться с http:// или https://')), 'error');
+											url.focus();
+											return;
+										}
+										const tag = allocateRulesetTag();
+										if (!tag) {
+											ui.addNotification(null, E('p', {}, _('Слишком много списков')), 'error');
+											return;
+										}
+										state.rulesets.push({
+											tag: tag, label: label.value.trim(), url: address,
+											detour: detour.value || 'direct',
+											update_interval: interval.value || ''
+										});
+										url.value = '';
+										label.value = '';
+										ui.addNotification(null, E('p', {}, _('Список добавлен: его уже можно выбрать в правиле. Скачает его sing-box при применении')), 'info');
+										refresh();
+									})
+								}, _('Добавить'))
+							])
+						])
+					])
 				]),
 
 				E('div', { 'class': 'cbi-section' }, [
@@ -1152,7 +1524,28 @@ return view.extend({
 
 		// The pane markup only exists once render has returned, so the first
 		// selection has to wait for the page to be in the document.
-		window.setTimeout(function() { selectTab('setup'); }, 0);
+		window.setTimeout(function() {
+			selectTab('setup');
+			const detour = document.querySelector('#zarap-ruleset-detour');
+			if (detour) {
+				dom.content(detour, [ E('option', { 'value': 'direct' }, _('напрямую')) ]
+					.concat(state.outbounds.map(function(outbound) {
+						return E('option', { 'value': outbound.tag }, outbound.label || outbound.tag);
+					})));
+				// Источники списков заблокированы там же, где и всё остальное,
+				// поэтому по умолчанию предлагается подключение, а не direct.
+				if (state.outbounds.length)
+					detour.value = state.outbounds[0].tag;
+			}
+			const interval = document.querySelector('#zarap-ruleset-interval');
+			if (interval)
+				dom.content(interval, [
+					E('option', { 'value': '1d' }, _('раз в день')),
+					E('option', { 'value': '12h' }, _('дважды в день')),
+					E('option', { 'value': '168h' }, _('раз в неделю')),
+					E('option', { 'value': '' }, _('не обновлять'))
+				]);
+		}, 0);
 		return page;
 	},
 

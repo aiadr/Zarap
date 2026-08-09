@@ -35,6 +35,13 @@ const fixtures = {
       { clients: ['00:11:22:33:44:55'], target: 'out_1' },
       { clients: ['10:20:30:40:50:60'], target: 'block' }
     ],
+    rulesets: [
+      {
+        tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
+        detour: 'out_1', update_interval: '1d', in_use: false
+      }
+    ],
+    cache: { size: 1258291, free: 20971520 },
     final: 'direct',
     capture: { interface: 'br-lan', active: true },
     devices: [
