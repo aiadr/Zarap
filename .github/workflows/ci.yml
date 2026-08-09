@@ -61,6 +61,7 @@ jobs:
           python3 -m json.tool luci-app-zarap/root/usr/share/rpcd/acl.d/luci-app-zarap.json >/dev/null
           bash -n .github/scripts/build-zarap-apk.sh
           sh -n luci-app-zarap/root/etc/init.d/zarap luci-app-zarap/root/etc/uci-defaults/90-zarap
+          sh -n tests/router-checks.sh
           python3 -m unittest discover -s tests -v
 
       - name: Build ucode syntax checker
