@@ -273,6 +273,43 @@ function refresh() {
 		_('Остальной трафик: %s').format(targetLabel(state.final)));
 }
 
+// Six sections is too many for one scroll, and the ones you configure have
+// nothing to do with the ones you read. Rules and devices stay together: adding
+// a device to a rule means giving it an address, and that is edited in the
+// device table.
+const TABS = [
+	{ id: 'setup', title: _('Настройка') },
+	{ id: 'maintenance', title: _('Обслуживание') }
+];
+
+function selectTab(id) {
+	TABS.forEach(function(tab) {
+		const pane = document.querySelector('#zarap-tab-' + tab.id);
+		const button = document.querySelector('#zarap-tabbtn-' + tab.id);
+		if (!pane || !button)
+			return;
+		const active = tab.id === id;
+		pane.style.display = active ? '' : 'none';
+		button.className = active ? 'cbi-tab' : 'cbi-tab-disabled';
+		button.setAttribute('aria-selected', active ? 'true' : 'false');
+	});
+}
+
+function tabBar() {
+	return E('ul', { 'class': 'cbi-tabmenu' }, TABS.map(function(tab) {
+		return E('li', { 'id': 'zarap-tabbtn-' + tab.id, 'class': 'cbi-tab-disabled' }, [
+			E('a', {
+				'href': '#',
+				'click': function(ev) { ev.preventDefault(); selectTab(tab.id); }
+			}, tab.title)
+		]);
+	}));
+}
+
+function tabPane(id, sections) {
+	return E('div', { 'id': 'zarap-tab-' + id, 'style': 'display:none' }, sections);
+}
+
 function updateRow(name, data, owner, runtimeStatus) {
 	const title = name === 'luci-app-zarap' ? 'Zarap' : 'sing-box';
 	const installed = data.installed || _('не установлен');
@@ -328,188 +365,198 @@ return view.extend({
 		const logs = (data[2] && data[2].logs) || '';
 		loadState(status);
 
-		return E('div', { 'class': 'cbi-map' }, [
+		const page = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, 'Zarap'),
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('Состояние')),
-				E('p', { 'class': status.state && status.state.endsWith('_error') ? 'error' : '' }, status.message || _('Состояние неизвестно')),
-				E('p', {}, [
-					statusPill(status.running, _('sing-box работает'), _('sing-box остановлен')),
-					statusPill(status.listener, _('TProxy слушает'), _('нет TProxy-порта')),
-					statusPill(status.firewall, _('kill switch активен'), _('нет правил firewall')),
-					statusPill(status.routing, _('маршрутизация активна'), _('нет policy routing'))
+			tabBar(),
+			tabPane('setup', [
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, _('Состояние')),
+					E('p', { 'class': status.state && status.state.endsWith('_error') ? 'error' : '' }, status.message || _('Состояние неизвестно')),
+					E('p', {}, [
+						statusPill(status.running, _('sing-box работает'), _('sing-box остановлен')),
+						statusPill(status.listener, _('TProxy слушает'), _('нет TProxy-порта')),
+						statusPill(status.firewall, _('kill switch активен'), _('нет правил firewall')),
+						statusPill(status.routing, _('маршрутизация активна'), _('нет policy routing'))
+					]),
+					E('p', {}, status.capture && status.capture.interface
+						? _('Захват трафика: интерфейс %s').format(status.capture.interface)
+						: _('LAN-интерфейс не определён')),
+					E('div', { 'class': 'right', 'style': ACTION_ROW }, [
+						E('button', {
+							'class': 'btn cbi-button-action',
+							'disabled': status.enabled ? null : '',
+							'title': status.enabled ? '' : _('Сначала включите Zarap'),
+							'click': ui.createHandlerFn(this, async function() {
+								if (notify(await callRestart(), _('Zarap перезапущен')))
+									window.location.reload();
+							})
+						}, _('Перезапустить')),
+						E('button', {
+							'class': 'btn cbi-button-negative',
+							'disabled': status.enabled ? null : '',
+							'title': status.enabled ? '' : _('Zarap уже выключен'),
+							'click': ui.createHandlerFn(this, async function() {
+								if (notify(await callStop(), _('Zarap остановлен; kill switch для выбранных устройств сохранён')))
+									window.location.reload();
+							})
+						}, _('Остановить'))
+					])
 				]),
-				E('p', {}, status.capture && status.capture.interface
-					? _('Захват трафика: интерфейс %s').format(status.capture.interface)
-					: _('LAN-интерфейс не определён')),
-				E('div', { 'class': 'right', 'style': ACTION_ROW }, [
-					E('button', {
+
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, _('Подключения')),
+					E('p', {}, _('Ссылка разбирается на роутере и обратно в браузер не возвращается. Сохранённые подключения показаны в замаскированном виде.')),
+					E('table', { 'class': 'table', 'id': 'zarap-outbounds' }, [
+						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
+							E('th', { 'class': 'th' }, _('Тег')),
+							E('th', { 'class': 'th' }, _('Название')),
+							E('th', { 'class': 'th' }, _('Ссылка')),
+							E('th', { 'class': 'th' }, _('Состояние'))
+						])),
+						E('tbody', { 'id': 'zarap-outbounds-body' }, renderOutbounds())
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-link' }, _('Добавить подключение')),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'zarap-link', 'class': 'cbi-input-password', 'type': 'password',
+								'autocomplete': 'off', 'style': 'width:100%', 'placeholder': 'vless://…'
+							})
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-enabled' }, _('Включить Zarap')),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', { 'id': 'zarap-enabled', 'type': 'checkbox', 'checked': state.enabled ? '' : null })
+						])
+					])
+				]),
+
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, _('Правила')),
+					E('p', {}, _('Применяется первое подходящее правило. Устройство, названное правилом, остаётся под kill switch даже при выключенном Zarap: прямой доступ возвращает только удаление правила.')),
+					E('table', { 'class': 'table', 'id': 'zarap-rules' }, [
+						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
+							E('th', { 'class': 'th' }, '#'),
+							E('th', { 'class': 'th' }, _('Устройства')),
+							E('th', { 'class': 'th' }, _('Куда'))
+						])),
+						E('tbody', { 'id': 'zarap-rules-body' }, renderRules())
+					]),
+					E('p', { 'id': 'zarap-final' }, _('Остальной трафик: %s').format(targetLabel(state.final))),
+					E('p', { 'class': 'cbi-value-description' }, _('Редактирование правил появится в следующей версии; пока их задаёт uci в /etc/config/zarap.'))
+				]),
+
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, _('Устройства')),
+					E('p', {}, _('Весь трафик локальной сети проходит через Zarap. Адрес можно менять только у устройств, названных правилом: Zarap держит для них статическую DHCP-аренду, на которую правило и опирается.')),
+					E('table', { 'class': 'table', 'id': 'zarap-devices' }, [
+						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
+							E('th', { 'class': 'th' }, _('Имя')),
+							E('th', { 'class': 'th' }, _('MAC')),
+							E('th', { 'class': 'th' }, _('Статический IPv4')),
+							E('th', { 'class': 'th' }, _('Куда идёт')),
+							E('th', { 'class': 'th' }, _('Состояние'))
+						])),
+						E('tbody', { 'id': 'zarap-devices-body' }, renderDevices())
+					]),
+					E('div', { 'class': 'cbi-page-actions', 'style': ACTION_ROW }, [
+						E('button', {
+							'class': 'btn cbi-button-neutral',
+							'click': ui.createHandlerFn(this, async function() {
+								notify(await callValidate(submittedOutbounds(), state.rules,
+									leasedClients(), state.final), _('Конфигурация корректна'));
+							})
+						}, _('Проверить конфигурацию')),
+						E('button', {
+							'class': 'btn cbi-button-save important',
+							'click': ui.createHandlerFn(this, async function(ev) {
+								ev.currentTarget.disabled = true;
+								const result = await callApply(
+									document.querySelector('#zarap-enabled').checked,
+									submittedOutbounds(),
+									state.rules,
+									leasedClients(),
+									state.final
+								);
+								if (notify(result, _('Конфигурация применена'))) {
+									if ((result.clients || []).some(function(client) { return client.reconnect_required; }))
+										ui.addNotification(null, E('p', _('Статический IPv4 изменён. Переподключите отмеченное устройство к Wi-Fi вручную.')), 'warning');
+									window.setTimeout(function() { window.location.reload(); }, 700);
+								}
+								else
+									ev.currentTarget.disabled = false;
+							})
+						}, _('Сохранить и применить'))
+					])
+				])
+			]),
+			tabPane('maintenance', [
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, _('Компоненты и обновления')),
+					E('p', {}, _('Проверка выполняется одновременно для Zarap и sing-box через настроенные APK-репозитории.')),
+					E('table', { 'class': 'table' }, [
+						E('tr', { 'class': 'tr table-titles' }, [
+							E('th', { 'class': 'th' }, _('Компонент')),
+							E('th', { 'class': 'th' }, _('Установлено')),
+							E('th', { 'class': 'th' }, _('Доступно')),
+							E('th', { 'class': 'th' }, _('Действие'))
+						]),
+						E('tbody', { 'id': 'zarap-components-body' }, [
+							updateRow('luci-app-zarap', updates['luci-app-zarap'] || {}, this, status),
+							updateRow('sing-box', updates['sing-box'] || {}, this, status)
+						])
+					]),
+					E('div', { 'class': 'right', 'style': ACTION_ROW }, E('button', {
 						'class': 'btn cbi-button-action',
-						'disabled': status.enabled ? null : '',
-						'title': status.enabled ? '' : _('Сначала включите Zarap'),
-						'click': ui.createHandlerFn(this, async function() {
-							if (notify(await callRestart(), _('Zarap перезапущен')))
-								window.location.reload();
-						})
-					}, _('Перезапустить')),
-					E('button', {
-						'class': 'btn cbi-button-negative',
-						'disabled': status.enabled ? null : '',
-						'title': status.enabled ? '' : _('Zarap уже выключен'),
-						'click': ui.createHandlerFn(this, async function() {
-							if (notify(await callStop(), _('Zarap остановлен; kill switch для выбранных устройств сохранён')))
-								window.location.reload();
-						})
-					}, _('Остановить'))
-				])
-			]),
-
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('Подключения')),
-				E('p', {}, _('Ссылка разбирается на роутере и обратно в браузер не возвращается. Сохранённые подключения показаны в замаскированном виде.')),
-				E('table', { 'class': 'table', 'id': 'zarap-outbounds' }, [
-					E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
-						E('th', { 'class': 'th' }, _('Тег')),
-						E('th', { 'class': 'th' }, _('Название')),
-						E('th', { 'class': 'th' }, _('Ссылка')),
-						E('th', { 'class': 'th' }, _('Состояние'))
-					])),
-					E('tbody', { 'id': 'zarap-outbounds-body' }, renderOutbounds())
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'zarap-link' }, _('Добавить подключение')),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('input', {
-							'id': 'zarap-link', 'class': 'cbi-input-password', 'type': 'password',
-							'autocomplete': 'off', 'style': 'width:100%', 'placeholder': 'vless://…'
-						})
-					])
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title', 'for': 'zarap-enabled' }, _('Включить Zarap')),
-					E('div', { 'class': 'cbi-value-field' }, [
-						E('input', { 'id': 'zarap-enabled', 'type': 'checkbox', 'checked': state.enabled ? '' : null })
-					])
-				])
-			]),
-
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('Правила')),
-				E('p', {}, _('Применяется первое подходящее правило. Устройство, названное правилом, остаётся под kill switch даже при выключенном Zarap: прямой доступ возвращает только удаление правила.')),
-				E('table', { 'class': 'table', 'id': 'zarap-rules' }, [
-					E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
-						E('th', { 'class': 'th' }, '#'),
-						E('th', { 'class': 'th' }, _('Устройства')),
-						E('th', { 'class': 'th' }, _('Куда'))
-					])),
-					E('tbody', { 'id': 'zarap-rules-body' }, renderRules())
-				]),
-				E('p', { 'id': 'zarap-final' }, _('Остальной трафик: %s').format(targetLabel(state.final))),
-				E('p', { 'class': 'cbi-value-description' }, _('Редактирование правил появится в следующей версии; пока их задаёт uci в /etc/config/zarap.'))
-			]),
-
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('Устройства')),
-				E('p', {}, _('Весь трафик локальной сети проходит через Zarap. Адрес можно менять только у устройств, названных правилом: Zarap держит для них статическую DHCP-аренду, на которую правило и опирается.')),
-				E('table', { 'class': 'table', 'id': 'zarap-devices' }, [
-					E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
-						E('th', { 'class': 'th' }, _('Имя')),
-						E('th', { 'class': 'th' }, _('MAC')),
-						E('th', { 'class': 'th' }, _('Статический IPv4')),
-						E('th', { 'class': 'th' }, _('Куда идёт')),
-						E('th', { 'class': 'th' }, _('Состояние'))
-					])),
-					E('tbody', { 'id': 'zarap-devices-body' }, renderDevices())
-				]),
-				E('div', { 'class': 'cbi-page-actions', 'style': ACTION_ROW }, [
-					E('button', {
-						'class': 'btn cbi-button-neutral',
-						'click': ui.createHandlerFn(this, async function() {
-							notify(await callValidate(submittedOutbounds(), state.rules,
-								leasedClients(), state.final), _('Конфигурация корректна'));
-						})
-					}, _('Проверить конфигурацию')),
-					E('button', {
-						'class': 'btn cbi-button-save important',
 						'click': ui.createHandlerFn(this, async function(ev) {
 							ev.currentTarget.disabled = true;
-							const result = await callApply(
-								document.querySelector('#zarap-enabled').checked,
-								submittedOutbounds(),
-								state.rules,
-								leasedClients(),
-								state.final
-							);
-							if (notify(result, _('Конфигурация применена'))) {
-								if ((result.clients || []).some(function(client) { return client.reconnect_required; }))
-									ui.addNotification(null, E('p', _('Статический IPv4 изменён. Переподключите отмеченное устройство к Wi-Fi вручную.')), 'warning');
-								window.setTimeout(function() { window.location.reload(); }, 700);
+							dom.content(ev.currentTarget, E('span', {}, _('Обновление списков…')));
+							const result = await callUpdates(true);
+							if (notify(result, _('Списки репозиториев обновлены'))) {
+								const components = result.components || {};
+								dom.content(document.querySelector('#zarap-components-body'), [
+									updateRow('luci-app-zarap', components['luci-app-zarap'] || {}, this, status),
+									updateRow('sing-box', components['sing-box'] || {}, this, status)
+								]);
 							}
-							else
-								ev.currentTarget.disabled = false;
+							dom.content(ev.currentTarget, _('Проверить обновления'));
+							ev.currentTarget.disabled = false;
 						})
-					}, _('Сохранить и применить'))
-				])
-			]),
+					}, _('Проверить обновления')))
+				]),
 
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('Компоненты и обновления')),
-				E('p', {}, _('Проверка выполняется одновременно для Zarap и sing-box через настроенные APK-репозитории.')),
-				E('table', { 'class': 'table' }, [
-					E('tr', { 'class': 'tr table-titles' }, [
-						E('th', { 'class': 'th' }, _('Компонент')),
-						E('th', { 'class': 'th' }, _('Установлено')),
-						E('th', { 'class': 'th' }, _('Доступно')),
-						E('th', { 'class': 'th' }, _('Действие'))
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, _('Журнал')),
+					E('div', { 'class': 'right', 'style': ACTION_ROW }, [
+						E('button', {
+							'id': 'zarap-copy-logs',
+							'class': 'btn cbi-button-action',
+							'disabled': logs ? null : '',
+							'title': logs ? _('Секреты в журнале уже скрыты') : _('Журнал пуст'),
+							// Not ui.createHandlerFn: the fallback copy must run inside the
+							// click gesture, which an async wrapper would lose.
+							'click': function(ev) {
+								const button = ev.currentTarget;
+								copyToClipboard(logs).then(function() {
+									ui.addNotification(null, E('p', {}, _('Журнал скопирован в буфер обмена')), 'info');
+								}, function() {
+									ui.addNotification(null, E('p', {}, _('Не удалось скопировать журнал. Выделите текст и скопируйте вручную.')), 'error');
+								});
+								button.blur();
+							}
+						}, _('Скопировать журнал'))
 					]),
-					E('tbody', { 'id': 'zarap-components-body' }, [
-						updateRow('luci-app-zarap', updates['luci-app-zarap'] || {}, this, status),
-						updateRow('sing-box', updates['sing-box'] || {}, this, status)
-					])
-				]),
-				E('div', { 'class': 'right', 'style': ACTION_ROW }, E('button', {
-					'class': 'btn cbi-button-action',
-					'click': ui.createHandlerFn(this, async function(ev) {
-						ev.currentTarget.disabled = true;
-						dom.content(ev.currentTarget, E('span', {}, _('Обновление списков…')));
-						const result = await callUpdates(true);
-						if (notify(result, _('Списки репозиториев обновлены'))) {
-							const components = result.components || {};
-							dom.content(document.querySelector('#zarap-components-body'), [
-								updateRow('luci-app-zarap', components['luci-app-zarap'] || {}, this, status),
-								updateRow('sing-box', components['sing-box'] || {}, this, status)
-							]);
-						}
-						dom.content(ev.currentTarget, _('Проверить обновления'));
-						ev.currentTarget.disabled = false;
-					})
-				}, _('Проверить обновления')))
-			]),
-
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, _('Журнал')),
-				E('div', { 'class': 'right', 'style': ACTION_ROW }, [
-					E('button', {
-						'id': 'zarap-copy-logs',
-						'class': 'btn cbi-button-action',
-						'disabled': logs ? null : '',
-						'title': logs ? _('Секреты в журнале уже скрыты') : _('Журнал пуст'),
-						// Not ui.createHandlerFn: the fallback copy must run inside the
-						// click gesture, which an async wrapper would lose.
-						'click': function(ev) {
-							const button = ev.currentTarget;
-							copyToClipboard(logs).then(function() {
-								ui.addNotification(null, E('p', {}, _('Журнал скопирован в буфер обмена')), 'info');
-							}, function() {
-								ui.addNotification(null, E('p', {}, _('Не удалось скопировать журнал. Выделите текст и скопируйте вручную.')), 'error');
-							});
-							button.blur();
-						}
-					}, _('Скопировать журнал'))
-				]),
-				E('pre', { 'style': 'max-height:24em;overflow:auto;white-space:pre-wrap' }, logs || _('Записей пока нет'))
+					E('pre', { 'style': 'max-height:24em;overflow:auto;white-space:pre-wrap' }, logs || _('Записей пока нет'))
+				])
 			])
+
 		]);
+
+		// The pane markup only exists once render has returned, so the first
+		// selection has to wait for the page to be in the document.
+		window.setTimeout(function() { selectTab('setup'); }, 0);
+		return page;
 	},
 
 	handleSave: null,

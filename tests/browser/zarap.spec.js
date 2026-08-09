@@ -7,6 +7,12 @@ async function openZarap(page) {
   await expect.poll(() => page.locator('body').getAttribute('data-ready')).toBe('true');
 }
 
+// Components and the log live on the second tab; configuration is on the first.
+async function openMaintenance(page) {
+  await page.getByRole('link', { name: 'Обслуживание' }).click();
+  await expect(page.locator('#zarap-tab-maintenance')).toBeVisible();
+}
+
 test('renders status and enforces private MAC restriction', async ({ page }) => {
   await openZarap(page);
 
@@ -17,6 +23,10 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
   await expect(page.getByText('маршрутизация активна')).toBeVisible();
 
   await expect(page.getByText('Захват трафика: интерфейс br-lan')).toBeVisible();
+
+  // Configuration opens first; maintenance is a click away.
+  await expect(page.locator('#zarap-tab-setup')).toBeVisible();
+  await expect(page.locator('#zarap-tab-maintenance')).toBeHidden();
 
   await expect(page.locator('#zarap-devices tbody tr')).toHaveCount(3);
   const privateDevice = page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"]');
@@ -93,6 +103,7 @@ test('shows backend validation errors without applying configuration', async ({ 
 
 test('refreshes both components and confirms each update separately', async ({ page }) => {
   await openZarap(page);
+  await openMaintenance(page);
   await expect(page.getByRole('button', { name: 'Обновить' })).toHaveCount(0);
 
   await page.getByRole('button', { name: 'Проверить обновления' }).click();
@@ -121,6 +132,7 @@ test('refreshes both components and confirms each update separately', async ({ p
 test('copies the scrubbed log to the clipboard', async ({ page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await openZarap(page);
+  await openMaintenance(page);
 
   await page.getByRole('button', { name: 'Скопировать журнал' }).click();
   await expect(page.getByText('Журнал скопирован в буфер обмена')).toBeVisible();
@@ -132,6 +144,7 @@ test('copies the scrubbed log to the clipboard', async ({ page, context }) => {
 
 test('shows what apk reported when the update check fails', async ({ page }) => {
   await openZarap(page);
+  await openMaintenance(page);
   await page.evaluate(() => {
     window.__mockState.updatesError = 'ERROR: unable to select packages: no repositories available';
   });
@@ -159,6 +172,7 @@ test('keeps an action pair aligned instead of at opposite edges', async ({ page 
 
 test('names the failure when the update RPC itself does not complete', async ({ page }) => {
   await openZarap(page);
+  await openMaintenance(page);
   // A failed ubus call resolves with the status code, not an object.
   await page.evaluate(() => { window.__mockState.updatesRpcStatus = 7; });
 
