@@ -87,12 +87,21 @@ emit "$WORK/ruleset.json" '{"auto_detect_interface":true,"rule_set":[
 check "remote rule_set + download_detour + cache_file" "$WORK/ruleset.json"
 
 # 5. Локальный список — запасной вариант, если удалённый откажется работать.
-emit "$WORK/ruleset-local.json" '{"auto_detect_interface":true,"rule_set":[
- {"type":"local","tag":"rs_1","format":"binary","path":"/etc/zarap/rulesets/rs_1.srs"}
-],"rules":[
- {"inbound":["zarap-tproxy"],"rule_set":["rs_1"],"action":"reject"}
-],"final":"direct"}'
-check "local rule_set (запасной путь)" "$WORK/ruleset-local.json"
+# Файл собирается тут же: check не ограничивается схемой, он открывает и
+# разбирает .srs, так что проверка по несуществующему пути ничего не сказала бы
+# о форме. Заодно видно, собирает ли установленный бинарник списки сам.
+printf '{"version":2,"rules":[{"domain_suffix":[".example.com"]}]}\n' > "$WORK/rs_1.json"
+rm -f "$WORK/rs_1.srs"
+COMPILED=$("$SING_BOX" rule-set compile --output "$WORK/rs_1.srs" "$WORK/rs_1.json" 2>&1)
+if [ -f "$WORK/rs_1.srs" ]; then
+	printf '{"log":{"level":"info"},"inbounds":[%s],"outbounds":[%s],"route":{"auto_detect_interface":true,"rule_set":[{"type":"local","tag":"rs_1","format":"binary","path":"%s"}],"rules":[{"inbound":["zarap-tproxy"],"rule_set":["rs_1"],"action":"reject"}],"final":"direct"}}\n' \
+		"$BASE_INBOUND" "$BASE_OUTBOUND" "$WORK/rs_1.srs" > "$WORK/ruleset-local.json"
+	check "local rule_set из собранного .srs" "$WORK/ruleset-local.json"
+	printf '      собранный .srs: %s байт\n' "$(wc -c < "$WORK/rs_1.srs")"
+else
+	printf 'SKIP  local rule_set: rule-set compile не собрал .srs\n      %s\n' \
+		"$(echo "$COMPILED" | head -n 1)"
+fi
 
 # 6. Этап 4: слушатель DNS. Inbound типа direct объявлялся устаревшим, так что
 # именно здесь схема установленной версии может разойтись с ожидаемой.
