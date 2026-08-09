@@ -87,24 +87,86 @@ function statusPill(ok, yesText, noText) {
 	}, ok ? yesText : noText);
 }
 
-// Only devices a rule names carry a lease, and those are exactly the rows the
+// Everything the page is about to submit, held here rather than read back out
+// of the DOM. Editing rules means rows appear, vanish and change places, and
+// reading values off a table that is being rebuilt underneath does not survive
+// that. Nothing here reaches the router until "Сохранить и применить".
+const state = {
+	enabled: false,
+	outbounds: [],
+	rules: [],
+	final: 'direct',
+	devices: [],
+	// Whether the kill switch chains are loaded, reported by the router. Only
+	// affects how a guarded device is labelled, never whether it is guarded.
+	firewall: false
+};
+
+function loadState(status) {
+	state.enabled = !!status.enabled;
+	state.outbounds = (status.outbounds || []).map(function(outbound) {
+		return {
+			tag: outbound.tag,
+			label: outbound.label || '',
+			masked_link: outbound.masked_link || ''
+		};
+	});
+	state.rules = (status.rules || []).map(function(rule) {
+		return { clients: (rule.clients || []).slice(), target: rule.target };
+	});
+	state.final = status.final || 'direct';
+	state.firewall = !!status.firewall;
+	state.devices = (status.devices || []).map(function(device) {
+		return Object.assign({}, device);
+	});
+}
+
+// Which devices the kill switch holds, worked out from the rules on this page
+// rather than taken from status. The router only knows the rules it has already
+// applied, so a device just added to an unsaved rule would otherwise get no
+// address field — and the apply would then fail for the address it never let
+// anyone enter.
+function guardedMacs() {
+	const macs = {};
+	state.rules.forEach(function(rule) {
+		(rule.clients || []).forEach(function(mac) { macs[mac] = true; });
+	});
+	return macs;
+}
+
+// The first rule naming a device decides where its traffic goes; a device no
+// rule names falls through to the remainder.
+function resolvedTarget(mac) {
+	for (let index = 0; index < state.rules.length; index++)
+		if ((state.rules[index].clients || []).indexOf(mac) >= 0)
+			return state.rules[index].target;
+	return state.final;
+}
+
+function isUsed(tag) {
+	return state.final === tag
+		|| state.rules.some(function(rule) { return rule.target === tag; });
+}
+
+// Only devices a rule names carry a lease, and those are exactly the ones the
 // apply has to send back. The rest of the table is there to be looked at.
 function leasedClients() {
-	const clients = [];
-	document.querySelectorAll('#zarap-devices tbody tr[data-guarded="1"]').forEach(function(row) {
-		clients.push({
-			mac: row.getAttribute('data-mac'),
-			name: row.querySelector('input[data-field="name"]').value.trim(),
-			ip: row.querySelector('input[data-field="ip"]').value.trim()
+	const guarded = guardedMacs();
+	return state.devices
+		.filter(function(device) { return guarded[device.mac]; })
+		.map(function(device) {
+			return {
+				mac: device.mac,
+				name: (device.name || '').trim(),
+				ip: (device.ip || '').trim()
+			};
 		});
-	});
-	return clients;
 }
 
 // Connections round-trip by tag with an empty link, which tells the router to
 // keep the secret it already holds. A pasted link adds one.
-function submittedOutbounds(outbounds) {
-	const sent = outbounds.map(function(outbound) {
+function submittedOutbounds() {
+	const sent = state.outbounds.map(function(outbound) {
 		return { tag: outbound.tag, label: outbound.label || '', link: '' };
 	});
 	const added = document.querySelector('#zarap-link').value.trim();
@@ -113,39 +175,48 @@ function submittedOutbounds(outbounds) {
 	return sent;
 }
 
-function targetLabel(target, outbounds) {
+function targetLabel(target) {
 	if (target === 'direct')
 		return _('напрямую');
 	if (target === 'block')
 		return _('заблокировано');
-	const match = outbounds.filter(function(outbound) { return outbound.tag === target; })[0];
+	const match = state.outbounds.filter(function(outbound) {
+		return outbound.tag === target;
+	})[0];
 	return match && match.label ? '%s (%s)'.format(match.label, target) : target;
 }
 
-function deviceRow(device, outbounds) {
+// Edits go straight into the state so a redraw cannot lose them.
+function bindField(device, field, placeholder) {
+	const input = E('input', {
+		'class': 'cbi-input-text', 'data-field': field,
+		'value': device[field] || '', 'placeholder': placeholder
+	});
+	input.addEventListener('input', function() { device[field] = input.value; });
+	return input;
+}
+
+function deviceRow(device) {
 	const unavailable = device.private_mac;
 	const reason = unavailable ? _('Приватный MAC: отключите рандомизацию MAC на устройстве') : '';
-	const editable = !!device.guarded;
+	const guarded = !!guardedMacs()[device.mac];
+	// Holds even with Zarap switched off: only deleting the rule that names a
+	// device opens its direct path to the WAN.
+	const killSwitch = state.firewall && guarded;
 	return E('tr', {
-		'class': 'tr', 'data-mac': device.mac, 'data-guarded': editable ? '1' : '0'
+		'class': 'tr', 'data-mac': device.mac, 'data-guarded': guarded ? '1' : '0'
 	}, [
-		E('td', { 'class': 'td' }, editable ? [
-			E('input', {
-				'class': 'cbi-input-text', 'data-field': 'name',
-				'value': device.name || '', 'placeholder': _('Имя устройства')
-			})
-		] : (device.name || '')),
+		E('td', { 'class': 'td' }, guarded
+			? [ bindField(device, 'name', _('Имя устройства')) ]
+			: (device.name || '')),
 		E('td', { 'class': 'td' }, device.mac),
-		E('td', { 'class': 'td' }, editable ? [
-			E('input', {
-				'class': 'cbi-input-text', 'data-field': 'ip',
-				'value': device.ip || '', 'placeholder': '192.168.1.100'
-			})
-		] : (device.ip || '')),
-		E('td', { 'class': 'td' }, targetLabel(device.resolved_target, outbounds)),
+		E('td', { 'class': 'td' }, guarded
+			? [ bindField(device, 'ip', '192.168.1.100') ]
+			: (device.ip || '')),
+		E('td', { 'class': 'td' }, targetLabel(resolvedTarget(device.mac))),
 		E('td', { 'class': 'td' }, [
 			device.connected ? statusPill(true, _('в сети'), '') : statusPill(false, '', _('не в сети')),
-			device.kill_switch ? statusPill(true, _(' kill switch'), '') : '',
+			killSwitch ? statusPill(true, _(' kill switch'), '') : '',
 			device.wireless && device.network ? E('small', {}, ' Wi-Fi: ' + device.network) : '',
 			unavailable ? E('div', { 'class': 'error' }, reason) : ''
 		])
@@ -153,22 +224,53 @@ function deviceRow(device, outbounds) {
 }
 
 function outboundRow(outbound) {
-	return E('tr', { 'class': 'tr' }, [
+	const used = isUsed(outbound.tag);
+	return E('tr', { 'class': 'tr', 'data-tag': outbound.tag }, [
 		E('td', { 'class': 'td' }, outbound.tag),
 		E('td', { 'class': 'td' }, outbound.label || '—'),
 		E('td', { 'class': 'td' }, E('code', {}, outbound.masked_link || '')),
-		E('td', { 'class': 'td' }, outbound.in_use
+		E('td', { 'class': 'td' }, used
 			? statusPill(true, _('используется'), '')
 			: statusPill(false, '', _('не используется')))
 	]);
 }
 
-function ruleRow(rule, index, outbounds) {
+function ruleRow(rule, index) {
 	return E('tr', { 'class': 'tr' }, [
 		E('td', { 'class': 'td' }, String(index + 1)),
 		E('td', { 'class': 'td' }, (rule.clients || []).join(', ')),
-		E('td', { 'class': 'td' }, targetLabel(rule.target, outbounds))
+		E('td', { 'class': 'td' }, targetLabel(rule.target))
 	]);
+}
+
+// The three sections that change while the page is open. Each renders straight
+// from the state, so a redraw after an edit needs no other bookkeeping.
+function renderOutbounds() {
+	return state.outbounds.length
+		? state.outbounds.map(outboundRow)
+		: E('tr', {}, E('td', { 'colspan': 4 }, _('Подключений пока нет')));
+}
+
+function renderRules() {
+	return state.rules.length
+		? state.rules.map(ruleRow)
+		: E('tr', {}, E('td', { 'colspan': 3 }, _('Правил пока нет: весь трафик идёт по умолчанию')));
+}
+
+function renderDevices() {
+	return state.devices.length
+		? state.devices.map(deviceRow)
+		: E('tr', {}, E('td', { 'colspan': 5 }, _('Устройства пока не обнаружены')));
+}
+
+// Redraws everything a rule change can affect: which connection counts as used,
+// which device carries a lease, and where each device's traffic ends up.
+function refresh() {
+	dom.content(document.querySelector('#zarap-outbounds-body'), renderOutbounds());
+	dom.content(document.querySelector('#zarap-rules-body'), renderRules());
+	dom.content(document.querySelector('#zarap-devices-body'), renderDevices());
+	dom.content(document.querySelector('#zarap-final'),
+		_('Остальной трафик: %s').format(targetLabel(state.final)));
 }
 
 function updateRow(name, data, owner, runtimeStatus) {
@@ -222,17 +324,9 @@ return view.extend({
 
 	render: function(data) {
 		const status = data[0] || {};
-		const devices = status.devices || [];
-		const outbounds = status.outbounds || [];
-		const rules = status.rules || [];
-		const final = status.final || 'direct';
 		const updates = (data[1] && data[1].components) || {};
 		const logs = (data[2] && data[2].logs) || '';
-		devices.forEach(function(device) {
-			// Holds even with Zarap switched off: only deleting the rule that
-			// names a device opens its direct path to the WAN.
-			device.kill_switch = !!(status.firewall && device.guarded);
-		});
+		loadState(status);
 
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, 'Zarap'),
@@ -280,9 +374,7 @@ return view.extend({
 						E('th', { 'class': 'th' }, _('Ссылка')),
 						E('th', { 'class': 'th' }, _('Состояние'))
 					])),
-					E('tbody', {}, outbounds.length
-						? outbounds.map(outboundRow)
-						: E('tr', {}, E('td', { 'colspan': 4 }, _('Подключений пока нет'))))
+					E('tbody', { 'id': 'zarap-outbounds-body' }, renderOutbounds())
 				]),
 				E('div', { 'class': 'cbi-value' }, [
 					E('label', { 'class': 'cbi-value-title', 'for': 'zarap-link' }, _('Добавить подключение')),
@@ -296,7 +388,7 @@ return view.extend({
 				E('div', { 'class': 'cbi-value' }, [
 					E('label', { 'class': 'cbi-value-title', 'for': 'zarap-enabled' }, _('Включить Zarap')),
 					E('div', { 'class': 'cbi-value-field' }, [
-						E('input', { 'id': 'zarap-enabled', 'type': 'checkbox', 'checked': status.enabled ? '' : null })
+						E('input', { 'id': 'zarap-enabled', 'type': 'checkbox', 'checked': state.enabled ? '' : null })
 					])
 				])
 			]),
@@ -310,11 +402,9 @@ return view.extend({
 						E('th', { 'class': 'th' }, _('Устройства')),
 						E('th', { 'class': 'th' }, _('Куда'))
 					])),
-					E('tbody', {}, rules.length
-						? rules.map(function(rule, index) { return ruleRow(rule, index, outbounds); })
-						: E('tr', {}, E('td', { 'colspan': 3 }, _('Правил пока нет: весь трафик идёт по умолчанию'))))
+					E('tbody', { 'id': 'zarap-rules-body' }, renderRules())
 				]),
-				E('p', {}, _('Остальной трафик: %s').format(targetLabel(final, outbounds))),
+				E('p', { 'id': 'zarap-final' }, _('Остальной трафик: %s').format(targetLabel(state.final))),
 				E('p', { 'class': 'cbi-value-description' }, _('Редактирование правил появится в следующей версии; пока их задаёт uci в /etc/config/zarap.'))
 			]),
 
@@ -329,16 +419,14 @@ return view.extend({
 						E('th', { 'class': 'th' }, _('Куда идёт')),
 						E('th', { 'class': 'th' }, _('Состояние'))
 					])),
-					E('tbody', {}, devices.length
-						? devices.map(function(device) { return deviceRow(device, outbounds); })
-						: E('tr', {}, E('td', { 'colspan': 5 }, _('Устройства пока не обнаружены'))))
+					E('tbody', { 'id': 'zarap-devices-body' }, renderDevices())
 				]),
 				E('div', { 'class': 'cbi-page-actions', 'style': ACTION_ROW }, [
 					E('button', {
 						'class': 'btn cbi-button-neutral',
 						'click': ui.createHandlerFn(this, async function() {
-							notify(await callValidate(submittedOutbounds(outbounds), rules,
-								leasedClients(), final), _('Конфигурация корректна'));
+							notify(await callValidate(submittedOutbounds(), state.rules,
+								leasedClients(), state.final), _('Конфигурация корректна'));
 						})
 					}, _('Проверить конфигурацию')),
 					E('button', {
@@ -347,10 +435,10 @@ return view.extend({
 							ev.currentTarget.disabled = true;
 							const result = await callApply(
 								document.querySelector('#zarap-enabled').checked,
-								submittedOutbounds(outbounds),
-								rules,
+								submittedOutbounds(),
+								state.rules,
 								leasedClients(),
-								final
+								state.final
 							);
 							if (notify(result, _('Конфигурация применена'))) {
 								if ((result.clients || []).some(function(client) { return client.reconnect_required; }))
