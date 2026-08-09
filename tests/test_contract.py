@@ -181,9 +181,18 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("/etc/init.d/rpcd reload", BACKEND)
         self.assertIn("/etc/init.d/rpcd reload", UCI_DEFAULTS)
 
-    def test_device_discovery_uses_hostapd_and_dhcp_leases(self):
+    def test_device_discovery_covers_the_whole_lan(self):
+        # Capture takes every device on the LAN, so a rule can name a wired host
+        # too. Leases are the base of the list; hostapd only adds what a lease
+        # cannot say — whether a station is associated, and on which radio.
         self.assertIn('/bin/ubus list "hostapd.*"', BACKEND)
         self.assertIn("/tmp/dhcp.leases", BACKEND)
+        body = BACKEND.split("function device_list(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("for (let mac in leases.by_mac)", body)
+        self.assertIn("for (let mac in dynamic_leases)", body)
+        # A device a rule names has to appear even with no lease at all.
+        self.assertIn("for (let mac in guarded)", body)
+        self.assertNotIn("wireless: true,", body)
 
     def test_update_check_is_required_before_update_buttons(self):
         view = (PACKAGE_ROOT / "htdocs/luci-static/resources/view/zarap/overview.js").read_text()

@@ -1216,12 +1216,46 @@ function apply_configuration(args) {
 	return { ok: true, enabled: enabled, clients: request.clients, health: health };
 }
 
+// The capture covers the whole LAN, so a rule can name any device on it, not
+// just a Wi-Fi client. Leases are therefore the base of the list — they know
+// about wired hosts — and hostapd only adds what leases cannot tell: whether a
+// station is associated right now, and on which radio.
 function device_list(rules, final) {
 	let devices = {}, leases = static_leases();
 	let dynamic_leases = current_dhcp_leases();
-	let guarded = guarded_macs(rules), selected = {};
+	let guarded = guarded_macs(rules);
+
+	function record(mac) {
+		if (!devices[mac]) {
+			let lease = leases.by_mac[mac] || {};
+			let dynamic = dynamic_leases[mac] || {};
+			devices[mac] = {
+				mac: mac,
+				name: lease.name || dynamic.name || ('Устройство ' + mac),
+				ip: lease.ip || dynamic.ip || '',
+				connected: false,
+				wireless: false,
+				has_static_lease: !!lease.ip,
+				private_mac: is_private_mac(mac),
+				guarded: !!guarded[mac],
+				resolved_target: resolved_target(mac, rules, final)
+			};
+		}
+		return devices[mac];
+	}
+
+	for (let mac in leases.by_mac)
+		record(mac);
+	for (let mac in dynamic_leases) {
+		let device = record(mac);
+		// A current lease is not proof of presence, but it is the best the DHCP
+		// server can say about a wired host.
+		device.connected = true;
+	}
+	// A device named by a rule belongs in the list even with no lease at all,
+	// or the rule would refer to something the page cannot show.
 	for (let mac in guarded)
-		selected[mac] = { mac: mac, ip: leases.by_mac[mac]?.ip || '', name: '' };
+		record(mac);
 
 	let ubus = connect();
 	if (ubus) {
@@ -1233,43 +1267,15 @@ function device_list(rules, final) {
 			for (let raw_mac, station in (response.clients || {})) {
 				let mac = normalize_mac(raw_mac);
 				if (!mac) continue;
-				let lease = leases.by_mac[mac] || {};
-				let dynamic = dynamic_leases[mac] || {};
-				devices[mac] = {
-					mac: mac,
-					name: lease.name || dynamic.name || selected[mac]?.name || ('Устройство ' + mac),
-					ip: lease.ip || dynamic.ip || selected[mac]?.ip || '',
-					connected: true,
-					wireless: true,
-					network: substr(object, 8),
-					signal: station?.signal || 0,
-					has_static_lease: !!lease.ip,
-					private_mac: is_private_mac(mac),
-					selected: !!selected[mac],
-					guarded: !!guarded[mac],
-					resolved_target: resolved_target(mac, rules, final)
-				};
+				let device = record(mac);
+				device.connected = true;
+				device.wireless = true;
+				device.network = substr(object, 8);
+				device.signal = station?.signal || 0;
 			}
 		}
 		ubus.disconnect();
 	}
-
-	for (let mac, client in selected)
-		if (!devices[mac]) {
-			let lease = leases.by_mac[mac] || {};
-			devices[mac] = {
-				mac: mac,
-				name: lease.name || client.name || ('Устройство ' + mac),
-				ip: lease.ip || client.ip,
-				connected: false,
-				wireless: true,
-				has_static_lease: !!lease.ip,
-				private_mac: is_private_mac(mac),
-				selected: true,
-				guarded: !!guarded[mac],
-				resolved_target: resolved_target(mac, rules, final)
-			};
-		}
 
 	let result = [];
 	for (let mac, device in devices)
