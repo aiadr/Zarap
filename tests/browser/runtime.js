@@ -155,7 +155,9 @@ window.E = function(tag, attributes, children) {
       return;
     if (name === 'click')
       element.addEventListener('click', value);
-    else if (name === 'checked' || name === 'disabled')
+    else if (name === 'checked' || name === 'disabled' || name === 'selected')
+      // LuCI applies these as attributes, where any value marks them set. The
+      // property assignment below would take '' as false.
       element[name] = true;
     else if (name === 'class')
       element.className = value;

@@ -255,6 +255,57 @@ test('reorders rules and applies them in the shown order', async ({ page }) => {
   ]);
 });
 
+test('refuses to delete a connection a rule still points at', async ({ page }) => {
+  await openZarap(page);
+
+  const used = page.locator('#zarap-outbounds-body tr[data-tag="out_1"]');
+  const spare = page.locator('#zarap-outbounds-body tr[data-tag="out_2"]');
+  const usedButton = used.getByRole('button', { name: 'Удалить' });
+  await expect(usedButton).toBeDisabled();
+  // The refusal has to name the reference, or there is nothing to act on.
+  await expect(usedButton).toHaveAttribute('title', /правило 1/);
+
+  await spare.getByRole('button', { name: 'Удалить' }).click();
+  await expect(page.locator('#zarap-outbounds-body tr')).toHaveCount(1);
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  expect(apply.args[1]).toEqual([{ tag: 'out_1', label: 'Нидерланды', link: '' }]);
+});
+
+test('a connection stops being deletable once the remainder points at it', async ({ page }) => {
+  await openZarap(page);
+
+  const spare = page.locator('#zarap-outbounds-body tr[data-tag="out_2"]');
+  await expect(spare.getByRole('button', { name: 'Удалить' })).toBeEnabled();
+
+  await page.locator('#zarap-final select').selectOption('out_2');
+  await expect(spare.getByRole('button', { name: 'Удалить' })).toBeDisabled();
+  await expect(spare.getByRole('button', { name: 'Удалить' }))
+    .toHaveAttribute('title', /остальной трафик/);
+  // Routing everyone through a proxy guards nobody; the page has to say so.
+  await expect(page.locator('#zarap-final'))
+    .toContainText('kill switch от этого ни у кого не появляется');
+});
+
+test('blocking the remainder is confirmed and can be backed out of', async ({ page }) => {
+  await openZarap(page);
+
+  await page.locator('#zarap-final select').selectOption('block');
+  await expect(page.locator('#modal')).toContainText('Без интернета останется весь дом');
+  await page.locator('#modal').getByRole('button', { name: 'Отмена' }).click();
+  await expect(page.locator('#zarap-final select')).toHaveValue('direct');
+
+  await page.locator('#zarap-final select').selectOption('block');
+  await page.locator('#modal').getByRole('button', { name: 'Заблокировать' }).click();
+  await expect(page.locator('#zarap-final select')).toHaveValue('block');
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.find(call => call.method === 'apply').args[4]).toBe('block');
+});
+
 test('deleting a rule warns what the device loses', async ({ page }) => {
   await openZarap(page);
 

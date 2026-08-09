@@ -223,15 +223,44 @@ function deviceRow(device) {
 	]);
 }
 
-function outboundRow(outbound) {
-	const used = isUsed(outbound.tag);
+// Who points at this connection, in words. A refusal that only says "in use"
+// leaves the user hunting for the reference.
+function referrers(tag) {
+	const found = [];
+	state.rules.forEach(function(rule, index) {
+		if (rule.target === tag)
+			found.push(_('правило %d').format(index + 1));
+	});
+	if (state.final === tag)
+		found.push(_('остальной трафик'));
+	return found;
+}
+
+function outboundRow(outbound, owner) {
+	const used = referrers(outbound.tag);
 	return E('tr', { 'class': 'tr', 'data-tag': outbound.tag }, [
 		E('td', { 'class': 'td' }, outbound.tag),
 		E('td', { 'class': 'td' }, outbound.label || '—'),
 		E('td', { 'class': 'td' }, E('code', {}, outbound.masked_link || '')),
-		E('td', { 'class': 'td' }, used
+		E('td', { 'class': 'td' }, used.length
 			? statusPill(true, _('используется'), '')
-			: statusPill(false, '', _('не используется')))
+			: statusPill(false, '', _('не используется'))),
+		E('td', { 'class': 'td' }, [
+			E('button', {
+				'class': 'btn cbi-button-negative',
+				'data-action': 'remove-outbound',
+				'disabled': used.length ? '' : null,
+				'title': used.length
+					? _('Ссылаются: %s').format(used.join(', '))
+					: _('Удалить подключение'),
+				'click': ui.createHandlerFn(owner, function() {
+					state.outbounds = state.outbounds.filter(function(other) {
+						return other.tag !== outbound.tag;
+					});
+					refresh();
+				})
+			}, _('Удалить'))
+		])
 	]);
 }
 
@@ -417,10 +446,12 @@ function targetSelect(current, onChange) {
 		}))
 		.concat([ { value: 'block', text: _('заблокировать') } ]);
 	options.forEach(function(option) {
-		select.appendChild(E('option', {
-			'value': option.value, 'selected': option.value === current ? '' : null
-		}, option.text));
+		select.appendChild(E('option', { 'value': option.value }, option.text));
 	});
+	// Set through the property rather than a selected attribute: the value is
+	// what the change handler reads back, and this needs no help from however
+	// attributes happen to be applied.
+	select.value = current;
 	select.addEventListener('change', function() { onChange(select.value); });
 	return select;
 }
@@ -476,10 +507,64 @@ function ruleRow(rule, index, owner) {
 
 // The three sections that change while the page is open. Each renders straight
 // from the state, so a redraw after an edit needs no other bookkeeping.
-function renderOutbounds() {
+function renderOutbounds(owner) {
+	if (owner)
+		renderOutbounds.owner = owner;
+	const context = renderOutbounds.owner;
 	return state.outbounds.length
-		? state.outbounds.map(outboundRow)
-		: E('tr', {}, E('td', { 'colspan': 4 }, _('Подключений пока нет')));
+		? state.outbounds.map(function(outbound) { return outboundRow(outbound, context); })
+		: E('tr', {}, E('td', { 'colspan': 5 }, _('Подключений пока нет')));
+}
+
+// Switching the remainder to block leaves the whole network without internet
+// except for what the rules allow. Legitimate as a whitelist, but not something
+// to land on by picking an entry from a list.
+function confirmFinal(select, previous, owner) {
+	ui.showModal(_('Заблокировать остальной трафик?'), [
+		E('p', {}, _('Без интернета останется весь дом, кроме устройств, перечисленных в правилах.')),
+		E('div', { 'class': 'right', 'style': ACTION_ROW }, [
+			E('button', {
+				'class': 'btn',
+				'click': ui.createHandlerFn(owner, function() {
+					select.value = previous;
+					state.final = previous;
+					ui.hideModal();
+					refresh();
+				})
+			}, _('Отмена')),
+			E('button', {
+				'class': 'btn cbi-button-negative important',
+				'click': ui.createHandlerFn(owner, function() {
+					ui.hideModal();
+					refresh();
+				})
+			}, _('Заблокировать'))
+		])
+	]);
+}
+
+function finalRow(owner) {
+	if (owner)
+		finalRow.owner = owner;
+	const context = finalRow.owner;
+	const previous = state.final;
+	const select = targetSelect(state.final, function(value) {
+		state.final = value;
+		if (value === 'block')
+			confirmFinal(select, previous, context);
+		else
+			refresh();
+	});
+	return E('span', {}, [
+		E('span', {}, _('Остальной трафик: ')),
+		select,
+		// Moving the remainder to a proxy routes everyone but guards nobody:
+		// the kill switch comes from the rules alone.
+		state.final !== 'direct' && state.final !== 'block'
+			? E('small', { 'style': 'margin-left:.5em' },
+				_('kill switch от этого ни у кого не появляется — он берётся только из правил'))
+			: ''
+	]);
 }
 
 // The owner is the view instance ui.createHandlerFn binds handlers to. A redraw
@@ -506,8 +591,7 @@ function refresh() {
 	dom.content(document.querySelector('#zarap-outbounds-body'), renderOutbounds());
 	dom.content(document.querySelector('#zarap-rules-body'), renderRules());
 	dom.content(document.querySelector('#zarap-devices-body'), renderDevices());
-	dom.content(document.querySelector('#zarap-final'),
-		_('Остальной трафик: %s').format(targetLabel(state.final)));
+	dom.content(document.querySelector('#zarap-final'), finalRow(finalRow.owner));
 }
 
 // Six sections is too many for one scroll, and the ones you configure have
@@ -648,9 +732,10 @@ return view.extend({
 							E('th', { 'class': 'th' }, _('Тег')),
 							E('th', { 'class': 'th' }, _('Название')),
 							E('th', { 'class': 'th' }, _('Ссылка')),
-							E('th', { 'class': 'th' }, _('Состояние'))
+							E('th', { 'class': 'th' }, _('Состояние')),
+							E('th', { 'class': 'th' }, '')
 						])),
-						E('tbody', { 'id': 'zarap-outbounds-body' }, renderOutbounds())
+						E('tbody', { 'id': 'zarap-outbounds-body' }, renderOutbounds(this))
 					]),
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-link' }, _('Добавить подключение')),
@@ -692,7 +777,7 @@ return view.extend({
 							})
 						}, _('Добавить правило'))
 					]),
-					E('p', { 'id': 'zarap-final' }, _('Остальной трафик: %s').format(targetLabel(state.final)))
+					E('p', { 'id': 'zarap-final' }, finalRow(this))
 				]),
 
 				E('div', { 'class': 'cbi-section' }, [
