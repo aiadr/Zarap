@@ -238,6 +238,66 @@ test('a device added to a rule immediately gets an address field', async ({ page
   await expect(page.locator('tr[data-mac="AA:BB:CC:DD:EE:FF"] input[data-field="ip"]')).toHaveCount(1);
 });
 
+test('names a device while picking it for a rule', async ({ page }) => {
+  await openZarap(page);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await page.locator('#zarap-rules-body tr[data-rule="2"]')
+    .getByRole('button', { name: 'Устройства…' }).click();
+
+  const row = page.locator('#zarap-picker tr')
+    .filter({ has: page.locator('input[data-mac="AA:BB:CC:DD:EE:FF"]') });
+  // The name lives in the lease, and only a device a rule names has one.
+  await expect(row.locator('input[data-field="name"]')).toBeDisabled();
+  await page.locator('#zarap-picker input[data-mac="AA:BB:CC:DD:EE:FF"]').check();
+  await expect(row.locator('input[data-field="name"]')).toBeEnabled();
+  await row.locator('input[data-field="name"]').fill('realme');
+  await page.getByRole('button', { name: 'Готово' }).click();
+
+  // One device, one name: the table shows what was typed in the picker.
+  const named = page.locator('tr[data-mac="AA:BB:CC:DD:EE:FF"]');
+  await expect(named.locator('input[data-field="name"]')).toHaveValue('realme');
+  await named.locator('input[data-field="ip"]').fill('192.168.1.81');
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  expect(apply.args[3]).toContainEqual({
+    mac: 'AA:BB:CC:DD:EE:FF', name: 'realme', ip: '192.168.1.81'
+  });
+});
+
+test('a MAC typed by hand gets a row to carry its address', async ({ page }) => {
+  await openZarap(page);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await page.locator('#zarap-rules-body tr[data-rule="2"]')
+    .getByRole('button', { name: 'Устройства…' }).click();
+
+  await page.getByPlaceholder('00:11:22:33:44:55').fill('10:34:56:78:9a:bc');
+  await page.getByRole('button', { name: 'Добавить', exact: true }).click();
+  const row = page.locator('#zarap-picker tr')
+    .filter({ has: page.locator('input[data-mac="10:34:56:78:9A:BC"]') });
+  await row.locator('input[data-field="name"]').fill('Кладовка');
+  await page.getByRole('button', { name: 'Готово' }).click();
+
+  // Without a row there is nowhere to enter the address the apply demands.
+  const added = page.locator('tr[data-mac="10:34:56:78:9A:BC"]');
+  await expect(added.locator('input[data-field="name"]')).toHaveValue('Кладовка');
+  await added.locator('input[data-field="ip"]').fill('192.168.1.99');
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  expect(apply.args[3]).toContainEqual({
+    mac: '10:34:56:78:9A:BC', name: 'Кладовка', ip: '192.168.1.99'
+  });
+});
+
 test('reorders rules and applies them in the shown order', async ({ page }) => {
   await openZarap(page);
 

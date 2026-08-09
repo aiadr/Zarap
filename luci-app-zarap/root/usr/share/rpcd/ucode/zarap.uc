@@ -656,14 +656,20 @@ function ipv4_in_lan(ip) {
 	return false;
 }
 
+// A lease Zarap created is Zarap's to edit: the name and the address shown on
+// the page are the ones that end up in it, so renaming a device or moving it to
+// another address is an ordinary apply. A reservation somebody else wrote is
+// adopted instead — its address becomes the device's and its section is left
+// exactly as it is, because Zarap does not own it.
 function resolve_static_leases(clients) {
 	let leases = static_leases(), dynamic = current_dhcp_leases(), result = [];
 	for (let client in clients) {
 		let existing = leases.by_mac[client.mac];
-		if (existing) {
+		if (existing && !existing.managed) {
 			push(result, {
 				mac: client.mac, ip: existing.ip,
-				name: client.name || existing.name, has_static_lease: true
+				name: client.name || existing.name,
+				has_static_lease: true, foreign_lease: true
 			});
 			continue;
 		}
@@ -672,11 +678,21 @@ function resolve_static_leases(clients) {
 			return input_error('IPv4-адрес ' + client.ip + ' уже закреплён за ' + conflict.mac);
 		if (!ipv4_in_lan(client.ip))
 			return input_error('IPv4-адрес ' + client.ip + ' не входит в LAN-подсеть');
-		push(result, {
+		// Whatever the device is holding right now, from its current lease or
+		// from the one pinned so far. A new address only reaches it on the next
+		// DHCP exchange, so say so rather than let it look applied.
+		let held = dynamic[client.mac]?.ip || existing?.ip || '';
+		let record = {
 			mac: client.mac, ip: client.ip, name: client.name,
-			has_static_lease: false,
-			reconnect_required: !!dynamic[client.mac]?.ip && dynamic[client.mac].ip != client.ip
-		});
+			has_static_lease: !!existing, foreign_lease: false,
+			reconnect_required: !!held && held != client.ip
+		};
+		// Rewrite the section that is already there rather than the canonical
+		// name: a managed lease renamed by hand would otherwise survive the
+		// sweep, and dnsmasq would get two reservations for one MAC.
+		if (existing)
+			record.section = existing.section;
+		push(result, record);
 	}
 	return { ok: true, clients: result };
 }
@@ -734,9 +750,12 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients) {
 		uci.delete('dhcp', section);
 
 	for (let client in clients) {
-		if (client.has_static_lease)
+		// Only the reservation somebody else wrote is left alone. Zarap's own is
+		// rewritten on every apply, which is what makes a name or an address
+		// edited on the page actually take.
+		if (client.foreign_lease)
 			continue;
-		let section = 'zarap_' + lc(replace(client.mac, /:/g, ''));
+		let section = client.section || ('zarap_' + lc(replace(client.mac, /:/g, '')));
 		uci.set('dhcp', section, 'host');
 		uci.set('dhcp', section, 'name', client.name);
 		uci.set('dhcp', section, 'mac', client.mac);
