@@ -150,7 +150,12 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("if (proxying)", BACKEND)
         self.assertNotIn("enabled ? request.rules : []", BACKEND)
         view = (PACKAGE_ROOT / "htdocs/luci-static/resources/view/zarap/overview.js").read_text()
-        self.assertIn("device.kill_switch = !!(status.firewall && device.guarded)", view)
+        # The page marks a device held by the kill switch from the rules it is
+        # showing, not from the guarded flag status reported: a device added to
+        # a rule that has not been applied yet still needs its address field.
+        self.assertIn("const killSwitch = state.firewall && guarded;", view)
+        self.assertIn("function guardedMacs()", view)
+        self.assertNotIn("device.guarded", view)
 
     def test_the_guarded_set_comes_only_from_the_rules(self):
         # Invariant 2: capture is a property of the network, the kill switch a
