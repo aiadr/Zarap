@@ -33,13 +33,14 @@ class RuleConditionTests(unittest.TestCase):
         cls.prelude = "\n".join(lift(source, name) for name in (
             "result_error", "input_error", "normalize_mac", "is_private_mac",
             "valid_ipv4", "normalize_domain", "normalize_cidr", "normalize_port",
-            "valid_target",
+            "valid_target", "valid_ruleset_tag", "validate_rulesets",
             "validate_rule_list", "validate_rules"))
 
-    def validate(self, rules, tags=None):
-        script = "%s\nprintf('%%J', validate_rules(%s, %s));\n" % (
+    def validate(self, rules, tags=None, declared=None):
+        script = "%s\nprintf('%%J', validate_rules(%s, %s, %s));\n" % (
             self.prelude, json.dumps(rules),
-            json.dumps({"out_1": True} if tags is None else tags))
+            json.dumps({"out_1": True} if tags is None else tags),
+            json.dumps(declared or {}))
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name
@@ -178,6 +179,47 @@ class RuleConditionTests(unittest.TestCase):
         for target in ("direct", "block", "out_1"):
             self.assertTrue(
                 self.validate([{"clients": [TABLET], "target": target}])["ok"])
+
+    def rulesets(self, entries, tags=None):
+        script = "%s\nprintf('%%J', validate_rulesets(%s, %s));\n" % (
+            self.prelude, json.dumps(entries),
+            json.dumps({"out_1": True} if tags is None else tags))
+        with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run([self.ucode, path], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return json.loads(done.stdout)
+        finally:
+            os.unlink(path)
+
+    def test_a_ruleset_needs_a_name_an_address_and_a_reachable_detour(self):
+        good = self.rulesets([{"tag": "rs_1", "label": "Реклама",
+                               "url": "https://example.org/a.srs",
+                               "detour": "out_1", "update_interval": "1d"}])
+        self.assertTrue(good["ok"], good)
+        self.assertEqual(good["rulesets"][0]["detour"], "out_1")
+
+        self.assertIn("Некорректное имя", self.rulesets(
+            [{"tag": "ads", "url": "https://example.org/a.srs"}])["error"])
+        self.assertIn("http", self.rulesets(
+            [{"tag": "rs_1", "url": "example.org/a.srs"}])["error"])
+        self.assertIn("несуществующее подключение", self.rulesets(
+            [{"tag": "rs_1", "url": "https://example.org/a.srs",
+              "detour": "out_9"}])["error"])
+        self.assertIn("12h", self.rulesets(
+            [{"tag": "rs_1", "url": "https://example.org/a.srs",
+              "update_interval": "каждый день"}])["error"])
+
+    def test_a_rule_points_only_at_a_declared_set(self):
+        # The section list and the rules are submitted together, so a reference
+        # to a set nobody declared is an error the request can be refused for.
+        self.assertIn("несуществующий набор", self.validate(
+            [{"rule_sets": ["rs_1"], "target": "out_1"}])["error"])
+        self.assertTrue(self.validate(
+            [{"rule_sets": ["rs_1"], "target": "out_1"}],
+            declared={"rs_1": True})["ok"])
 
     def test_the_order_of_the_rules_is_kept(self):
         result = self.validate([

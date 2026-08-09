@@ -50,16 +50,17 @@ class RouteMappingTests(unittest.TestCase):
         constants = "\n".join(
             line for line in source.splitlines()
             if line.startswith(("const CAPTURE_PORT", "const INBOUND_TAG",
-                                "const RESERVED_TAGS")))
+                                "const RESERVED_TAGS", "const CACHE_FILE")))
         cls.prelude = constants + "\n" + "\n".join(
             lift(source, name) for name in
             ("valid_outbound_tag", "outbound_json", "rule_jsons", "sing_box_config"))
 
-    def generate(self, outbounds, rules, final, addresses=None):
-        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s));\n" % (
+    def generate(self, outbounds, rules, final, addresses=None, rulesets=None):
+        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s));\n" % (
             self.prelude,
             json.dumps(outbounds), json.dumps(rules), json.dumps(final),
-            json.dumps(ADDRESSES if addresses is None else addresses))
+            json.dumps(ADDRESSES if addresses is None else addresses),
+            json.dumps(rulesets or []))
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name
@@ -278,6 +279,54 @@ class RouteMappingTests(unittest.TestCase):
                   "target": "out_1"}]
         emitted = self.generate([OUT_1], rules, "direct")["route"]["rules"]
         self.assertNotIn("source_ip_cidr", emitted[0])
+
+    def test_a_rule_set_is_declared_remote_with_its_detour_and_schedule(self):
+        # Downloading is sing-box's job: the backend goes out as the router, and
+        # router traffic is not captured, so it would fetch past the proxy —
+        # exactly where the source is blocked.
+        rulesets = [{"tag": "rs_1", "label": "Реклама",
+                     "url": "https://example.org/ads.srs",
+                     "detour": "out_1", "update_interval": "1d"}]
+        config = self.generate(
+            [OUT_1], [{"rule_sets": ["rs_1"], "target": "block"}], "direct",
+            rulesets=rulesets)
+        self.assertEqual(config["route"]["rule_set"], [{
+            "type": "remote", "tag": "rs_1", "format": "binary",
+            "url": "https://example.org/ads.srs",
+            "download_detour": "out_1", "update_interval": "1d",
+        }])
+        self.assertEqual(config["experimental"]["cache_file"],
+                         {"enabled": True, "path": "/etc/zarap/cache.db"})
+
+    def test_a_direct_detour_is_left_out_being_the_default(self):
+        rulesets = [{"tag": "rs_1", "label": "", "url": "https://example.org/a.srs",
+                     "detour": "direct", "update_interval": ""}]
+        declared = self.generate(
+            [OUT_1], [{"rule_sets": ["rs_1"], "target": "block"}], "direct",
+            rulesets=rulesets)["route"]["rule_set"][0]
+        self.assertNotIn("download_detour", declared)
+        self.assertNotIn("update_interval", declared)
+
+    def test_an_unused_rule_set_is_not_declared_and_costs_no_cache(self):
+        # A declaration alone would be downloaded and cached, so it follows the
+        # same rule as the direct outbound: emitted when something points at it.
+        rulesets = [{"tag": "rs_1", "label": "", "url": "https://example.org/a.srs",
+                     "detour": "direct", "update_interval": ""}]
+        config = self.generate(
+            [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}],
+            "direct", rulesets=rulesets)
+        self.assertNotIn("rule_set", config["route"])
+        self.assertNotIn("experimental", config)
+
+    def test_a_rule_set_asks_for_sniffing_too(self):
+        # An .srs usually carries domains, and without the name they cannot
+        # match at all.
+        config = self.generate(
+            [OUT_1], [{"rule_sets": ["rs_1"], "target": "block"}], "direct",
+            rulesets=[{"tag": "rs_1", "label": "", "url": "https://e.org/a.srs",
+                       "detour": "direct", "update_interval": ""}])
+        self.assertEqual(config["route"]["rules"][0],
+                         {"inbound": ["zarap-tproxy"], "action": "sniff"})
 
     def test_first_matching_rule_decides_where_a_device_goes(self):
         rules = [

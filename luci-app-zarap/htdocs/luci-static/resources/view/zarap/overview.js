@@ -5,8 +5,8 @@
 'require view';
 
 const callStatus = rpc.declare({ object: 'zarap', method: 'status' });
-const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'clients', 'final' ] });
-const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'clients', 'final' ] });
+const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'clients', 'final' ] });
+const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'clients', 'final' ] });
 const callRestart = rpc.declare({ object: 'zarap', method: 'restart' });
 const callStop = rpc.declare({ object: 'zarap', method: 'stop' });
 const callLogs = rpc.declare({ object: 'zarap', method: 'logs' });
@@ -95,6 +95,7 @@ const state = {
 	enabled: false,
 	outbounds: [],
 	rules: [],
+	rulesets: [],
 	final: 'direct',
 	devices: [],
 	// Whether the kill switch chains are loaded, reported by the router. Only
@@ -120,10 +121,22 @@ function loadState(status) {
 		return {
 			clients: (rule.clients || []).slice(),
 			domains: (rule.domains || []).slice(),
+			rule_sets: (rule.rule_sets || []).slice(),
 			ip_cidr: (rule.ip_cidr || []).slice(),
 			ports: (rule.ports || []).slice(),
 			network: rule.network || '',
 			target: rule.target
+		};
+	});
+	// Наборы правил страница пока не редактирует, но отправляет обратно: apply
+	// переписывает секции целиком, и потерянный здесь набор был бы удалён.
+	state.rulesets = (status.rulesets || []).map(function(ruleset) {
+		return {
+			tag: ruleset.tag,
+			label: ruleset.label || '',
+			url: ruleset.url || '',
+			detour: ruleset.detour || 'direct',
+			update_interval: ruleset.update_interval || ''
 		};
 	});
 	state.final = status.final || 'direct';
@@ -207,6 +220,7 @@ function addressesReady() {
 // can never answer "where does this device go", only "where does some of it go".
 function isConditional(rule) {
 	return !!(rule.domains || []).length
+		|| !!(rule.rule_sets || []).length
 		|| !!(rule.ip_cidr || []).length
 		|| !!(rule.ports || []).length
 		|| !!rule.network;
@@ -651,6 +665,8 @@ function destinationSummary(rule) {
 	const parts = [];
 	if ((rule.domains || []).length)
 		parts.push((rule.domains || []).join(', '));
+	if ((rule.rule_sets || []).length)
+		parts.push((rule.rule_sets || []).map(rulesetLabel).join(', '));
 	if ((rule.ip_cidr || []).length)
 		parts.push((rule.ip_cidr || []).join(', '));
 	if ((rule.ports || []).length)
@@ -658,6 +674,14 @@ function destinationSummary(rule) {
 	if (rule.network)
 		parts.push(rule.network);
 	return parts.length ? parts.join(' · ') : _('любой адрес');
+}
+
+// Тег вроде rs_1 в журнале sing-box узнаваем, а в таблице правил — нет.
+function rulesetLabel(tag) {
+	const known = state.rulesets.filter(function(ruleset) {
+		return ruleset.tag === tag;
+	})[0];
+	return known && known.label ? _('список «%s»').format(known.label) : tag;
 }
 
 function ruleRow(rule, index, owner) {
@@ -1003,7 +1027,7 @@ return view.extend({
 							'class': 'btn cbi-button-add',
 							'click': ui.createHandlerFn(this, function() {
 								state.rules.push({
-									clients: [], domains: [], ip_cidr: [], ports: [], network: '',
+									clients: [], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '',
 									target: state.outbounds.length
 										? state.outbounds[0].tag : 'direct'
 								});
@@ -1034,7 +1058,8 @@ return view.extend({
 								if (!readyToSend())
 									return;
 								notify(await callValidate(submittedOutbounds(), state.rules,
-									leasedClients(), state.final), _('Конфигурация корректна'));
+									state.rulesets, leasedClients(), state.final),
+									_('Конфигурация корректна'));
 							})
 						}, _('Проверить конфигурацию')),
 						E('button', {
@@ -1047,6 +1072,7 @@ return view.extend({
 									document.querySelector('#zarap-enabled').checked,
 									submittedOutbounds(),
 									state.rules,
+									state.rulesets,
 									leasedClients(),
 									state.final
 								);

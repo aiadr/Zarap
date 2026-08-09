@@ -100,7 +100,7 @@ class PackageContractTests(unittest.TestCase):
             self.assertNotIn(type_name, methods_body)
         self.assertIn("args: { refresh: true }", methods_body)
         self.assertIn(
-            "args: { enabled: true, outbounds: [], rules: [], clients: [], final: '' }",
+            "args: { enabled: true, outbounds: [], rules: [], rulesets: [], clients: [], final: '' }",
             methods_body)
 
     def test_atomic_temporary_files_share_target_directories(self):

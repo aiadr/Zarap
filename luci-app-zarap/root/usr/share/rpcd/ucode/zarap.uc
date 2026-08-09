@@ -2,12 +2,16 @@
 
 'use strict';
 
-import { access, chmod, mkdir, open, popen, readfile, rename, unlink, writefile } from 'fs';
+import { access, chmod, mkdir, open, popen, readfile, rename, stat, unlink, writefile } from 'fs';
 import { urldecode, urldecode_params } from 'luci.http';
 import { connect } from 'ubus';
 import { cursor } from 'uci';
 
 const CONFIG = '/etc/zarap/sing-box.json';
+// Where sing-box keeps the rule sets it downloads. On a persistent partition on
+// purpose: in /tmp every reboot would send it back to the network for lists
+// that had already been fetched.
+const CACHE_FILE = '/etc/zarap/cache.db';
 const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp';
 const NFT_CONFIG = '/etc/nftables.d/90-zarap.nft';
 const NFT_TMP = '/etc/nftables.d/.90-zarap.nft.tmp';
@@ -371,6 +375,55 @@ function validate_outbounds(input) {
 	return { ok: true, outbounds: result };
 }
 
+function valid_ruleset_tag(tag) {
+	return !!match(tag || '', /^rs_[0-9]+$/);
+}
+
+// A ruleset section describes what sing-box should fetch: where from, through
+// what and how often. Zarap keeps no copy of the file and knows nothing about
+// its contents, so what can be checked here is exactly these three things.
+function validate_rulesets(input, tags) {
+	if (input == null)
+		input = [];
+	if (type(input) != 'array')
+		return input_error('Список наборов правил имеет неверный формат');
+
+	let taken = {}, result = [];
+	for (let entry in input) {
+		let tag = trim('' + (entry?.tag || ''));
+		if (!valid_ruleset_tag(tag))
+			return input_error('Некорректное имя набора правил: ' + (tag || '—'));
+		if (taken[tag])
+			return input_error('Наборы правил не должны повторяться: ' + tag);
+		taken[tag] = true;
+
+		let url = trim('' + (entry?.url || ''));
+		// Скачивает sing-box, а не Zarap, поэтому доступность адреса здесь не
+		// проверить: она выяснится на запуске службы, где уже есть откат.
+		// Печатаемый ASCII без пробелов — всё, что здесь можно проверить, не
+		// переписывая разбор URL. POSIX-класс со скобками внутри писать нельзя:
+		// `]` закрывает класс, и выражение молча перестаёт совпадать с чем-либо.
+		if (!match(url, /^https?:\/\/[!-~]+$/))
+			return input_error('Адрес набора ' + tag + ' должен начинаться с http:// или https://');
+
+		let detour = trim('' + (entry?.detour || 'direct'));
+		if (detour != 'direct' && !tags[detour])
+			return input_error('Набор ' + tag + ' скачивается через несуществующее подключение: ' + detour);
+
+		let interval = lc(trim('' + (entry?.update_interval || '')));
+		if (interval != '' && !match(interval, /^[0-9]{1,4}[hd]$/))
+			return input_error('Интервал обновления набора ' + tag + ' пишется как 12h или 1d');
+
+		let label = trim(replace('' + (entry?.label || ''), /[[:cntrl:]]/g, ''));
+		if (length(label) > 64)
+			label = trim(substr(label, 0, 64));
+
+		push(result, { tag: tag, label: label, url: url, detour: detour,
+			update_interval: interval });
+	}
+	return { ok: true, rulesets: result };
+}
+
 function valid_target(target, tags) {
 	return target == 'direct' || target == 'block' || !!tags[target];
 }
@@ -396,7 +449,9 @@ function validate_rule_list(raw, kind, normalize) {
 	return { values: values };
 }
 
-function validate_rules(input, tags) {
+function validate_rules(input, tags, declared) {
+	if (declared == null)
+		declared = {};
 	if (input == null)
 		input = [];
 	if (type(input) != 'array')
@@ -427,6 +482,14 @@ function validate_rules(input, tags) {
 			push(clients, mac);
 		}
 
+		let sets = validate_rule_list(entry?.rule_sets, 'наборы правил', function(value) {
+			let tag = trim('' + (value || ''));
+			if (!valid_ruleset_tag(tag) || !declared[tag])
+				return { error: 'Правило ссылается на несуществующий набор правил: ' + (tag || '—') };
+			return { value: tag };
+		});
+		if (sets.error)
+			return input_error(sets.error);
 		let domains = validate_rule_list(entry?.domains, 'домены', normalize_domain);
 		if (domains.error)
 			return input_error(domains.error);
@@ -446,11 +509,12 @@ function validate_rules(input, tags) {
 		// enough: a rule naming only a destination applies to the whole LAN,
 		// and that is a legitimate thing to write.
 		if (!length(clients) && !length(domains.values) && !length(ranges.values) &&
-			!length(ports.values) && network == '')
-			return input_error('В правиле должно быть хотя бы одно условие: устройства, домен, диапазон адресов, порт или протокол');
+			!length(sets.values) && !length(ports.values) && network == '')
+			return input_error('В правиле должно быть хотя бы одно условие: устройства, домен, набор правил, диапазон адресов, порт или протокол');
 		push(result, {
 			clients: clients,
 			domains: domains.values,
+			rule_sets: sets.values,
 			ip_cidr: ranges.values,
 			ports: ports.values,
 			network: network,
@@ -548,6 +612,8 @@ function rule_jsons(rule, address_of) {
 	}
 	if (length(rule.ip_cidr || []))
 		push(destinations, { ip_cidr: rule.ip_cidr });
+	if (length(rule.rule_sets || []))
+		push(destinations, { rule_set: rule.rule_sets });
 	if (!length(destinations))
 		push(destinations, {});
 
@@ -569,7 +635,7 @@ function rule_jsons(rule, address_of) {
 	return emitted;
 }
 
-function sing_box_config(outbounds, rules, final, address_of) {
+function sing_box_config(outbounds, rules, final, address_of, rulesets) {
 	let emitted = [], route_rules = [], wants_direct = false;
 
 	for (let outbound in outbounds)
@@ -585,7 +651,7 @@ function sing_box_config(outbounds, rules, final, address_of) {
 	// and does nothing about a name blocked in DNS.
 	let wants_sniff = false;
 	for (let rule in rules)
-		if (length(rule.domains || []))
+		if (length(rule.domains || []) || length(rule.rule_sets || []))
 			wants_sniff = true;
 	if (wants_sniff)
 		push(route_rules, { inbound: [INBOUND_TAG], action: 'sniff' });
@@ -615,7 +681,36 @@ function sing_box_config(outbounds, rules, final, address_of) {
 	if (wants_direct)
 		push(emitted, { type: 'direct', tag: 'direct' });
 
-	return {
+	// Only the sets something points at, like the direct outbound: an unused
+	// declaration would still be downloaded and cached.
+	let used = {};
+	for (let rule in rules)
+		for (let tag in (rule.rule_sets || []))
+			used[tag] = true;
+	let declared = [];
+	for (let ruleset in (rulesets || [])) {
+		if (!used[ruleset.tag])
+			continue;
+		let json = {
+			type: 'remote',
+			tag: ruleset.tag,
+			format: 'binary',
+			url: ruleset.url
+		};
+		// `direct` is the default detour, so saying it changes nothing and only
+		// adds a field that a later version could rename.
+		if (ruleset.detour && ruleset.detour != 'direct')
+			json.download_detour = ruleset.detour;
+		if (ruleset.update_interval)
+			json.update_interval = ruleset.update_interval;
+		push(declared, json);
+	}
+
+	let route = { auto_detect_interface: true, rules: route_rules, final: final_tag };
+	if (length(declared))
+		route.rule_set = declared;
+
+	let config = {
 		log: { level: 'info', timestamp: true },
 		inbounds: [{
 			type: 'tproxy',
@@ -624,8 +719,14 @@ function sing_box_config(outbounds, rules, final, address_of) {
 			listen_port: CAPTURE_PORT
 		}],
 		outbounds: emitted,
-		route: { auto_detect_interface: true, rules: route_rules, final: final_tag }
+		route: route
 	};
+	// Without the cache every restart is a trip to the network for lists that
+	// were already fetched; with nothing to cache the file is not worth the
+	// flash it would take.
+	if (length(declared))
+		config.experimental = { cache_file: { enabled: true, path: CACHE_FILE } };
+	return config;
 }
 
 function network_v4(address, mask) {
@@ -851,7 +952,7 @@ function resolve_static_leases(clients) {
 	return { ok: true, clients: result };
 }
 
-function configure_uci(uci, outbounds, rules, final, enabled, clients) {
+function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets) {
 	uci.load('zarap');
 	uci.set('zarap', 'main', 'zarap');
 	uci.set('zarap', 'main', 'enabled', enabled ? '1' : '0');
@@ -866,7 +967,7 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients) {
 	// The whole set is rewritten on every apply, which is also what makes the
 	// order of the rule sections the order of the rules.
 	let stale = [];
-	for (let kind in ['outbound', 'rule', 'client'])
+	for (let kind in ['outbound', 'rule', 'client', 'ruleset'])
 		uci.foreach('zarap', kind, function(section) { push(stale, section['.name']); });
 	for (let section in stale)
 		uci.delete('zarap', section);
@@ -879,11 +980,17 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients) {
 		                 'public_key', 'short_id', 'fingerprint'])
 			uci.set('zarap', outbound.tag, key, '' + outbound[key]);
 	}
+	for (let ruleset in rulesets) {
+		uci.set('zarap', ruleset.tag, 'ruleset');
+		for (let key in ['label', 'url', 'detour', 'update_interval'])
+			uci.set('zarap', ruleset.tag, key, '' + ruleset[key]);
+	}
 	for (let rule in rules) {
 		let section = uci.add('zarap', 'rule');
 		// An empty list is deleted rather than written: uci keeps an empty
 		// option as an empty string, which would read back as one blank entry.
 		for (let key, values in { client: rule.clients, domain: rule.domains,
+		                          rule_set: rule.rule_sets,
 		                          ip_cidr: rule.ip_cidr, port: rule.ports })
 			if (length(values || []))
 				uci.set('zarap', section, key, values);
@@ -956,7 +1063,7 @@ function cleanup_uci_candidate() {
 	}
 }
 
-function prepare_uci_candidate(outbounds, rules, final, enabled, clients) {
+function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulesets) {
 	mkdir(UCI_CANDIDATE);
 	chmod(UCI_CANDIDATE, 0700);
 	mkdir(UCI_CANDIDATE_DELTA);
@@ -972,7 +1079,7 @@ function prepare_uci_candidate(outbounds, rules, final, enabled, clients) {
 	}
 
 	let candidate = cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA);
-	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients)) {
+	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients, rulesets)) {
 		cleanup_uci_candidate();
 		return result_error('Не удалось сформировать временный UCI-кандидат', '', 'startup_error');
 	}
@@ -1016,7 +1123,10 @@ function saved_rules() {
 		// Written by hand into /etc/config/zarap, a condition can be anything;
 		// what does not normalise is dropped rather than carried into the
 		// generator, which would put it in front of sing-box unchecked.
-		let domains = [], ranges = [], ports = [];
+		let domains = [], sets = [], ranges = [], ports = [];
+		for (let value in uci_list(section.rule_set))
+			if (valid_ruleset_tag(trim('' + value)))
+				push(sets, trim('' + value));
 		for (let value in uci_list(section.domain)) {
 			let checked = normalize_domain(value);
 			if (!checked.error)
@@ -1036,6 +1146,7 @@ function saved_rules() {
 		push(rules, {
 			clients: clients,
 			domains: domains,
+			rule_sets: sets,
 			ip_cidr: ranges,
 			ports: ports,
 			network: (network == 'tcp' || network == 'udp') ? network : '',
@@ -1043,6 +1154,24 @@ function saved_rules() {
 		});
 	});
 	return rules;
+}
+
+function saved_rulesets() {
+	let uci = cursor(), rulesets = [];
+	uci.load('zarap');
+	uci.foreach('zarap', 'ruleset', function(section) {
+		let tag = section['.name'];
+		if (!valid_ruleset_tag(tag))
+			return;
+		push(rulesets, {
+			tag: tag,
+			label: section.label || '',
+			url: section.url || '',
+			detour: section.detour || 'direct',
+			update_interval: section.update_interval || ''
+		});
+	});
+	return rulesets;
 }
 
 function saved_final() {
@@ -1072,8 +1201,9 @@ function lease_addresses() {
 // a rule can never be the answer to "where does this device go", only to "where
 // does some of it go".
 function conditional_rule(rule) {
-	return !!length(rule.domains || []) || !!length(rule.ip_cidr || []) ||
-		!!length(rule.ports || []) || !!(rule.network || '');
+	return !!length(rule.domains || []) || !!length(rule.rule_sets || []) ||
+		!!length(rule.ip_cidr || []) || !!length(rule.ports || []) ||
+		!!(rule.network || '');
 }
 
 // Where a device's traffic goes, in two parts, because one value would be a
@@ -1168,7 +1298,7 @@ function recent_connection_error() {
 	return false;
 }
 
-function validate_candidate(outbounds, rules, final, clients, proxying) {
+function validate_candidate(outbounds, rules, final, clients, proxying, rulesets) {
 	let lan = lan_device();
 	// A redirect without an interface condition would capture traffic arriving
 	// from the WAN, so an unanswered ubus has to fail the apply outright.
@@ -1185,7 +1315,7 @@ function validate_candidate(outbounds, rules, final, clients, proxying) {
 
 	mkdir('/etc/zarap');
 	chmod('/etc/zarap', 0700);
-	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of)) + '\n';
+	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of, rulesets)) + '\n';
 	let nft = nft_config(guarded, lan, proxying);
 	let config_written = writefile(CONFIG_TMP, sing_box);
 	let nft_written = writefile(NFT_TMP, nft);
@@ -1341,7 +1471,14 @@ function validate_request(args, enabled) {
 	for (let outbound in outbounds)
 		tags[outbound.tag] = true;
 
-	let rule_result = validate_rules(args?.rules, tags);
+	let ruleset_result = validate_rulesets(args?.rulesets, tags);
+	if (!ruleset_result.ok)
+		return ruleset_result;
+	let declared = {};
+	for (let ruleset in ruleset_result.rulesets)
+		declared[ruleset.tag] = true;
+
+	let rule_result = validate_rules(args?.rules, tags, declared);
 	if (!rule_result.ok)
 		return rule_result;
 	let rules = rule_result.rules;
@@ -1373,7 +1510,7 @@ function validate_request(args, enabled) {
 		return client_result;
 
 	return { ok: true, outbounds: outbounds, rules: rules, final: final,
-		clients: client_result.clients };
+		clients: client_result.clients, rulesets: ruleset_result.rulesets };
 }
 
 function apply_configuration(args) {
@@ -1387,11 +1524,11 @@ function apply_configuration(args) {
 		return conflict;
 
 	let candidate = validate_candidate(request.outbounds, request.rules, request.final,
-		request.clients, enabled);
+		request.clients, enabled, request.rulesets);
 	if (!candidate.ok)
 		return candidate;
 	let uci_candidate = prepare_uci_candidate(request.outbounds, request.rules,
-		request.final, enabled, request.clients);
+		request.final, enabled, request.clients, request.rulesets);
 	if (!uci_candidate.ok) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
 		return uci_candidate;
@@ -1423,6 +1560,10 @@ function apply_configuration(args) {
 	}
 	chmod(CONFIG, 0600);
 	unlink(NFT_CHECK);
+	// Ни одного набора не осталось — держать их кэш незачем, а место на flash
+	// он занимает настоящее.
+	if (!length(request.rulesets))
+		unlink(CACHE_FILE);
 
 	if (system(['/etc/init.d/firewall', 'reload']) != 0) {
 		let restored = rollback(backups);
@@ -1613,6 +1754,20 @@ function device_list(rules, final) {
 // True while the sing-box service runs on somebody else's configuration. Its
 // failures then belong to that configuration, not to Zarap, and saying so keeps
 // a crash-looping package default from reading as a Zarap fault.
+// Что можно честно сказать про место: сколько занимает кэш наборов и сколько
+// осталось на разделе, где он лежит. Размер отдельного набора Zarap неоткуда
+// взять — файл не его, — а выдуманное число хуже отсутствующего.
+function cache_state() {
+	let size = stat(CACHE_FILE)?.size || 0;
+	let free = 0;
+	for (let line in split(capture('/bin/df -k /overlay').output, '\n')) {
+		let fields = split(trim(line), /[ \t]+/);
+		if (length(fields) >= 4 && match(fields[3], /^[0-9]+$/))
+			free = int(fields[3]) * 1024;
+	}
+	return { size: size, free: free };
+}
+
 function unmanaged_sing_box() {
 	let uci = cursor();
 	uci.load('sing-box');
@@ -1655,12 +1810,32 @@ function status() {
 		message = 'Zarap выключен. Устройства с правилами остаются без выхода в интернет: kill switch не пускает их напрямую. Удалите правило, чтобы вернуть устройству прямой доступ';
 	}
 
-	let in_use = {};
+	let in_use = {}, sets_in_use = {};
 	if (final != 'direct' && final != 'block')
 		in_use[final] = true;
-	for (let rule in rules)
+	for (let rule in rules) {
 		if (rule.target != 'direct' && rule.target != 'block')
 			in_use[rule.target] = true;
+		for (let tag in (rule.rule_sets || []))
+			sets_in_use[tag] = true;
+	}
+
+	let listed_sets = [];
+	for (let ruleset in saved_rulesets()) {
+		// Скачивание идёт через подключение, а подключение могли удалить: тогда
+		// набор не обновится, и сказать об этом должен интерфейс.
+		let detour = ruleset.detour;
+		push(listed_sets, {
+			tag: ruleset.tag,
+			label: ruleset.label,
+			url: ruleset.url,
+			detour: detour,
+			detour_missing: detour != 'direct' && !length(filter(outbounds,
+				function(outbound) { return outbound.tag == detour; })),
+			update_interval: ruleset.update_interval,
+			in_use: !!sets_in_use[ruleset.tag]
+		});
+	}
 
 	let listed = [];
 	for (let outbound in outbounds)
@@ -1682,6 +1857,8 @@ function status() {
 		firewall: health.firewall,
 		routing: health.routing,
 		outbounds: listed,
+		rulesets: listed_sets,
+		cache: cache_state(),
 		rules: rules,
 		final: final,
 		capture: { interface: lan_device(), active: enabled && health.listener },
@@ -1840,30 +2017,31 @@ function update_component(name) {
 const methods = {
 	status: { call: function() { return status(); } },
 	validate: {
-		args: { outbounds: [], rules: [], clients: [], final: '' },
+		args: { outbounds: [], rules: [], rulesets: [], clients: [], final: '' },
 		call: function(request) {
 			let checked = validate_request(request.args || {}, true);
 			if (!checked.ok) return checked;
 			let conflict = resource_conflict();
 			if (!conflict.ok) return conflict;
 			let candidate = validate_candidate(checked.outbounds, checked.rules,
-				checked.final, checked.clients, true);
+				checked.final, checked.clients, true, checked.rulesets);
 			if (!candidate.ok) return candidate;
 			let uci_candidate = prepare_uci_candidate(checked.outbounds, checked.rules,
-				checked.final, true, checked.clients);
+				checked.final, true, checked.clients, checked.rulesets);
 			unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
 			if (!uci_candidate.ok) return uci_candidate;
 			return {
 				ok: true,
 				outbounds: length(checked.outbounds),
 				rules: length(checked.rules),
+				rulesets: length(checked.rulesets),
 				clients: length(checked.clients),
 				capture: candidate.lan
 			};
 		}
 	},
 	apply: {
-		args: { enabled: true, outbounds: [], rules: [], clients: [], final: '' },
+		args: { enabled: true, outbounds: [], rules: [], rulesets: [], clients: [], final: '' },
 		call: function(request) {
 			let lock = acquire_lock();
 			if (!lock) return result_error('Другая операция Zarap уже выполняется');

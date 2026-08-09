@@ -91,16 +91,16 @@ test('sends the leases of guarded devices and the connections as they stand', as
   // what is submitted is the list held here, so anything dropped on the way in
   // would be deleted from the router on the way out.
   expect(apply.args[2]).toEqual([
-    { clients: ['00:11:22:33:44:55'], domains: [], ip_cidr: [], ports: [], network: '', target: 'out_1' },
-    { clients: ['10:20:30:40:50:60'], domains: [], ip_cidr: [], ports: [], network: '', target: 'block' }
+    { clients: ['00:11:22:33:44:55'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'out_1' },
+    { clients: ['10:20:30:40:50:60'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'block' }
   ]);
   // Only devices a rule names carry a lease.
-  expect(apply.args[3]).toEqual([
+  expect(apply.args[4]).toEqual([
     { mac: '00:11:22:33:44:55', name: 'Телевизор', ip: '192.168.1.50' },
     { mac: '10:20:30:40:50:60', name: 'Планшет ребёнка', ip: '192.168.1.62' }
   ]);
-  expect(apply.args[3].some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
-  expect(apply.args[4]).toBe('direct');
+  expect(apply.args[4].some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
+  expect(apply.args[5]).toBe('direct');
 });
 
 test('shows backend validation errors without applying configuration', async ({ page }) => {
@@ -148,7 +148,7 @@ test('adds a connection without the router and lets a rule use it', async ({ pag
   // in exactly the same shape.
   expect(apply.args[1]).toContainEqual({ tag: 'out_3', label: '', link: validLink });
   expect(apply.args[2]).toContainEqual(
-    { clients: ['AA:BB:CC:DD:EE:FF'], domains: [], ip_cidr: [], ports: [], network: '', target: 'out_3' });
+    { clients: ['AA:BB:CC:DD:EE:FF'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'out_3' });
 });
 
 test('keeps a link folded away until it is asked for', async ({ page }) => {
@@ -280,9 +280,13 @@ test('shows conditions by destination and hands them back untouched', async ({ p
   // as if it covered everything the device does would be a lie in the meantime.
   await page.addInitScript(() => {
     window.__statusOverride = {
+      rulesets: [
+        { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
+          detour: 'direct', update_interval: '1d', in_use: true }
+      ],
       rules: [
         { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
-          ip_cidr: ['149.154.160.0/20'],
+          rule_sets: ['rs_1'], ip_cidr: ['149.154.160.0/20'],
           ports: ['443', '1000:2000'], network: 'udp', target: 'out_1' },
         { clients: ['10:20:30:40:50:60'], target: 'block' }
       ]
@@ -292,7 +296,7 @@ test('shows conditions by destination and hands them back untouched', async ({ p
 
   const conditioned = page.locator('#zarap-rules-body tr[data-rule="0"]');
   await expect(conditioned.locator('[data-field="destination"]'))
-    .toHaveText('youtube.com · 149.154.160.0/20 · порт 443, 1000:2000 · udp');
+    .toHaveText('youtube.com · список «Реклама» · 149.154.160.0/20 · порт 443, 1000:2000 · udp');
   await expect(page.locator('#zarap-rules-body tr[data-rule="1"] [data-field="destination"]'))
     .toHaveText('любой адрес');
 
@@ -306,11 +310,16 @@ test('shows conditions by destination and hands them back untouched', async ({ p
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  expect(calls.find(call => call.method === 'apply').args[2]).toEqual([
+  const sent = calls.find(call => call.method === 'apply');
+  expect(sent.args[3]).toEqual([
+    { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
+      detour: 'direct', update_interval: '1d' }
+  ]);
+  expect(sent.args[2]).toEqual([
     { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
-      ip_cidr: ['149.154.160.0/20'],
+      rule_sets: ['rs_1'], ip_cidr: ['149.154.160.0/20'],
       ports: ['443', '1000:2000'], network: 'udp', target: 'out_1' },
-    { clients: ['10:20:30:40:50:60'], domains: [], ip_cidr: [], ports: [], network: '', target: 'block' }
+    { clients: ['10:20:30:40:50:60'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'block' }
   ]);
 });
 
@@ -382,7 +391,7 @@ test('names a device while picking it for a rule', async ({ page }) => {
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[3]).toContainEqual({
+  expect(apply.args[4]).toContainEqual({
     mac: 'AA:BB:CC:DD:EE:FF', name: 'realme', ip: '192.168.1.81'
   });
 });
@@ -409,7 +418,7 @@ test('a device with no lease is offered a free address when a rule names it', as
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[3]).toContainEqual({
+  expect(apply.args[4]).toContainEqual({
     mac: 'FC:D2:02:D3:28:63', name: 'Устройство FC:D2:02:D3:28:63', ip: '192.168.1.90'
   });
 });
@@ -459,7 +468,7 @@ test('a MAC typed by hand gets a row to carry its address', async ({ page }) => 
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[3]).toContainEqual({
+  expect(apply.args[4]).toContainEqual({
     mac: '10:34:56:78:9A:BC', name: 'Кладовка', ip: '192.168.1.99'
   });
 });
@@ -476,8 +485,8 @@ test('reorders rules and applies them in the shown order', async ({ page }) => {
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
   expect(apply.args[2]).toEqual([
-    { clients: ['10:20:30:40:50:60'], domains: [], ip_cidr: [], ports: [], network: '', target: 'block' },
-    { clients: ['00:11:22:33:44:55'], domains: [], ip_cidr: [], ports: [], network: '', target: 'out_1' }
+    { clients: ['10:20:30:40:50:60'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'block' },
+    { clients: ['00:11:22:33:44:55'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'out_1' }
   ]);
 });
 
@@ -529,7 +538,7 @@ test('blocking the remainder is confirmed and can be backed out of', async ({ pa
 
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   const calls = await page.evaluate(() => window.__rpcCalls);
-  expect(calls.find(call => call.method === 'apply').args[4]).toBe('block');
+  expect(calls.find(call => call.method === 'apply').args[5]).toBe('block');
 });
 
 test('deleting a rule warns what the device loses', async ({ page }) => {
