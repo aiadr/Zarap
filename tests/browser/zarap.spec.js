@@ -445,6 +445,18 @@ test('blocking everything for the whole LAN is confirmed first', async ({ page }
   await expect(page.locator('#zarap-rules-body tr[data-rule="2"] select')).not.toHaveValue('block');
 });
 
+test('says whether names are resolved through the proxy', async ({ page }) => {
+  // Доменное правило меняет путь, но не точку назначения, поэтому без резолва
+  // через прокси оно обходит только DPI — и молчать об этом нельзя.
+  await openZarap(page);
+  await expect(page.locator('#zarap-dns-note')).toContainText('не спасает, если домен блокируется в DNS');
+
+  await page.addInitScript(() => { window.__statusOverride = { dns: { forwarded: 3 } }; });
+  await page.reload();
+  await expect.poll(() => page.locator('body').getAttribute('data-ready')).toBe('true');
+  await expect(page.locator('#zarap-dns-note')).toContainText('резолвится имён: 3');
+});
+
 test('says how much room the rule set cache leaves', async ({ page }) => {
   await page.addInitScript(() => {
     window.__statusOverride = { cache: { size: 6291456, free: 4194304 } };

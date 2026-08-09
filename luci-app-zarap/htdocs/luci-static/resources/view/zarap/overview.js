@@ -97,6 +97,9 @@ const state = {
 	rules: [],
 	rulesets: [],
 	cache: { size: 0, free: 0 },
+	// Сколько имён резолвится через прокси; считается роутером из применённых
+	// правил, поэтому это состояние роутера, а не страницы.
+	dns: { forwarded: 0 },
 	final: 'direct',
 	devices: [],
 	// Whether the kill switch chains are loaded, reported by the router. Only
@@ -140,6 +143,7 @@ function loadState(status) {
 		};
 	});
 	state.cache = status.cache || { size: 0, free: 0 };
+	state.dns = status.dns || { forwarded: 0 };
 	state.final = status.final || 'direct';
 	state.firewall = !!status.firewall;
 	state.devices = (status.devices || []).map(function(device) {
@@ -1031,6 +1035,16 @@ function renderCache() {
 	]);
 }
 
+// Доменное правило меняет путь, но не точку назначения: наружу уходит адрес,
+// который клиент получил от DNS. Пока имя не резолвится через прокси, такое
+// правило обходит DPI по SNI и не обходит блокировку, устроенную в DNS.
+function renderDnsNote() {
+	const forwarded = (state.dns || {}).forwarded || 0;
+	return E('small', {}, forwarded
+		? _('Через прокси резолвится имён: %d — их адреса Zarap получает сам, минуя DNS провайдера. Остальные домены в правилах защищены только от DPI по имени.').format(forwarded)
+		: _('Правило по домену действует на соединения, где имя видно в запросе. Оно не спасает, если домен блокируется в DNS: наружу уходит адрес, который клиент получил от провайдера. Резолв через прокси включается сам, когда домен отправлен в подключение.'));
+}
+
 // The three sections that change while the page is open. Each renders straight
 // from the state, so a redraw after an edit needs no other bookkeeping.
 function renderOutbounds(owner) {
@@ -1119,6 +1133,7 @@ function refresh() {
 	dom.content(document.querySelector('#zarap-rules-body'), renderRules());
 	dom.content(document.querySelector('#zarap-rulesets-body'), renderRulesets());
 	dom.content(document.querySelector('#zarap-cache'), renderCache());
+	dom.content(document.querySelector('#zarap-dns-note'), renderDnsNote());
 	dom.content(document.querySelector('#zarap-devices-body'), renderDevices());
 	dom.content(document.querySelector('#zarap-final'), finalRow(finalRow.owner));
 }
@@ -1318,7 +1333,7 @@ return view.extend({
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('Правила')),
 					E('p', {}, _('Применяется первое подходящее правило. Условия «Откуда» и «Куда» соединяются через «и»: правило срабатывает, когда трафик пришёл от названного устройства и идёт к названному месту. Устройство, названное правилом, остаётся под kill switch даже при выключенном Zarap: прямой доступ возвращает только удаление правила.')),
-					E('p', {}, E('small', {}, _('Правило по домену действует на соединения, где имя видно в запросе, и не спасает, если домен блокируется в DNS: наружу уходит адрес, который клиент получил от DNS.'))),
+					E('p', { 'id': 'zarap-dns-note' }, renderDnsNote()),
 					E('table', { 'class': 'table', 'id': 'zarap-rules' }, [
 						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
 							E('th', { 'class': 'th' }, '#'),

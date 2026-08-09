@@ -42,6 +42,7 @@ const fixtures = {
       }
     ],
     cache: { size: 1258291, free: 20971520 },
+    dns: { forwarded: 0 },
     final: 'direct',
     capture: { interface: 'br-lan', active: true },
     devices: [

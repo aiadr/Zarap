@@ -34,6 +34,15 @@ for key in ra dhcpv6 ndp; do
 		uci -q set "dhcp.lan.$$key=$$saved"
 	fi
 done
+# Пересылка названных доменов на наш DNS-слушатель: своими считаются строки,
+# указывающие на него, чужие остаются нетронутыми.
+section="$$(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$$/\1/p' | head -n 1)"
+if [ -n "$$section" ]; then
+	uci -q get "dhcp.$$section.server" | tr ' ' '\n' | grep -F '127.0.0.1#5353' |
+	while read -r entry; do
+		[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
+	done
+fi
 uci -q commit dhcp
 /etc/init.d/dnsmasq reload 2>/dev/null
 /etc/init.d/odhcpd reload 2>/dev/null

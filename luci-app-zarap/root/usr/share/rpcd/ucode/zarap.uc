@@ -34,10 +34,18 @@ const CAPTURE_PORT = 7893;
 const MARK = '0x5a52';
 const ROUTE_TABLE = 2022;
 const INBOUND_TAG = 'zarap-tproxy';
+// DNS-слушатель для доменов, названных правилами: dnsmasq пересылает их сюда,
+// sing-box резолвит их через то же подключение, куда отправляет трафик.
+const DNS_TAG = 'zarap-dns';
+const DNS_PORT = 5353;
+// Резолвер, к которому sing-box идёт через подключение. Константа, а не
+// настройка: выбор здесь ничего не решает, потому что запрос всё равно уходит
+// внутри туннеля, а лишняя ручка требует объяснения, чем один адрес лучше.
+const DNS_UPSTREAM = '1.1.1.1';
 
 // Outbound section names double as sing-box tags, so they have to stay clear of
 // the tags sing-box gives its own meanings.
-const RESERVED_TAGS = { direct: true, block: true, dns: true, main: true, [INBOUND_TAG]: true };
+const RESERVED_TAGS = { direct: true, block: true, dns: true, main: true, [INBOUND_TAG]: true, [DNS_TAG]: true };
 
 function result_error(message, details, kind) {
 	return { ok: false, error: message, details: details || '', kind: kind || 'operation_error' };
@@ -546,6 +554,48 @@ function outbound_json(outbound) {
 	return json;
 }
 
+// Домены, которые стоит резолвить через прокси, и выход для каждого. Только те,
+// что правило отправляет в подключение: для `direct` резолв через туннель ничего
+// не даёт, а для `block` соединение всё равно не состоится.
+//
+// Ответ должен приходить с того же выхода, куда пойдёт трафик, иначе CDN отдаст
+// адрес другого континента — поэтому сервер свой на каждое подключение.
+function dns_routes(rules) {
+	let by_outbound = {}, order = [];
+	for (let rule in rules) {
+		if (!length(rule.domains || []) || rule.target == 'direct' || rule.target == 'block')
+			continue;
+		if (!by_outbound[rule.target]) {
+			by_outbound[rule.target] = [];
+			push(order, rule.target);
+		}
+		for (let domain in rule.domains)
+			push(by_outbound[rule.target], domain);
+	}
+	return { by_outbound: by_outbound, order: order };
+}
+
+// Домен в том виде, в каком его ждут и route, и dns: имя целиком плюс суффикс,
+// либо один суффикс, если запись начиналась с точки.
+function domain_json(domains) {
+	let exact = [], suffixes = [];
+	for (let domain in domains) {
+		if (substr(domain, 0, 1) == '.') {
+			push(suffixes, domain);
+		}
+		else {
+			push(exact, domain);
+			push(suffixes, '.' + domain);
+		}
+	}
+	let json = {};
+	if (length(exact))
+		json.domain = exact;
+	if (length(suffixes))
+		json.domain_suffix = suffixes;
+	return json;
+}
+
 // sing-box cannot match a source by MAC, so a device is represented by the
 // address its static lease pins. address_of maps one to the other.
 //
@@ -589,27 +639,10 @@ function rule_jsons(rule, address_of) {
 	// One entry per kind of destination; an empty list leaves a single element
 	// whose only conditions are the shared ones.
 	let destinations = [];
-	if (length(rule.domains || [])) {
-		// `example.com` is the name and everything under it, so it becomes both
-		// an exact match and a suffix; `.example.com` asked for the subdomains
-		// alone and stays a suffix.
-		let exact = [], suffixes = [];
-		for (let domain in rule.domains) {
-			if (substr(domain, 0, 1) == '.') {
-				push(suffixes, domain);
-			}
-			else {
-				push(exact, domain);
-				push(suffixes, '.' + domain);
-			}
-		}
-		let json = {};
-		if (length(exact))
-			json.domain = exact;
-		if (length(suffixes))
-			json.domain_suffix = suffixes;
-		push(destinations, json);
-	}
+	// `example.com` is the name and everything under it; `.example.com` asked
+	// for the subdomains alone.
+	if (length(rule.domains || []))
+		push(destinations, domain_json(rule.domains));
 	if (length(rule.ip_cidr || []))
 		push(destinations, { ip_cidr: rule.ip_cidr });
 	if (length(rule.rule_sets || []))
@@ -649,6 +682,13 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets) {
 	// It routes by name and dials by address: the connection still goes to the
 	// address the client resolved. A domain rule therefore beats DPI on the SNI
 	// and does nothing about a name blocked in DNS.
+	// Запросы, которые dnsmasq переслал на наш порт, уходят в DNS-модуль
+	// sing-box; правило стоит первым и ловит их по своему inbound, так что с
+	// захваченным трафиком оно не пересекается.
+	let dns = dns_routes(rules);
+	if (length(dns.order))
+		push(route_rules, { inbound: [DNS_TAG], action: 'hijack-dns' });
+
 	let wants_sniff = false;
 	for (let rule in rules)
 		if (length(rule.domains || []) || length(rule.rule_sets || []))
@@ -710,17 +750,52 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets) {
 	if (length(declared))
 		route.rule_set = declared;
 
+	let inbounds = [{
+		type: 'tproxy',
+		tag: INBOUND_TAG,
+		listen: '0.0.0.0',
+		listen_port: CAPTURE_PORT
+	}];
+	if (length(dns.order))
+		push(inbounds, {
+			type: 'direct',
+			tag: DNS_TAG,
+			listen: '127.0.0.1',
+			listen_port: DNS_PORT
+		});
+
 	let config = {
 		log: { level: 'info', timestamp: true },
-		inbounds: [{
-			type: 'tproxy',
-			tag: INBOUND_TAG,
-			listen: '0.0.0.0',
-			listen_port: CAPTURE_PORT
-		}],
+		inbounds: inbounds,
 		outbounds: emitted,
 		route: route
 	};
+
+	// Резолв только названных доменов, и каждый — через своё подключение.
+	// Перенаправлять сюда весь DNS дома нельзя: при остановленном sing-box дом
+	// потерял бы имена целиком, включая имена в самой локальной сети.
+	if (length(dns.order)) {
+		let servers = [], dns_rules = [];
+		for (let tag in dns.order) {
+			push(servers, {
+				type: 'https',
+				tag: 'dns_' + tag,
+				server: DNS_UPSTREAM,
+				detour: tag
+			});
+			let json = domain_json(dns.by_outbound[tag]);
+			json.server = 'dns_' + tag;
+			push(dns_rules, json);
+		}
+		config.dns = {
+			servers: servers,
+			rules: dns_rules,
+			// IPv6 в LAN не раздаётся, и AAAA-ответ отправил бы клиента по
+			// адресу, до которого он не дойдёт.
+			strategy: 'ipv4_only',
+			final: 'dns_' + dns.order[0]
+		};
+	}
 	// Without the cache every restart is a trip to the network for lists that
 	// were already fetched; with nothing to cache the file is not worth the
 	// flash it would take.
@@ -952,6 +1027,57 @@ function resolve_static_leases(clients) {
 	return { ok: true, clients: result };
 }
 
+// Адрес нашего слушателя в том виде, в каком его понимает dnsmasq. Он же —
+// метка: своей строкой считается та, что указывает сюда, потому что отдельного
+// поля для пометки у элемента списка нет, а чужие строки трогать нельзя.
+const DNS_FORWARD = '127.0.0.1#' + DNS_PORT;
+
+// Имя секции dnsmasq: она анонимная, и адресоваться к ней надо тем именем,
+// которое uci ей дал.
+function dnsmasq_section(uci) {
+	let found = null;
+	uci.foreach('dhcp', 'dnsmasq', function(section) {
+		if (found == null)
+			found = section['.name'];
+	});
+	return found;
+}
+
+// Пересылка по домену: dnsmasq отдаёт названные имена нашему слушателю, а всё
+// остальное резолвит как раньше. Перенаправлять весь DNS дома нельзя (7.3).
+function configure_dnsmasq(uci, rules) {
+	let section = dnsmasq_section(uci);
+	if (!section)
+		return;
+
+	let raw = uci.get('dhcp', section, 'server');
+	if (type(raw) != 'array')
+		raw = raw ? [raw] : [];
+	// Чужие строки остаются как есть, свои переписываются целиком: они целиком
+	// выводятся из правил, и сверять их по одной незачем.
+	let kept = [];
+	for (let entry in raw)
+		if (index('' + entry, DNS_FORWARD) < 0)
+			push(kept, '' + entry);
+
+	let dns = dns_routes(rules), seen = {};
+	for (let tag in dns.order)
+		for (let domain in dns.by_outbound[tag]) {
+			// dnsmasq сопоставляет по суффиксу, поэтому ведущая точка ему не
+			// нужна: /example.com/ покрывает и имя, и поддомены.
+			let name = substr(domain, 0, 1) == '.' ? substr(domain, 1) : domain;
+			if (seen[name])
+				continue;
+			seen[name] = true;
+			push(kept, '/' + name + '/' + DNS_FORWARD);
+		}
+
+	if (length(kept))
+		uci.set('dhcp', section, 'server', kept);
+	else
+		uci.delete('dhcp', section, 'server');
+}
+
 function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets) {
 	uci.load('zarap');
 	uci.set('zarap', 'main', 'zarap');
@@ -1047,6 +1173,8 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets)
 			uci.set('zarap', 'main', 'saved_' + key, previous == null ? '' : previous);
 		uci.set('dhcp', 'lan', key, 'disabled');
 	}
+	configure_dnsmasq(uci, rules);
+
 	uci.load('sing-box');
 	uci.set('sing-box', 'main', 'sing-box');
 	uci.set('sing-box', 'main', 'enabled', enabled ? '1' : '0');
@@ -1788,6 +1916,17 @@ function cache_state() {
 	return { size: size, free: free };
 }
 
+// Сколько доменов уезжает в наш резолвер: столько строк пересылки получит
+// dnsmasq, и столько имён перестанут зависеть от провайдерского DNS.
+function dns_forwarded(rules) {
+	let names = {};
+	let routes = dns_routes(rules);
+	for (let tag in routes.order)
+		for (let domain in routes.by_outbound[tag])
+			names[substr(domain, 0, 1) == '.' ? substr(domain, 1) : domain] = true;
+	return length(keys(names));
+}
+
 function unmanaged_sing_box() {
 	let uci = cursor();
 	uci.load('sing-box');
@@ -1879,6 +2018,9 @@ function status() {
 		outbounds: listed,
 		rulesets: listed_sets,
 		cache: cache_state(),
+		// Сколько имён резолвится через прокси. Ноль означает, что доменные
+		// правила работают только против DPI: подменённый DNS они не обходят.
+		dns: { forwarded: length(keys(dns_routes(rules).by_outbound)) ? dns_forwarded(rules) : 0 },
 		rules: rules,
 		final: final,
 		capture: { interface: lan_device(), active: enabled && health.listener },

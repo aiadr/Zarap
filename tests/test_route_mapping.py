@@ -50,10 +50,13 @@ class RouteMappingTests(unittest.TestCase):
         constants = "\n".join(
             line for line in source.splitlines()
             if line.startswith(("const CAPTURE_PORT", "const INBOUND_TAG",
-                                "const RESERVED_TAGS", "const CACHE_FILE")))
+                                "const RESERVED_TAGS", "const CACHE_FILE",
+                                "const DNS_TAG", "const DNS_PORT",
+                                "const DNS_UPSTREAM")))
         cls.prelude = constants + "\n" + "\n".join(
             lift(source, name) for name in
-            ("valid_outbound_tag", "outbound_json", "rule_jsons", "sing_box_config"))
+            ("valid_outbound_tag", "outbound_json", "dns_routes", "domain_json",
+             "rule_jsons", "sing_box_config"))
 
     def generate(self, outbounds, rules, final, addresses=None, rulesets=None):
         script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s));\n" % (
@@ -202,9 +205,12 @@ class RouteMappingTests(unittest.TestCase):
                   "ip_cidr": ["149.154.160.0/20"], "ports": ["443"],
                   "target": "out_1"}]
         emitted = self.generate([OUT_1], rules, "direct")["route"]["rules"]
-        # The first element is the sniff action the domains need.
-        self.assertEqual(emitted[0], {"inbound": ["zarap-tproxy"], "action": "sniff"})
-        group = emitted[1:]
+        # Ahead of the group sit the actions its conditions need: the DNS
+        # hijack for the names this rule sends through a connection, then the
+        # sniff that gets a name out of the first packet at all.
+        self.assertEqual(emitted[0], {"inbound": ["zarap-dns"], "action": "hijack-dns"})
+        self.assertEqual(emitted[1], {"inbound": ["zarap-tproxy"], "action": "sniff"})
+        group = emitted[2:]
         self.assertEqual(len(group), 2)
         self.assertEqual(group[0]["domain"], ["youtube.com"])
         self.assertEqual(group[1]["ip_cidr"], ["149.154.160.0/20"])
@@ -215,25 +221,30 @@ class RouteMappingTests(unittest.TestCase):
 
     def test_a_domain_covers_the_name_and_everything_under_it(self):
         rules = [{"domains": ["youtube.com", ".googlevideo.com"], "target": "out_1"}]
-        element = self.generate([OUT_1], rules, "direct")["route"]["rules"][1]
+        element = self.generate([OUT_1], rules, "direct")["route"]["rules"][2]
         self.assertEqual(element["domain"], ["youtube.com"])
         # A leading dot asked for the subdomains alone, so the name itself is
         # not in `domain` and only its suffix form is kept.
         self.assertEqual(element["domain_suffix"],
                          [".youtube.com", ".googlevideo.com"])
 
-    def test_sniff_is_emitted_only_for_domains_and_comes_first(self):
+    def test_sniff_is_emitted_only_for_domains_and_before_any_matching(self):
         # Sniffing delays the first packet while it waits for the header, so a
         # configuration with nothing to match by name must not pay for it.
         without = self.generate(
             [OUT_1], [{"ip_cidr": ["10.0.0.0/8"], "target": "out_1"}], "direct")
         self.assertNotIn("sniff", str(without["route"]["rules"]))
 
-        with_domains = self.generate(
+        emitted = self.generate(
             [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "direct"},
-                      {"domains": ["youtube.com"], "target": "out_1"}], "direct")
-        self.assertEqual(with_domains["route"]["rules"][0],
-                         {"inbound": ["zarap-tproxy"], "action": "sniff"})
+                      {"domains": ["youtube.com"], "target": "out_1"}],
+            "direct")["route"]["rules"]
+        sniff = [index for index, rule in enumerate(emitted)
+                 if rule.get("action") == "sniff"]
+        matching = [index for index, rule in enumerate(emitted)
+                    if "action" not in rule or rule["action"] == "reject"]
+        self.assertEqual(len(sniff), 1)
+        self.assertLess(sniff[0], min(matching))
 
     def test_block_rejects_in_every_element_of_the_group(self):
         rules = [{"domains": ["ads.example"], "ip_cidr": ["10.0.0.0/8"],
@@ -327,6 +338,46 @@ class RouteMappingTests(unittest.TestCase):
                        "detour": "direct", "update_interval": ""}])
         self.assertEqual(config["route"]["rules"][0],
                          {"inbound": ["zarap-tproxy"], "action": "sniff"})
+
+    def test_named_domains_are_resolved_through_the_outbound_that_routes_them(self):
+        # The answer has to come from the exit the traffic will take, or a CDN
+        # hands back an address on another continent.
+        config = self.generate([OUT_1, OUT_2], [
+            {"domains": ["youtube.com"], "target": "out_1"},
+            {"domains": ["example.com"], "target": "out_2"},
+        ], "direct")
+        self.assertEqual(config["dns"]["servers"], [
+            {"type": "https", "tag": "dns_out_1", "server": "1.1.1.1", "detour": "out_1"},
+            {"type": "https", "tag": "dns_out_2", "server": "1.1.1.1", "detour": "out_2"},
+        ])
+        self.assertEqual(config["dns"]["rules"][0]["server"], "dns_out_1")
+        self.assertEqual(config["dns"]["rules"][0]["domain"], ["youtube.com"])
+        # IPv6 is not handed out to the LAN, so an AAAA would send the client to
+        # an address it cannot reach.
+        self.assertEqual(config["dns"]["strategy"], "ipv4_only")
+        self.assertEqual(config["dns"]["final"], "dns_out_1")
+
+    def test_the_dns_listener_appears_only_with_something_to_resolve(self):
+        listener = {"type": "direct", "tag": "zarap-dns",
+                    "listen": "127.0.0.1", "listen_port": 5353}
+        with_domains = self.generate(
+            [OUT_1], [{"domains": ["youtube.com"], "target": "out_1"}], "direct")
+        self.assertIn(listener, with_domains["inbounds"])
+        self.assertEqual(with_domains["route"]["rules"][0],
+                         {"inbound": ["zarap-dns"], "action": "hijack-dns"})
+
+        # A domain going direct or blocked needs no resolving through a tunnel.
+        for target in ("direct", "block"):
+            plain = self.generate(
+                [OUT_1], [{"domains": ["youtube.com"], "target": target}], "direct")
+            self.assertNotIn(listener, plain["inbounds"])
+            self.assertNotIn("dns", plain)
+
+    def test_a_rule_without_domains_does_not_touch_dns(self):
+        config = self.generate(
+            [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}], "direct")
+        self.assertNotIn("dns", config)
+        self.assertEqual(len(config["inbounds"]), 1)
 
     def test_first_matching_rule_decides_where_a_device_goes(self):
         rules = [
