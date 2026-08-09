@@ -192,11 +192,60 @@ class RouteMappingTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_a_domain_and_a_range_become_a_group_with_one_target(self):
+        # sing-box ands the fields of one rule together, so two kinds of
+        # destination in one section have to be two rules. Adjacency is the or:
+        # they sit next to each other, share the source and the qualifiers, and
+        # carry the same target, so which one matched makes no difference.
+        rules = [{"clients": ["00:11:22:33:44:55"], "domains": ["youtube.com"],
+                  "ip_cidr": ["149.154.160.0/20"], "ports": ["443"],
+                  "target": "out_1"}]
+        emitted = self.generate([OUT_1], rules, "direct")["route"]["rules"]
+        # The first element is the sniff action the domains need.
+        self.assertEqual(emitted[0], {"inbound": ["zarap-tproxy"], "action": "sniff"})
+        group = emitted[1:]
+        self.assertEqual(len(group), 2)
+        self.assertEqual(group[0]["domain"], ["youtube.com"])
+        self.assertEqual(group[1]["ip_cidr"], ["149.154.160.0/20"])
+        for element in group:
+            self.assertEqual(element["source_ip_cidr"], ["192.168.1.50/32"])
+            self.assertEqual(element["port"], [443])
+            self.assertEqual(element["outbound"], "out_1")
+
+    def test_a_domain_covers_the_name_and_everything_under_it(self):
+        rules = [{"domains": ["youtube.com", ".googlevideo.com"], "target": "out_1"}]
+        element = self.generate([OUT_1], rules, "direct")["route"]["rules"][1]
+        self.assertEqual(element["domain"], ["youtube.com"])
+        # A leading dot asked for the subdomains alone, so the name itself is
+        # not in `domain` and only its suffix form is kept.
+        self.assertEqual(element["domain_suffix"],
+                         [".youtube.com", ".googlevideo.com"])
+
+    def test_sniff_is_emitted_only_for_domains_and_comes_first(self):
+        # Sniffing delays the first packet while it waits for the header, so a
+        # configuration with nothing to match by name must not pay for it.
+        without = self.generate(
+            [OUT_1], [{"ip_cidr": ["10.0.0.0/8"], "target": "out_1"}], "direct")
+        self.assertNotIn("sniff", str(without["route"]["rules"]))
+
+        with_domains = self.generate(
+            [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "direct"},
+                      {"domains": ["youtube.com"], "target": "out_1"}], "direct")
+        self.assertEqual(with_domains["route"]["rules"][0],
+                         {"inbound": ["zarap-tproxy"], "action": "sniff"})
+
+    def test_block_rejects_in_every_element_of_the_group(self):
+        rules = [{"domains": ["ads.example"], "ip_cidr": ["10.0.0.0/8"],
+                  "target": "block"}]
+        group = self.generate([OUT_1], rules, "direct")["route"]["rules"][1:]
+        self.assertEqual(len(group), 2)
+        for element in group:
+            self.assertEqual(element["action"], "reject")
+            self.assertNotIn("outbound", element)
+
     def test_source_range_and_port_meet_in_one_element(self):
         # Source, destination and qualifiers are anded, which is what sing-box
-        # does with the fields of a single rule anyway. The second element of a
-        # group appears only once a second kind of destination exists, so there
-        # is one element here and nothing to say about adjacency yet.
+        # does with the fields of a single rule anyway.
         rules = [{"clients": ["00:11:22:33:44:55"], "ip_cidr": ["149.154.160.0/20"],
                   "ports": ["443"], "target": "out_1"}]
         emitted = self.generate([OUT_1], rules, "direct")["route"]["rules"]

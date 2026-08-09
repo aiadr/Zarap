@@ -91,8 +91,8 @@ test('sends the leases of guarded devices and the connections as they stand', as
   // what is submitted is the list held here, so anything dropped on the way in
   // would be deleted from the router on the way out.
   expect(apply.args[2]).toEqual([
-    { clients: ['00:11:22:33:44:55'], ip_cidr: [], ports: [], network: '', target: 'out_1' },
-    { clients: ['10:20:30:40:50:60'], ip_cidr: [], ports: [], network: '', target: 'block' }
+    { clients: ['00:11:22:33:44:55'], domains: [], ip_cidr: [], ports: [], network: '', target: 'out_1' },
+    { clients: ['10:20:30:40:50:60'], domains: [], ip_cidr: [], ports: [], network: '', target: 'block' }
   ]);
   // Only devices a rule names carry a lease.
   expect(apply.args[3]).toEqual([
@@ -148,7 +148,7 @@ test('adds a connection without the router and lets a rule use it', async ({ pag
   // in exactly the same shape.
   expect(apply.args[1]).toContainEqual({ tag: 'out_3', label: '', link: validLink });
   expect(apply.args[2]).toContainEqual(
-    { clients: ['AA:BB:CC:DD:EE:FF'], ip_cidr: [], ports: [], network: '', target: 'out_3' });
+    { clients: ['AA:BB:CC:DD:EE:FF'], domains: [], ip_cidr: [], ports: [], network: '', target: 'out_3' });
 });
 
 test('keeps a link folded away until it is asked for', async ({ page }) => {
@@ -281,7 +281,8 @@ test('shows conditions by destination and hands them back untouched', async ({ p
   await page.addInitScript(() => {
     window.__statusOverride = {
       rules: [
-        { clients: ['00:11:22:33:44:55'], ip_cidr: ['149.154.160.0/20'],
+        { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
+          ip_cidr: ['149.154.160.0/20'],
           ports: ['443', '1000:2000'], network: 'udp', target: 'out_1' },
         { clients: ['10:20:30:40:50:60'], target: 'block' }
       ]
@@ -291,7 +292,7 @@ test('shows conditions by destination and hands them back untouched', async ({ p
 
   const conditioned = page.locator('#zarap-rules-body tr[data-rule="0"]');
   await expect(conditioned.locator('[data-field="destination"]'))
-    .toHaveText('149.154.160.0/20 · порт 443, 1000:2000 · udp');
+    .toHaveText('youtube.com · 149.154.160.0/20 · порт 443, 1000:2000 · udp');
   await expect(page.locator('#zarap-rules-body tr[data-rule="1"] [data-field="destination"]'))
     .toHaveText('любой адрес');
 
@@ -306,9 +307,10 @@ test('shows conditions by destination and hands them back untouched', async ({ p
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   expect(calls.find(call => call.method === 'apply').args[2]).toEqual([
-    { clients: ['00:11:22:33:44:55'], ip_cidr: ['149.154.160.0/20'],
+    { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
+      ip_cidr: ['149.154.160.0/20'],
       ports: ['443', '1000:2000'], network: 'udp', target: 'out_1' },
-    { clients: ['10:20:30:40:50:60'], ip_cidr: [], ports: [], network: '', target: 'block' }
+    { clients: ['10:20:30:40:50:60'], domains: [], ip_cidr: [], ports: [], network: '', target: 'block' }
   ]);
 });
 
@@ -474,8 +476,8 @@ test('reorders rules and applies them in the shown order', async ({ page }) => {
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
   expect(apply.args[2]).toEqual([
-    { clients: ['10:20:30:40:50:60'], ip_cidr: [], ports: [], network: '', target: 'block' },
-    { clients: ['00:11:22:33:44:55'], ip_cidr: [], ports: [], network: '', target: 'out_1' }
+    { clients: ['10:20:30:40:50:60'], domains: [], ip_cidr: [], ports: [], network: '', target: 'block' },
+    { clients: ['00:11:22:33:44:55'], domains: [], ip_cidr: [], ports: [], network: '', target: 'out_1' }
   ]);
 });
 

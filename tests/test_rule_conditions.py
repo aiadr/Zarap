@@ -32,7 +32,8 @@ class RuleConditionTests(unittest.TestCase):
         source = BACKEND.read_text()
         cls.prelude = "\n".join(lift(source, name) for name in (
             "result_error", "input_error", "normalize_mac", "is_private_mac",
-            "valid_ipv4", "normalize_cidr", "normalize_port", "valid_target",
+            "valid_ipv4", "normalize_domain", "normalize_cidr", "normalize_port",
+            "valid_target",
             "validate_rule_list", "validate_rules"))
 
     def validate(self, rules, tags=None):
@@ -66,9 +67,39 @@ class RuleConditionTests(unittest.TestCase):
         self.assertIn("хотя бы одно условие", self.refusal([{"target": "out_1"}]))
 
     def test_any_single_condition_is_enough(self):
-        for rule in ({"clients": [TV]}, {"ip_cidr": ["10.0.0.0/8"]},
+        for rule in ({"clients": [TV]}, {"domains": ["example.com"]},
+                     {"ip_cidr": ["10.0.0.0/8"]},
                      {"ports": ["443"]}, {"network": "udp"}):
             self.assertTrue(self.validate([dict(rule, target="out_1")])["ok"], rule)
+
+    def test_a_domain_is_kept_as_written_and_lowercased(self):
+        rule = self.accepted({"domains": ["YouTube.com", ".googlevideo.com"],
+                              "target": "out_1"})
+        self.assertEqual(rule["domains"], ["youtube.com", ".googlevideo.com"])
+
+    def test_a_domain_with_a_scheme_or_a_path_is_refused(self):
+        # The generator would put it straight into the configuration, where it
+        # would match nothing and say nothing.
+        self.assertIn("без схемы", self.refusal(
+            [{"domains": ["https://youtube.com"], "target": "out_1"}]))
+        self.assertIn("без схемы", self.refusal(
+            [{"domains": ["youtube.com/watch"], "target": "out_1"}]))
+
+    def test_a_star_is_refused_with_what_to_write_instead(self):
+        # "*.example.com" is the shape people reach for, and the entry already
+        # covers subdomains, so the refusal has to say that rather than just no.
+        message = self.refusal([{"domains": ["*.example.com"], "target": "out_1"}])
+        self.assertIn("Звёздочка", message)
+        self.assertIn("точки", message)
+
+    def test_a_cyrillic_domain_is_refused_asking_for_punycode(self):
+        # There is nothing on the router to convert it with.
+        self.assertIn("punycode", self.refusal(
+            [{"domains": ["сайт.рф"], "target": "out_1"}]))
+
+    def test_something_that_is_not_a_domain_is_refused(self):
+        for value in ("youtube", "", ".", "youtube..com", "you tube.com"):
+            self.refusal([{"domains": [value], "target": "out_1"}])
 
     def test_a_bare_address_becomes_its_own_range(self):
         self.assertEqual(
@@ -132,6 +163,7 @@ class RuleConditionTests(unittest.TestCase):
 
     def test_a_missing_list_is_an_empty_one(self):
         rule = self.accepted({"clients": [TV], "target": "out_1"})
+        self.assertEqual(rule["domains"], [])
         self.assertEqual(rule["ip_cidr"], [])
         self.assertEqual(rule["ports"], [])
         self.assertEqual(rule["network"], "")

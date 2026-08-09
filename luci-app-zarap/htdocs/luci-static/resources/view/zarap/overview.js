@@ -119,6 +119,7 @@ function loadState(status) {
 	state.rules = (status.rules || []).map(function(rule) {
 		return {
 			clients: (rule.clients || []).slice(),
+			domains: (rule.domains || []).slice(),
 			ip_cidr: (rule.ip_cidr || []).slice(),
 			ports: (rule.ports || []).slice(),
 			network: rule.network || '',
@@ -205,7 +206,8 @@ function addressesReady() {
 // A rule that speaks about part of the traffic — a range, a port, a protocol —
 // can never answer "where does this device go", only "where does some of it go".
 function isConditional(rule) {
-	return !!(rule.ip_cidr || []).length
+	return !!(rule.domains || []).length
+		|| !!(rule.ip_cidr || []).length
 		|| !!(rule.ports || []).length
 		|| !!rule.network;
 }
@@ -647,6 +649,8 @@ function sourceSummary(rule) {
 // it covers everything a device does would be a lie about what is applied.
 function destinationSummary(rule) {
 	const parts = [];
+	if ((rule.domains || []).length)
+		parts.push((rule.domains || []).join(', '));
 	if ((rule.ip_cidr || []).length)
 		parts.push((rule.ip_cidr || []).join(', '));
 	if ((rule.ports || []).length)
@@ -982,7 +986,7 @@ return view.extend({
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('Правила')),
 					E('p', {}, _('Применяется первое подходящее правило. Условия «Откуда» и «Куда» соединяются через «и»: правило срабатывает, когда трафик пришёл от названного устройства и идёт к названному месту. Устройство, названное правилом, остаётся под kill switch даже при выключенном Zarap: прямой доступ возвращает только удаление правила.')),
-					E('p', {}, E('small', {}, _('Условия «Куда» — диапазоны адресов, порты, протокол — пока задаются только в /etc/config/zarap. Страница их показывает и сохраняет без изменений.'))),
+					E('p', {}, E('small', {}, _('Условия «Куда» — домены, диапазоны адресов, порты, протокол — пока задаются только в /etc/config/zarap. Страница их показывает и сохраняет без изменений. Правило по домену действует на соединения, где имя видно в запросе, и не спасает, если домен блокируется в DNS.'))),
 					E('table', { 'class': 'table', 'id': 'zarap-rules' }, [
 						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
 							E('th', { 'class': 'th' }, '#'),
@@ -999,7 +1003,7 @@ return view.extend({
 							'class': 'btn cbi-button-add',
 							'click': ui.createHandlerFn(this, function() {
 								state.rules.push({
-									clients: [], ip_cidr: [], ports: [], network: '',
+									clients: [], domains: [], ip_cidr: [], ports: [], network: '',
 									target: state.outbounds.length
 										? state.outbounds[0].tag : 'direct'
 								});

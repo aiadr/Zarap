@@ -107,6 +107,27 @@ function normalize_cidr(value) {
 	return { value: address + '/' + int(parts[1]) };
 }
 
+// A domain as the user writes it. `example.com` means the name and everything
+// under it, `.example.com` means the subdomains alone; the generator turns one
+// entry into the two fields sing-box wants. Keyword and regex matching are not
+// offered: half the internet lives inside a substring of the other half.
+function normalize_domain(value) {
+	let text = lc(trim('' + (value || '')));
+	if (text == '')
+		return { error: 'Пустая запись в списке доменов' };
+	if (index(text, '://') >= 0 || index(text, '/') >= 0)
+		return { error: 'Домен пишется без схемы и пути: ' + text };
+	if (index(text, '*') >= 0)
+		return { error: 'Звёздочка не нужна: ' + text + ' — запись и так покрывает поддомены. Для одних поддоменов начните с точки' };
+	if (!match(text, /^[!-~]+$/))
+		return { error: 'Домен ' + text + ' записан не ASCII: укажите его в punycode (xn--…)' };
+	if (length(text) > 253)
+		return { error: 'Домен длиннее 253 символов' };
+	if (!match(text, /^\.?[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$/))
+		return { error: 'Некорректный домен: ' + text };
+	return { value: text };
+}
+
 // One port or a range, kept in the form it was written: the generator splits
 // them into `port` and `port_range`, which is where the difference matters.
 function normalize_port(value) {
@@ -406,6 +427,9 @@ function validate_rules(input, tags) {
 			push(clients, mac);
 		}
 
+		let domains = validate_rule_list(entry?.domains, 'домены', normalize_domain);
+		if (domains.error)
+			return input_error(domains.error);
 		let ranges = validate_rule_list(entry?.ip_cidr, 'диапазоны адресов', normalize_cidr);
 		if (ranges.error)
 			return input_error(ranges.error);
@@ -421,10 +445,12 @@ function validate_rules(input, tags) {
 		// the remainder, which main.final already covers. Any one condition is
 		// enough: a rule naming only a destination applies to the whole LAN,
 		// and that is a legitimate thing to write.
-		if (!length(clients) && !length(ranges.values) && !length(ports.values) && network == '')
-			return input_error('В правиле должно быть хотя бы одно условие: устройства, диапазон адресов, порт или протокол');
+		if (!length(clients) && !length(domains.values) && !length(ranges.values) &&
+			!length(ports.values) && network == '')
+			return input_error('В правиле должно быть хотя бы одно условие: устройства, домен, диапазон адресов, порт или протокол');
 		push(result, {
 			clients: clients,
+			domains: domains.values,
 			ip_cidr: ranges.values,
 			ports: ports.values,
 			network: network,
@@ -499,6 +525,27 @@ function rule_jsons(rule, address_of) {
 	// One entry per kind of destination; an empty list leaves a single element
 	// whose only conditions are the shared ones.
 	let destinations = [];
+	if (length(rule.domains || [])) {
+		// `example.com` is the name and everything under it, so it becomes both
+		// an exact match and a suffix; `.example.com` asked for the subdomains
+		// alone and stays a suffix.
+		let exact = [], suffixes = [];
+		for (let domain in rule.domains) {
+			if (substr(domain, 0, 1) == '.') {
+				push(suffixes, domain);
+			}
+			else {
+				push(exact, domain);
+				push(suffixes, '.' + domain);
+			}
+		}
+		let json = {};
+		if (length(exact))
+			json.domain = exact;
+		if (length(suffixes))
+			json.domain_suffix = suffixes;
+		push(destinations, json);
+	}
 	if (length(rule.ip_cidr || []))
 		push(destinations, { ip_cidr: rule.ip_cidr });
 	if (!length(destinations))
@@ -527,6 +574,21 @@ function sing_box_config(outbounds, rules, final, address_of) {
 
 	for (let outbound in outbounds)
 		push(emitted, outbound_json(outbound));
+
+	// A TProxy inbound sees an address and a port; the name is in the first
+	// packet, and only sniffing takes it out. The rule is emitted solely when
+	// something asks for a domain — sniffing delays the first packet while it
+	// waits for the header, and paying that with no domain rule buys nothing.
+	//
+	// It routes by name and dials by address: the connection still goes to the
+	// address the client resolved. A domain rule therefore beats DPI on the SNI
+	// and does nothing about a name blocked in DNS.
+	let wants_sniff = false;
+	for (let rule in rules)
+		if (length(rule.domains || []))
+			wants_sniff = true;
+	if (wants_sniff)
+		push(route_rules, { inbound: [INBOUND_TAG], action: 'sniff' });
 
 	for (let rule in rules) {
 		for (let json in rule_jsons(rule, address_of || {}))
@@ -821,7 +883,8 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients) {
 		let section = uci.add('zarap', 'rule');
 		// An empty list is deleted rather than written: uci keeps an empty
 		// option as an empty string, which would read back as one blank entry.
-		for (let key, values in { client: rule.clients, ip_cidr: rule.ip_cidr, port: rule.ports })
+		for (let key, values in { client: rule.clients, domain: rule.domains,
+		                          ip_cidr: rule.ip_cidr, port: rule.ports })
 			if (length(values || []))
 				uci.set('zarap', section, key, values);
 		if (rule.network)
@@ -953,7 +1016,12 @@ function saved_rules() {
 		// Written by hand into /etc/config/zarap, a condition can be anything;
 		// what does not normalise is dropped rather than carried into the
 		// generator, which would put it in front of sing-box unchecked.
-		let ranges = [], ports = [];
+		let domains = [], ranges = [], ports = [];
+		for (let value in uci_list(section.domain)) {
+			let checked = normalize_domain(value);
+			if (!checked.error)
+				push(domains, checked.value);
+		}
 		for (let value in uci_list(section.ip_cidr)) {
 			let checked = normalize_cidr(value);
 			if (!checked.error)
@@ -967,6 +1035,7 @@ function saved_rules() {
 		let network = lc(trim('' + (section.network || '')));
 		push(rules, {
 			clients: clients,
+			domains: domains,
 			ip_cidr: ranges,
 			ports: ports,
 			network: (network == 'tcp' || network == 'udp') ? network : '',
@@ -1003,7 +1072,8 @@ function lease_addresses() {
 // a rule can never be the answer to "where does this device go", only to "where
 // does some of it go".
 function conditional_rule(rule) {
-	return !!length(rule.ip_cidr || []) || !!length(rule.ports || []) || !!(rule.network || '');
+	return !!length(rule.domains || []) || !!length(rule.ip_cidr || []) ||
+		!!length(rule.ports || []) || !!(rule.network || '');
 }
 
 // Where a device's traffic goes, in two parts, because one value would be a
