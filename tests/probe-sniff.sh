@@ -20,12 +20,15 @@
 #
 #   sh /tmp/probe-sniff.sh
 #
-# Если curl есть на роутере, скрипт всё делает сам. Если нет — печатает
-# команду для ноутбука и ждёт.
+# Если curl есть на роутере, скрипт всё делает сам. Если нет — печатает команду
+# для компьютера и ждёт трафика окном в WAIT секунд, опрашивая журнал. Ждать
+# нажатия Enter нельзя: скрипт часто запускают сразу после вставки в терминал, и
+# `read` съедает остаток вставленного текста, не дав ничего сделать.
 
 SING_BOX=${SING_BOX:-/usr/bin/sing-box}
 PORT=${PORT:-17893}
 DOMAIN=${DOMAIN:-example.com}
+WAIT=${WAIT:-60}
 CONF=/tmp/zarap-probe.json
 LOG=/tmp/zarap-probe.log
 PROBE_PID=""
@@ -52,7 +55,9 @@ ROUTER_IP=$(ubus call network.interface.lan status 2>/dev/null |
 
 # Только для справки: по какому адресу имя резолвится с роутера. На решение не
 # влияет — правило в прогоне A совпадает с любым адресом.
-RESOLVED=$(nslookup "$DOMAIN" 2>/dev/null | sed -n 's/^Address[0-9: ]*\([0-9.]*\)$/\1/p' | tail -n 1)
+RESOLVED=$(nslookup "$DOMAIN" 2>/dev/null |
+	sed -n 's/^Address[[:space:]]*[0-9]*:[[:space:]]*\([0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}\).*/\1/p' |
+	tail -n 1)
 echo "$DOMAIN резолвится с роутера в ${RESOLVED:-—}"
 echo
 
@@ -109,20 +114,38 @@ run() {
 	if [ "$LOCAL_CURL" = 1 ]; then
 		curl -s -o /dev/null --max-time 20 --socks5 "127.0.0.1:$PORT" "https://$DOMAIN/"
 	else
-		echo "Выполните на компьютере в этой же сети и вернитесь сюда:"
+		echo "Выполните на компьютере в этой же сети:"
 		echo
 		echo "    curl -s -o /dev/null --socks5 $ROUTER_IP:$PORT https://$DOMAIN/"
 		echo
-		printf 'Готово? Enter для продолжения: '
-		read _answer
+		printf 'жду соединения до %s с' "$WAIT"
 	fi
+	# Опрос журнала вместо ожидания Enter: проба заканчивается сама, как только
+	# соединение прошло, и не зависит от того, что осталось во вводе терминала.
+	DEADLINE=$(( $(date +%s) + WAIT ))
+	while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+		grep -q 'outbound connection to' "$LOG" 2>/dev/null && break
+		[ "$LOCAL_CURL" = 1 ] && break
+		printf '.'
+		sleep 2
+	done
+	[ "$LOCAL_CURL" = 1 ] || echo
 	sleep 1
 	cleanup
 
 	echo "--- что увидел маршрутизатор ---"
 	grep -E 'sniff|outbound connection to' "$LOG" 2>/dev/null | tail -n 6
 	VERDICT=$(grep -o 'outbound/direct\[[a-z_]*\]' "$LOG" 2>/dev/null | tail -n 1)
-	echo "выбранный outbound: ${VERDICT:-не видно в журнале}"
+	if [ -n "$VERDICT" ]; then
+		echo "выбранный outbound: $VERDICT"
+	else
+		# Пустой журнал почти всегда значит, что соединения не было вовсе, а не
+		# что правило не совпало. Разница важная, поэтому она называется прямо.
+		echo "соединение до пробы не дошло: журнал пуст"
+		echo "проверьте, что команда curl выполнена, пока проба слушала,"
+		echo "и что $ROUTER_IP:$PORT доступен с компьютера"
+		[ -s "$LOG" ] && { echo "последние строки журнала:"; tail -n 3 "$LOG"; }
+	fi
 	echo
 }
 
