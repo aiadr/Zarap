@@ -238,6 +238,39 @@ function allocate_tag(taken) {
 	return null;
 }
 
+// ucode resolves a name where the call is compiled, not where it runs, and it
+// does not hoist function declarations: a function called from above its own
+// definition is looked up as a global, is not found, and raises an exception the
+// whole way out — which rpcd can only report as "Unspecified error (9)". Both
+// helpers below are therefore defined before validate_outbounds, their first
+// caller, rather than next to the other uci readers further down.
+function valid_outbound_tag(tag) {
+	return !!match(tag || '', /^out_[0-9]+$/) && !RESERVED_TAGS[tag];
+}
+
+function saved_outbounds() {
+	let uci = cursor(), outbounds = [];
+	uci.load('zarap');
+	uci.foreach('zarap', 'outbound', function(section) {
+		let tag = section['.name'];
+		if (!valid_outbound_tag(tag))
+			return;
+		push(outbounds, {
+			tag: tag,
+			label: section.label || '',
+			server: section.server || '',
+			server_port: int(section.server_port || 0),
+			uuid: section.uuid || '',
+			flow: section.flow || '',
+			server_name: section.server_name || '',
+			public_key: section.public_key || '',
+			short_id: section.short_id || '',
+			fingerprint: section.fingerprint || 'chrome'
+		});
+	});
+	return outbounds;
+}
+
 // An entry with an empty link keeps the secret already saved under that tag, so
 // applying an unchanged connection never sends its uuid through the browser.
 function validate_outbounds(input) {
@@ -349,10 +382,6 @@ function validate_rules(input, tags) {
 		push(result, { clients: clients, target: target });
 	}
 	return { ok: true, rules: result };
-}
-
-function valid_outbound_tag(tag) {
-	return !!match(tag || '', /^out_[0-9]+$/) && !RESERVED_TAGS[tag];
 }
 
 function outbound_json(outbound) {
@@ -782,29 +811,6 @@ function activate_uci_candidate() {
 			return false;
 	chmod('/etc/config/zarap', 0600);
 	return true;
-}
-
-function saved_outbounds() {
-	let uci = cursor(), outbounds = [];
-	uci.load('zarap');
-	uci.foreach('zarap', 'outbound', function(section) {
-		let tag = section['.name'];
-		if (!valid_outbound_tag(tag))
-			return;
-		push(outbounds, {
-			tag: tag,
-			label: section.label || '',
-			server: section.server || '',
-			server_port: int(section.server_port || 0),
-			uuid: section.uuid || '',
-			flow: section.flow || '',
-			server_name: section.server_name || '',
-			public_key: section.public_key || '',
-			short_id: section.short_id || '',
-			fingerprint: section.fingerprint || 'chrome'
-		});
-	});
-	return outbounds;
 }
 
 // The order of the sections in the file is the order of the rules, and the
