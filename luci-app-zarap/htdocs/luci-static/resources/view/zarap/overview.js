@@ -134,6 +134,50 @@ function guardedMacs() {
 	return macs;
 }
 
+const IPV4_PATTERN = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+function isIpv4(value) {
+	const parts = IPV4_PATTERN.exec(String(value || '').trim());
+	return !!parts && parts.slice(1).every(function(part) { return Number(part) <= 255; });
+}
+
+// A device a rule names has to carry an address, and one that never held a
+// lease has none to show. The router offers a free one with the device list;
+// put it in the field rather than leave an empty box that only fails on apply.
+function fillSuggestedAddresses() {
+	const guarded = guardedMacs();
+	state.devices.forEach(function(device) {
+		if (guarded[device.mac] && !String(device.ip || '').trim() && device.suggested_ip)
+			device.ip = device.suggested_ip;
+	});
+}
+
+// Devices a rule names that still have no address. The router refuses such an
+// apply and can only name the MAC, so catch it here where the row is.
+function devicesMissingAddress() {
+	const guarded = guardedMacs();
+	return state.devices.filter(function(device) {
+		return guarded[device.mac] && !isIpv4(device.ip);
+	});
+}
+
+// True when the page is ready to be sent. Otherwise it says which device is
+// short of an address and puts the cursor in the field that takes it.
+function addressesReady() {
+	const missing = devicesMissingAddress();
+	if (!missing.length)
+		return true;
+
+	ui.addNotification(null, E('p', {}, _('Устройству %s нужен статический IPv4-адрес из LAN-подсети: заполните поле «Статический IPv4» в таблице устройств.')
+		.format(missing.map(function(device) { return deviceLabel(device.mac); }).join(', '))), 'error');
+	const field = document.querySelector('tr[data-mac="%s"] input[data-field="ip"]'.format(missing[0].mac));
+	if (field) {
+		field.scrollIntoView({ block: 'center' });
+		field.focus();
+	}
+	return false;
+}
+
 // The first rule naming a device decides where its traffic goes; a device no
 // rule names falls through to the remainder.
 function resolvedTarget(mac) {
@@ -315,9 +359,11 @@ function deviceLabel(mac) {
 // Picks the devices for one rule. Opened per rule rather than driven from the
 // device table: a device belongs to a rule, and several rules may name it.
 //
-// The address is deliberately not editable here. One device has one lease, so
-// letting two rules each edit it would give two places for one fact; the picker
-// shows it, the device table owns it.
+// The name is editable here, on the row being ticked: naming a device is part of
+// picking it, and a device discovered without a lease has no name to show until
+// somebody gives it one. It edits the same device record the table does, so the
+// fact still lives in one place — unlike the address, which stays in the table,
+// because it is the lease itself and two rules must not each move it.
 function devicePicker(rule, owner, onDone) {
 	const chosen = {};
 	(rule.clients || []).forEach(function(mac) { chosen[mac] = true; });
@@ -348,6 +394,13 @@ function devicePicker(rule, owner, onDone) {
 			return [device.mac, device.name, device.ip].join(' ').toLowerCase().indexOf(needle) >= 0;
 		}).map(function(device) {
 			const blocked = device.private_mac;
+			// Only a device the rule names carries a lease, and the name is
+			// stored in it, so there is nothing to keep a name on until the row
+			// is ticked.
+			const name = bindField(device, 'name', _('Имя устройства'));
+			name.disabled = blocked || !chosen[device.mac];
+			name.title = name.disabled && !blocked
+				? _('Отметьте устройство, чтобы задать имя') : '';
 			const box = E('input', {
 				'type': 'checkbox',
 				'data-mac': device.mac,
@@ -360,10 +413,12 @@ function devicePicker(rule, owner, onDone) {
 					chosen[device.mac] = true;
 				else
 					delete chosen[device.mac];
+				name.disabled = !box.checked;
+				name.title = box.checked ? '' : _('Отметьте устройство, чтобы задать имя');
 			});
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, [ box ]),
-				E('td', { 'class': 'td' }, device.name || '—'),
+				E('td', { 'class': 'td' }, [ name ]),
 				E('td', { 'class': 'td' }, device.mac),
 				E('td', { 'class': 'td' }, device.ip || '—'),
 				E('td', { 'class': 'td' }, blocked
@@ -379,7 +434,7 @@ function devicePicker(rule, owner, onDone) {
 	draw();
 
 	ui.showModal(_('Устройства правила'), [
-		E('p', {}, _('Адрес здесь не редактируется: аренда у устройства одна, и правится она в таблице устройств.')),
+		E('p', {}, _('Имя задаётся здесь и сохраняется у отмеченных устройств. Адрес не редактируется: аренда у устройства одна, и правится она в таблице устройств.')),
 		E('div', { 'class': 'cbi-value' }, [ filter ]),
 		E('div', { 'style': 'max-height:20em;overflow:auto' }, [
 			E('table', { 'class': 'table', 'id': 'zarap-picker' }, [
@@ -430,6 +485,17 @@ function devicePicker(rule, owner, onDone) {
 				'class': 'btn cbi-button-positive important',
 				'click': ui.createHandlerFn(owner, function() {
 					rule.clients = Object.keys(chosen);
+					// A MAC typed by hand, or one named by a rule but never
+					// discovered, has no row in the device table — and that is
+					// the only place its address can be entered, without which
+					// the apply is refused. Give it one.
+					rule.clients.forEach(function(mac) {
+						if (state.devices.some(function(device) { return device.mac === mac; }))
+							return;
+						state.devices.push(listed.filter(function(device) {
+							return device.mac === mac;
+						})[0] || { mac: mac, name: '', ip: '', private_mac: isPrivateMac(mac) });
+					});
 					ui.hideModal();
 					onDone();
 				})
@@ -588,6 +654,7 @@ function renderDevices() {
 // Redraws everything a rule change can affect: which connection counts as used,
 // which device carries a lease, and where each device's traffic ends up.
 function refresh() {
+	fillSuggestedAddresses();
 	dom.content(document.querySelector('#zarap-outbounds-body'), renderOutbounds());
 	dom.content(document.querySelector('#zarap-rules-body'), renderRules());
 	dom.content(document.querySelector('#zarap-devices-body'), renderDevices());
@@ -685,6 +752,7 @@ return view.extend({
 		const updates = (data[1] && data[1].components) || {};
 		const logs = (data[2] && data[2].logs) || '';
 		loadState(status);
+		fillSuggestedAddresses();
 
 		const page = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, 'Zarap'),
@@ -797,6 +865,8 @@ return view.extend({
 						E('button', {
 							'class': 'btn cbi-button-neutral',
 							'click': ui.createHandlerFn(this, async function() {
+								if (!addressesReady())
+									return;
 								notify(await callValidate(submittedOutbounds(), state.rules,
 									leasedClients(), state.final), _('Конфигурация корректна'));
 							})
@@ -804,6 +874,8 @@ return view.extend({
 						E('button', {
 							'class': 'btn cbi-button-save important',
 							'click': ui.createHandlerFn(this, async function(ev) {
+								if (!addressesReady())
+									return;
 								ev.currentTarget.disabled = true;
 								const result = await callApply(
 									document.querySelector('#zarap-enabled').checked,

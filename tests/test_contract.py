@@ -258,6 +258,28 @@ class PackageContractTests(unittest.TestCase):
         for secret_field in ("uuid:", "public_key:", "short_id:"):
             self.assertNotIn(secret_field, status_body)
 
+    def test_a_lease_zarap_owns_follows_the_page(self):
+        # The device table offers a name and an address, and the rule picker
+        # offers a name; skipping every client that already had a lease meant an
+        # edit to either was accepted, reported back in the apply result and
+        # then thrown away. Only a reservation Zarap did not write is left be.
+        self.assertIn("if (existing && !existing.managed)", BACKEND)
+        self.assertIn("if (client.foreign_lease)", BACKEND)
+        # A pinned address only reaches the device on its next DHCP exchange,
+        # whether the lease is new or moved.
+        self.assertIn("reconnect_required: !!held && held != client.ip", BACKEND)
+
+    def test_a_device_without_a_lease_is_offered_an_address(self):
+        # A rule cannot name a device that has no address, and a device that
+        # never held a lease has none to show. Without an offer the field is an
+        # empty box whose only answer comes from a refused apply.
+        self.assertIn("device.suggested_ip = suggest()", BACKEND)
+        # The offer has to miss everything already spoken for, or the apply
+        # would refuse it for a conflict the user never chose.
+        self.assertIn("taken[lan.address] = true", BACKEND)
+        self.assertIn("for (let ip, lease in static_leases().by_ip)", BACKEND)
+        self.assertIn("for (let mac, lease in current_dhcp_leases())", BACKEND)
+
     def test_every_function_is_defined_before_it_is_called(self):
         # ucode resolves a name where the call is compiled and does not hoist
         # function declarations, so a call placed above its own definition is

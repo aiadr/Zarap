@@ -656,14 +656,20 @@ function ipv4_in_lan(ip) {
 	return false;
 }
 
+// A lease Zarap created is Zarap's to edit: the name and the address shown on
+// the page are the ones that end up in it, so renaming a device or moving it to
+// another address is an ordinary apply. A reservation somebody else wrote is
+// adopted instead — its address becomes the device's and its section is left
+// exactly as it is, because Zarap does not own it.
 function resolve_static_leases(clients) {
 	let leases = static_leases(), dynamic = current_dhcp_leases(), result = [];
 	for (let client in clients) {
 		let existing = leases.by_mac[client.mac];
-		if (existing) {
+		if (existing && !existing.managed) {
 			push(result, {
 				mac: client.mac, ip: existing.ip,
-				name: client.name || existing.name, has_static_lease: true
+				name: client.name || existing.name,
+				has_static_lease: true, foreign_lease: true
 			});
 			continue;
 		}
@@ -672,11 +678,21 @@ function resolve_static_leases(clients) {
 			return input_error('IPv4-адрес ' + client.ip + ' уже закреплён за ' + conflict.mac);
 		if (!ipv4_in_lan(client.ip))
 			return input_error('IPv4-адрес ' + client.ip + ' не входит в LAN-подсеть');
-		push(result, {
+		// Whatever the device is holding right now, from its current lease or
+		// from the one pinned so far. A new address only reaches it on the next
+		// DHCP exchange, so say so rather than let it look applied.
+		let held = dynamic[client.mac]?.ip || existing?.ip || '';
+		let record = {
 			mac: client.mac, ip: client.ip, name: client.name,
-			has_static_lease: false,
-			reconnect_required: !!dynamic[client.mac]?.ip && dynamic[client.mac].ip != client.ip
-		});
+			has_static_lease: !!existing, foreign_lease: false,
+			reconnect_required: !!held && held != client.ip
+		};
+		// Rewrite the section that is already there rather than the canonical
+		// name: a managed lease renamed by hand would otherwise survive the
+		// sweep, and dnsmasq would get two reservations for one MAC.
+		if (existing)
+			record.section = existing.section;
+		push(result, record);
 	}
 	return { ok: true, clients: result };
 }
@@ -734,9 +750,12 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients) {
 		uci.delete('dhcp', section);
 
 	for (let client in clients) {
-		if (client.has_static_lease)
+		// Only the reservation somebody else wrote is left alone. Zarap's own is
+		// rewritten on every apply, which is what makes a name or an address
+		// edited on the page actually take.
+		if (client.foreign_lease)
 			continue;
-		let section = 'zarap_' + lc(replace(client.mac, /:/g, ''));
+		let section = client.section || ('zarap_' + lc(replace(client.mac, /:/g, '')));
 		uci.set('dhcp', section, 'host');
 		uci.set('dhcp', section, 'name', client.name);
 		uci.set('dhcp', section, 'mac', client.mac);
@@ -1222,6 +1241,73 @@ function apply_configuration(args) {
 	return { ok: true, enabled: enabled, clients: request.clients, health: health };
 }
 
+function ipv4_number(ip) {
+	let parts = split(ip || '', '.');
+	if (length(parts) != 4)
+		return null;
+	let value = 0;
+	for (let part in parts)
+		value = (value * 256) + int(part);
+	return value;
+}
+
+function ipv4_text(value) {
+	return sprintf('%d.%d.%d.%d', (value >> 24) & 255, (value >> 16) & 255,
+		(value >> 8) & 255, value & 255);
+}
+
+// The LAN prefix the router itself sits on, or null when ubus cannot say. Only
+// the first address counts: a suggestion has to land somewhere the device can
+// actually be reached, and that is the subnet its lease will come from.
+function lan_ipv4() {
+	let ubus = connect();
+	if (!ubus)
+		return null;
+	let lan = ubus.call('network.interface.lan', 'status') || {};
+	ubus.disconnect();
+	let item = (lan['ipv4-address'] || [])[0];
+	let mask = int(item?.mask);
+	if (!item || !valid_ipv4(item.address || '') || mask < 8 || mask > 30)
+		return null;
+	return { address: item.address, mask: mask };
+}
+
+// Hands out addresses nothing on the LAN is using. A device no lease ever
+// answered for has no address to show, and a rule cannot name it without one,
+// so the page would otherwise offer an empty box and the apply would refuse
+// what was left in it. Every reservation, every current lease and the router
+// itself are excluded, and each address handed out is taken off the list, so
+// two devices added at once do not get the same one.
+function address_suggester() {
+	let taken = {}, lan = lan_ipv4();
+	for (let ip, lease in static_leases().by_ip)
+		taken[ip] = true;
+	for (let mac, lease in current_dhcp_leases())
+		taken[lease.ip] = true;
+	if (!lan)
+		return function() { return ''; };
+
+	taken[lan.address] = true;
+	let size = 1 << (32 - lan.mask);
+	let network = ipv4_number(lan.address) & ~(size - 1);
+	// Walking a large subnet end to end is pointless work: the first free
+	// address is normally a few steps in, and a full scan is bounded anyway.
+	let limit = size - 1 < 1024 ? size - 1 : 1024;
+	let next = 1;
+
+	return function() {
+		while (next < limit) {
+			let candidate = ipv4_text(network + next);
+			next++;
+			if (!taken[candidate]) {
+				taken[candidate] = true;
+				return candidate;
+			}
+		}
+		return '';
+	};
+}
+
 // The capture covers the whole LAN, so a rule can name any device on it, not
 // just a Wi-Fi client. Leases are therefore the base of the list — they know
 // about wired hosts — and hostapd only adds what leases cannot tell: whether a
@@ -1283,9 +1369,15 @@ function device_list(rules, final) {
 		ubus.disconnect();
 	}
 
+	// Handed out only to the devices that have nothing, and only after the whole
+	// list is known, so a suggestion never lands on an address already in it.
+	let suggest = address_suggester();
 	let result = [];
-	for (let mac, device in devices)
+	for (let mac, device in devices) {
+		if (!device.ip)
+			device.suggested_ip = suggest();
 		push(result, device);
+	}
 	return result;
 }
 

@@ -21,7 +21,10 @@ body { margin: 0; }
 .right, .cbi-page-actions { margin-top: 12px; text-align: right; }
 .notification { padding: 10px; border-radius: 6px; background: #e2e8f0; }
 .notification.error { color: #991b1b; background: #fee2e2; }
-#modal { position: fixed; z-index: 20; inset: 20% 25%; padding: 20px; border: 1px solid #64748b; border-radius: 10px; background: #fff; box-shadow: 0 12px 40px #0005; }
+/* overflow as in the LuCI themes: a dialog taller than its box scrolls rather
+   than putting its own buttons out of reach, which is what a device list long
+   enough to matter does on a phone. */
+#modal { position: fixed; z-index: 20; inset: 20% 25%; padding: 20px; border: 1px solid #64748b; border-radius: 10px; background: #fff; box-shadow: 0 12px 40px #0005; overflow: auto; }
 pre { padding: 10px; background: #0f172a; color: #e2e8f0; }
 
 /* Verbatim from luci-theme-bootstrap: everything in a page-actions row that is
