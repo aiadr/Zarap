@@ -36,7 +36,9 @@ cleanup() {
 trap 'cleanup; exit 130' INT TERM
 
 [ -x "$SING_BOX" ] || { echo "sing-box не найден в $SING_BOX"; exit 1; }
-command -v nc >/dev/null 2>&1 || { echo "нужен nc, его нет в PATH"; exit 1; }
+
+HELLO=/tmp/zarap-hello.bin
+NC_ERR=/tmp/zarap-nc.err
 
 # Байты в поток. Восьмеричная форма, а не \xNN: %b с шестнадцатеричными
 # escape-последовательностями за пределами POSIX, и busybox их может не знать.
@@ -80,16 +82,31 @@ client_hello() {
 	printf '%s' "$host"
 }
 
-RESOLVED=$(nslookup "$DOMAIN" 2>/dev/null |
-	sed -n 's/^Address[[:space:]]*[0-9]*:[[:space:]]*\([0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}\).*/\1/p' |
-	tail -n 1)
-if [ -z "$RESOLVED" ]; then
-	echo "не удалось узнать адрес $DOMAIN через nslookup"
-	echo "укажите его сами: TARGET=93.184.216.34 sh $0"
-	[ -n "$TARGET" ] || exit 1
+# Строка вида «Address 1: 1.2.3.4», а не «Address: 127.0.0.1:53» — последняя
+# принадлежит самому резолверу, и принять её за адрес имени легко.
+LOOKUP=$(nslookup "$DOMAIN" 2>/dev/null |
+	sed -n 's/^Address[[:space:]]\{1,\}[0-9]\{1,\}:[[:space:]]*\([0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}\).*/\1/p' |
+	head -n 1)
+TARGET=${TARGET:-$LOOKUP}
+if [ -z "$TARGET" ]; then
+	echo "не удалось узнать адрес $DOMAIN через nslookup; вывод был такой:"
+	nslookup "$DOMAIN" 2>&1 | head -n 8
+	echo "укажите адрес сами: TARGET=93.184.216.34 sh $0"
+	exit 1
 fi
-TARGET=${TARGET:-$RESOLVED}
 echo "$DOMAIN → $TARGET (назначение задаётся адресом, как при захвате TProxy)"
+
+# Проверка самого генератора: длина известна заранее, и расхождение означает,
+# что printf в этой оболочке не понимает восьмеричные escape-последовательности,
+# а не что маршрутизатор чего-то не увидел.
+client_hello "$DOMAIN" > "$HELLO"
+BUILT=$(wc -c < "$HELLO")
+WANTED=$((61 + ${#DOMAIN}))
+echo "ClientHello: $BUILT байт (ожидалось $WANTED)"
+if [ "$BUILT" != "$WANTED" ]; then
+	echo "генератор собрал не то — проверять маршрутизацию этим нельзя"
+	exit 1
+fi
 echo
 
 # write_config <первое-правило> <второе-правило>
@@ -125,6 +142,14 @@ CONFIG
 BY_IP='{ "inbound": ["probe-in"], "ip_cidr": ["0.0.0.0/0"], "outbound": "by_ip" }'
 BY_DOMAIN="{ \"inbound\": [\"probe-in\"], \"domain\": [\"$DOMAIN\"], \"domain_suffix\": [\".$DOMAIN\"], \"outbound\": \"by_domain\" }"
 
+# Отправить собранный ClientHello и подержать соединение открытым: клиент,
+# закрывший его сразу, оставил бы маршрутизатору меньше времени, чем тот тратит
+# на разбор первого пакета.
+send_hello() {
+	: > "$NC_ERR"
+	{ cat "$HELLO"; sleep 2; } | nc "$@" 127.0.0.1 "$PORT" >/dev/null 2>"$NC_ERR"
+}
+
 # run <название> <первое-правило> <второе-правило>
 run() {
 	echo "== $1 =="
@@ -146,7 +171,34 @@ run() {
 		return 1
 	fi
 
-	client_hello "$DOMAIN" | nc -w 5 127.0.0.1 "$PORT" >/dev/null 2>&1
+	# Слушает ли проба на самом деле — иначе ответ «соединения не было» ничего
+	# не объясняет.
+	ss -lnt 2>/dev/null | grep -q ":$PORT" || echo "внимание: порт $PORT не слушается"
+
+	# Соединение держится ещё пару секунд после отправки: клиент, закрывший его
+	# сразу, оставил бы маршрутизатору меньше времени, чем тот тратит на разбор.
+	if command -v nc >/dev/null 2>&1; then
+		send_hello -w 5
+		CODE=$?
+		# busybox собирают по-разному, и nc без -w — не редкость. Такой nc
+		# печатает usage и уходит, а с подавленным stderr это выглядело бы как
+		# «соединения не было», то есть как ответ про маршрутизацию.
+		if [ -s "$NC_ERR" ]; then
+			echo "nc не принял -w: $(head -n 1 "$NC_ERR")"
+			send_hello
+			CODE=$?
+		fi
+		echo "клиент nc: код $CODE"
+		[ -s "$NC_ERR" ] && { echo "nc сказал:"; head -n 2 "$NC_ERR"; }
+	fi
+	# Запасной клиент. Нужен ровно тогда, когда nc отсутствует или молча не
+	# соединяется, а sing-box на роутере есть по определению.
+	if ! grep -q 'inbound connection' "$LOG" 2>/dev/null; then
+		if "$SING_BOX" tools connect --help >/dev/null 2>&1; then
+			echo "nc не дошёл, пробуем sing-box tools connect"
+			{ cat "$HELLO"; sleep 2; } | "$SING_BOX" tools connect "127.0.0.1:$PORT" >/dev/null 2>&1
+		fi
+	fi
 	sleep 2
 	cleanup
 
@@ -155,8 +207,13 @@ run() {
 	VERDICT=$(grep -o 'outbound/direct\[[a-z_]*\]' "$LOG" 2>/dev/null | tail -n 1)
 	if [ -n "$VERDICT" ]; then
 		echo "выбранный outbound: $VERDICT"
+	elif grep -q 'inbound connection' "$LOG" 2>/dev/null; then
+		# Соединение дошло, но маршрут не выбран — это уже разговор про
+		# маршрутизатор, а не про клиента.
+		echo "соединение принято, но outbound в журнале не назван:"
+		tail -n 6 "$LOG"
 	else
-		echo "маршрут в журнале не виден — соединение до пробы не дошло"
+		echo "соединение до пробы не дошло: клиент не смог подключиться"
 		[ -s "$LOG" ] && { echo "последние строки журнала:"; tail -n 3 "$LOG"; }
 	fi
 	echo
