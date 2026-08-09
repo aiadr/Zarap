@@ -22,8 +22,12 @@ clear_policy_routing() {
 	return 0
 }
 
+# The mark and the routing table are fixed above. They used to be read back
+# from uci as if they were settings, but every other consumer substituted the
+# literals anyway, so a changed value produced a system that disagreed with
+# itself.
 start_service() {
-	local enabled mark route_table
+	local enabled
 	config_load zarap
 	config_get_bool enabled main enabled 0
 	[ "$enabled" -eq 1 ] || return 0
@@ -31,11 +35,6 @@ start_service() {
 		logger -t zarap "configuration is missing: $CONFIG"
 		return 1
 	}
-
-	config_get mark main mark "$MARK"
-	config_get route_table main route_table "$ROUTE_TABLE"
-	MARK="$mark"
-	ROUTE_TABLE="$route_table"
 
 	setup_policy_routing || return 1
 }

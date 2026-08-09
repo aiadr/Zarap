@@ -21,22 +21,46 @@ const fixtures = {
     listener: true,
     firewall: true,
     routing: true,
-    masked_link: 'vless://********@proxy.example.test:443?security=reality&type=tcp&sni=cdn.example.test#Zarap',
+    outbounds: [
+      {
+        tag: 'out_1', label: 'Нидерланды', in_use: true,
+        masked_link: 'vless://********@proxy.example.test:443?security=reality&type=tcp&sni=cdn.example.test#Нидерланды'
+      },
+      {
+        tag: 'out_2', label: 'Германия', in_use: false,
+        masked_link: 'vless://********@de.example.test:443?security=reality&type=tcp&sni=cdn.example.test#Германия'
+      }
+    ],
+    rules: [
+      { clients: ['00:11:22:33:44:55'], target: 'out_1' },
+      { clients: ['10:20:30:40:50:60'], target: 'block' }
+    ],
+    final: 'direct',
+    capture: { interface: 'br-lan', active: true },
     devices: [
       {
         mac: '00:11:22:33:44:55', name: 'Телевизор', ip: '192.168.1.50',
         connected: true, wireless: true, network: 'Home', signal: -48,
-        has_static_lease: true, private_mac: false, selected: true
+        has_static_lease: true, private_mac: false,
+        guarded: true, resolved_target: 'out_1'
       },
       {
         mac: '10:20:30:40:50:60', name: 'Планшет', ip: '192.168.1.61',
         connected: true, wireless: true, network: 'Home', signal: -62,
-        has_static_lease: false, private_mac: false, selected: false
+        has_static_lease: true, private_mac: false,
+        guarded: true, resolved_target: 'block'
       },
       {
         mac: '02:AA:BB:CC:DD:EE', name: 'Телефон', ip: '192.168.1.72',
         connected: true, wireless: true, network: 'Home', signal: -55,
-        has_static_lease: false, private_mac: true, selected: false
+        has_static_lease: false, private_mac: true,
+        guarded: false, resolved_target: 'direct'
+      },
+      {
+        mac: 'AA:BB:CC:DD:EE:FF', name: 'Принтер', ip: '192.168.1.80',
+        connected: true, wireless: false,
+        has_static_lease: false, private_mac: false,
+        guarded: false, resolved_target: 'direct'
       }
     ]
   },
@@ -83,7 +107,7 @@ const handlers = {
     }),
   validate: () => window.__mockState.validateError
 	? { ok: false, error: window.__mockState.validateError, kind: 'input_error' }
-    : { ok: true, server: 'proxy.example.test', server_name: 'cdn.example.test', clients: 2 },
+    : { ok: true, outbounds: 2, rules: 2, clients: 2, capture: 'br-lan' },
   apply: () => window.__mockState.applyError
     ? { ok: false, error: window.__mockState.applyError }
     : { ok: true, enabled: true },
@@ -131,7 +155,9 @@ window.E = function(tag, attributes, children) {
       return;
     if (name === 'click')
       element.addEventListener('click', value);
-    else if (name === 'checked' || name === 'disabled')
+    else if (name === 'checked' || name === 'disabled' || name === 'selected')
+      // LuCI applies these as attributes, where any value marks them set. The
+      // property assignment below would take '' as false.
       element[name] = true;
     else if (name === 'class')
       element.className = value;

@@ -22,6 +22,19 @@ const LOCK_FILE = '/var/lock/zarap.lock';
 // inside the LuCI RPC deadline.
 const LISTENER_WAIT = 5;
 
+// Fixed resources. These used to live in uci and read like settings, but every
+// consumer here substituted the literals anyway, so changing one produced a
+// broken system complaining about a port it was no longer using. They are
+// constants; /etc/init.d/zarap carries the same values for the policy routing.
+const CAPTURE_PORT = 7893;
+const MARK = '0x5a52';
+const ROUTE_TABLE = 2022;
+const INBOUND_TAG = 'zarap-tproxy';
+
+// Outbound section names double as sing-box tags, so they have to stay clear of
+// the tags sing-box gives its own meanings.
+const RESERVED_TAGS = { direct: true, block: true, dns: true, main: true, [INBOUND_TAG]: true };
+
 function result_error(message, details, kind) {
 	return { ok: false, error: message, details: details || '', kind: kind || 'operation_error' };
 }
@@ -215,36 +228,220 @@ function validate_clients(clients) {
 	return { ok: true, clients: result };
 }
 
-function sing_box_config(parsed, listen_port) {
-	let outbound = {
+// Connections are addressed by their section name, which is also their sing-box
+// tag, so a name has to survive editing the link behind it. New ones get the
+// lowest free number; the ones already saved keep what they have.
+function allocate_tag(taken) {
+	for (let n = 1; n <= 999; n++)
+		if (!taken['out_' + n])
+			return 'out_' + n;
+	return null;
+}
+
+// An entry with an empty link keeps the secret already saved under that tag, so
+// applying an unchanged connection never sends its uuid through the browser.
+function validate_outbounds(input) {
+	if (input == null)
+		input = [];
+	if (type(input) != 'array')
+		return input_error('Список подключений имеет неверный формат');
+
+	let saved = {}, taken = {}, result = [];
+	for (let outbound in saved_outbounds())
+		saved[outbound.tag] = outbound;
+
+	for (let entry in input) {
+		let tag = trim('' + (entry?.tag || ''));
+		if (!tag)
+			continue;
+		if (!valid_outbound_tag(tag))
+			return input_error('Некорректное имя подключения: ' + tag);
+		if (taken[tag])
+			return input_error('Подключения не должны повторяться: ' + tag);
+		taken[tag] = true;
+	}
+
+	for (let entry in input) {
+		let tag = trim('' + (entry?.tag || ''));
+		let link = trim('' + (entry?.link || ''));
+		let label = trim(replace('' + (entry?.label || ''), /[[:cntrl:]]/g, ''));
+		let config;
+
+		if (link) {
+			let parsed = parse_vless(link);
+			if (!parsed.ok)
+				return parsed;
+			config = parsed.config;
+			if (!label)
+				label = config.name;
+		}
+		else {
+			if (!tag || !saved[tag])
+				return input_error('Для нового подключения нужна VLESS Reality-ссылка');
+			config = saved[tag];
+			if (!label)
+				label = config.label;
+		}
+
+		if (!tag) {
+			tag = allocate_tag(taken);
+			if (!tag)
+				return input_error('Слишком много подключений');
+			taken[tag] = true;
+		}
+
+		if (length(label) > 64)
+			label = trim(substr(label, 0, 64));
+		push(result, {
+			tag: tag,
+			label: label,
+			server: config.server,
+			server_port: config.server_port,
+			uuid: config.uuid,
+			flow: config.flow,
+			server_name: config.server_name,
+			public_key: config.public_key,
+			short_id: config.short_id,
+			fingerprint: config.fingerprint || 'chrome'
+		});
+	}
+	return { ok: true, outbounds: result };
+}
+
+function valid_target(target, tags) {
+	return target == 'direct' || target == 'block' || !!tags[target];
+}
+
+function validate_rules(input, tags) {
+	if (input == null)
+		input = [];
+	if (type(input) != 'array')
+		return input_error('Список правил имеет неверный формат');
+
+	let result = [];
+	for (let entry in input) {
+		let target = trim('' + (entry?.target || ''));
+		if (!valid_target(target, tags))
+			return input_error('Правило ссылается на несуществующее подключение: ' + (target || '—'));
+
+		let raw = entry?.clients;
+		if (raw == null)
+			raw = [];
+		if (type(raw) != 'array')
+			return input_error('Список устройств в правиле имеет неверный формат');
+
+		let seen = {}, clients = [];
+		for (let value in raw) {
+			let mac = normalize_mac(value);
+			if (!mac)
+				return input_error('В правиле указан некорректный MAC-адрес');
+			if (is_private_mac(mac))
+				return input_error('Устройство ' + mac + ' использует приватный MAC. Отключите рандомизацию MAC для этой Wi-Fi-сети.');
+			if (seen[mac])
+				return input_error('Устройство ' + mac + ' указано в правиле дважды');
+			seen[mac] = true;
+			push(clients, mac);
+		}
+		// A rule with no condition would match everything and duplicate the
+		// remainder, which main.final already covers.
+		if (!length(clients))
+			return input_error('В правиле должно быть хотя бы одно устройство');
+		push(result, { clients: clients, target: target });
+	}
+	return { ok: true, rules: result };
+}
+
+function valid_outbound_tag(tag) {
+	return !!match(tag || '', /^out_[0-9]+$/) && !RESERVED_TAGS[tag];
+}
+
+function outbound_json(outbound) {
+	let json = {
 		type: 'vless',
-		tag: 'zarap-proxy',
-		server: parsed.server,
-		server_port: parsed.server_port,
-		uuid: parsed.uuid,
+		tag: outbound.tag,
+		server: outbound.server,
+		server_port: outbound.server_port,
+		uuid: outbound.uuid,
 		tls: {
 			enabled: true,
-			server_name: parsed.server_name,
-			utls: { enabled: true, fingerprint: parsed.fingerprint },
-			reality: { enabled: true, public_key: parsed.public_key }
+			server_name: outbound.server_name,
+			utls: { enabled: true, fingerprint: outbound.fingerprint || 'chrome' },
+			reality: { enabled: true, public_key: outbound.public_key }
 		}
 	};
 
-	if (parsed.flow)
-		outbound.flow = parsed.flow;
-	if (parsed.short_id)
-		outbound.tls.reality.short_id = parsed.short_id;
+	if (outbound.flow)
+		json.flow = outbound.flow;
+	if (outbound.short_id)
+		json.tls.reality.short_id = outbound.short_id;
+	return json;
+}
+
+// sing-box cannot match a source by MAC, so a device is represented by the
+// address its static lease pins. address_of maps one to the other.
+function rule_json(rule, address_of) {
+	let sources = [];
+	for (let mac in (rule.clients || [])) {
+		let address = address_of[mac];
+		if (address)
+			push(sources, address + '/32');
+	}
+
+	// The inbound is the only one there is, so naming it changes nothing today.
+	// It is written from the start so that splitting the capture across several
+	// TProxy ports later does not mean rewriting every rule.
+	let json = { inbound: [INBOUND_TAG] };
+	if (length(sources))
+		json.source_ip_cidr = sources;
+	// The special `block` outbound was deprecated in sing-box 1.11 and removed
+	// in 1.13; the rule action replaces it.
+	if (rule.target == 'block')
+		json.action = 'reject';
+	else
+		json.outbound = rule.target;
+	return json;
+}
+
+function sing_box_config(outbounds, rules, final, address_of) {
+	let emitted = [], route_rules = [], wants_direct = false;
+
+	for (let outbound in outbounds)
+		push(emitted, outbound_json(outbound));
+
+	for (let rule in rules) {
+		push(route_rules, rule_json(rule, address_of || {}));
+		if (rule.target == 'direct')
+			wants_direct = true;
+	}
+
+	// `final` takes an outbound tag, and `block` is no longer one. Blocking the
+	// remainder is therefore a trailing rule that matches everything, with the
+	// field itself filled by a declared tag so it stays valid — the flow never
+	// reaches it.
+	let final_tag = final;
+	if (final == 'block') {
+		push(route_rules, { inbound: [INBOUND_TAG], action: 'reject' });
+		final_tag = length(outbounds) ? outbounds[0].tag : 'direct';
+	}
+	if (final_tag == 'direct')
+		wants_direct = true;
+
+	// Declared only when something points at it: an unreferenced `direct` would
+	// turn a mistyped tag into a silent path to the WAN, while an undeclared one
+	// makes `sing-box check` reject the configuration outright.
+	if (wants_direct)
+		push(emitted, { type: 'direct', tag: 'direct' });
 
 	return {
 		log: { level: 'info', timestamp: true },
 		inbounds: [{
 			type: 'tproxy',
-			tag: 'zarap-tproxy',
+			tag: INBOUND_TAG,
 			listen: '0.0.0.0',
-			listen_port: listen_port
+			listen_port: CAPTURE_PORT
 		}],
-		outbounds: [outbound],
-		route: { auto_detect_interface: true, final: 'zarap-proxy' }
+		outbounds: emitted,
+		route: { auto_detect_interface: true, rules: route_rules, final: final_tag }
 	};
 }
 
@@ -325,36 +522,56 @@ function nft_set(name, type_name, flags, elements) {
 	return text + '}\n\n';
 }
 
-// A selected device must never reach the WAN directly, so the kill switch holds
-// whether or not the proxy is running. The TProxy redirect is the part that
-// depends on it: pointing traffic at a port nothing listens on would swallow it
-// silently, while leaving only the kill switch rejects it outright.
-function nft_config(clients, listen_port, proxying) {
-	let ips = map(clients, function(client) { return client.ip; });
-	let macs = map(clients, function(client) { return client.mac; });
+// The device the LAN is bridged onto. Read on every generation rather than
+// baked in: a redirect rule without an interface condition would capture
+// traffic arriving from the WAN too, so an unanswered ubus has to fail the
+// apply instead of producing an unrestricted rule.
+function lan_device() {
+	let ubus = connect();
+	if (!ubus)
+		return '';
+	let lan = ubus.call('network.interface.lan', 'status') || {};
+	ubus.disconnect();
+	let device = trim('' + (lan.l3_device || lan.device || ''));
+	return match(device, /^[A-Za-z0-9._-]+$/) ? device : '';
+}
+
+// Two different jobs, two different sources. The redirect captures everything
+// arriving from the LAN and knows nothing about devices. The kill switch holds
+// only the devices named in a rule, and holds them whether or not the proxy is
+// running — releasing one means deleting its rule.
+//
+// The redirect itself is the part tied to the master switch: pointing traffic
+// at a port nothing listens on would swallow it silently, so switching Zarap
+// off drops the rule and the LAN forwards normally again.
+function nft_config(guarded_ips, lan, proxying) {
 	let direct = direct_networks();
 	let text = '# Generated by Zarap. Manual changes will be overwritten.\n';
 
-	text += nft_set('zarap_clients_v4', 'ipv4_addr', '', ips);
-	text += nft_set('zarap_clients_mac', 'ether_addr', '', macs);
+	text += nft_set('zarap_guarded_v4', 'ipv4_addr', '', guarded_ips);
 	text += nft_set('zarap_direct_v4', 'ipv4_addr', 'interval', direct.v4);
 	text += nft_set('zarap_direct_v6', 'ipv6_addr', 'interval', direct.v6);
 	text += 'chain zarap_prerouting {\n';
 	text += '\ttype filter hook prerouting priority mangle; policy accept;\n';
-	text += '\tip saddr @zarap_clients_v4 ip daddr @zarap_direct_v4 return\n';
+	// Keeps the router itself, traffic between LAN subnets, multicast and
+	// broadcast out of the capture. Without it dnsmasq's own port goes to TProxy.
+	text += '\tiifname "' + lan + '" ip daddr @zarap_direct_v4 return\n';
 	if (proxying)
-		text += '\tip saddr @zarap_clients_v4 meta l4proto { tcp, udp } meta mark set 0x5a52 tproxy ip to 127.0.0.1:' + listen_port + ' accept\n';
+		text += '\tiifname "' + lan + '" meta l4proto { tcp, udp } meta mark set ' + MARK + ' tproxy ip to 127.0.0.1:' + CAPTURE_PORT + ' accept\n';
 	text += '}\n\n';
 	text += 'chain zarap_killswitch_forward {\n';
 	text += '\ttype filter hook forward priority filter + 10; policy accept;\n';
-	text += '\tip saddr @zarap_clients_v4 ip daddr @zarap_direct_v4 return\n';
-	text += '\tip saddr @zarap_clients_v4 reject\n';
-	text += '\tether saddr @zarap_clients_mac ether type ip6 ip6 daddr @zarap_direct_v6 return\n';
-	text += '\tether saddr @zarap_clients_mac ether type ip6 reject\n';
+	text += '\tip saddr @zarap_guarded_v4 ip daddr @zarap_direct_v4 return\n';
+	text += '\tip saddr @zarap_guarded_v4 reject\n';
+	// IPv6 is not proxied, and it is not handed out to the LAN either, so there
+	// is no device to single out here: the whole LAN is barred from routing it.
+	// That also covers an address someone configured by hand.
+	text += '\tiifname "' + lan + '" ether type ip6 ip6 daddr @zarap_direct_v6 return\n';
+	text += '\tiifname "' + lan + '" ether type ip6 reject\n';
 	text += '}\n\n';
 	text += 'chain zarap_protect_tproxy {\n';
 	text += '\ttype filter hook input priority filter - 10; policy accept;\n';
-	text += '\tmeta l4proto { tcp, udp } th dport ' + listen_port + ' meta mark != 0x5a52 drop\n';
+	text += '\tmeta l4proto { tcp, udp } th dport ' + CAPTURE_PORT + ' meta mark != ' + MARK + ' drop\n';
 	text += '}\n';
 	return text;
 }
@@ -435,43 +652,56 @@ function resolve_static_leases(clients) {
 	return { ok: true, clients: result };
 }
 
-function configure_uci(uci, parsed, enabled, clients) {
+function configure_uci(uci, outbounds, rules, final, enabled, clients) {
 	uci.load('zarap');
 	uci.set('zarap', 'main', 'zarap');
 	uci.set('zarap', 'main', 'enabled', enabled ? '1' : '0');
-	for (let key in ['name', 'server', 'server_port', 'uuid', 'flow', 'server_name', 'public_key', 'short_id', 'fingerprint'])
-		uci.set('zarap', 'main', key, '' + parsed[key]);
-	uci.set('zarap', 'main', 'listen_port', '7893');
-	uci.set('zarap', 'main', 'mark', '0x5a52');
-	uci.set('zarap', 'main', 'route_table', '2022');
+	uci.set('zarap', 'main', 'final', final);
+	// Leftovers from the single-connection schema and from the three options
+	// that only ever looked like settings.
+	for (let key in ['name', 'server', 'server_port', 'uuid', 'flow', 'server_name',
+	                 'public_key', 'short_id', 'fingerprint',
+	                 'listen_port', 'mark', 'route_table'])
+		uci.delete('zarap', 'main', key);
 
-	let old_clients = [];
-	uci.foreach('zarap', 'client', function(section) { push(old_clients, section['.name']); });
-	for (let section in old_clients)
+	// The whole set is rewritten on every apply, which is also what makes the
+	// order of the rule sections the order of the rules.
+	let stale = [];
+	for (let kind in ['outbound', 'rule', 'client'])
+		uci.foreach('zarap', kind, function(section) { push(stale, section['.name']); });
+	for (let section in stale)
 		uci.delete('zarap', section);
-	for (let client in clients) {
-		let section = uci.add('zarap', 'client');
-		uci.set('zarap', section, 'mac', client.mac);
-		uci.set('zarap', section, 'ip', client.ip);
-		uci.set('zarap', section, 'name', client.name);
+
+	for (let outbound in outbounds) {
+		uci.set('zarap', outbound.tag, 'outbound');
+		uci.set('zarap', outbound.tag, 'label', outbound.label);
+		uci.set('zarap', outbound.tag, 'type', 'vless');
+		for (let key in ['server', 'server_port', 'uuid', 'flow', 'server_name',
+		                 'public_key', 'short_id', 'fingerprint'])
+			uci.set('zarap', outbound.tag, key, '' + outbound[key]);
+	}
+	for (let rule in rules) {
+		let section = uci.add('zarap', 'rule');
+		uci.set('zarap', section, 'client', rule.clients);
+		uci.set('zarap', section, 'target', rule.target);
 	}
 	uci.load('dhcp');
 
 	// Zarap marks the static leases it creates with zarap_managed. Nothing ever
-	// removed them, so a device kept its pinned address after being deselected
+	// removed them, so a device kept its pinned address after its rule was gone
 	// and there was no way to release it from the interface. Drop the marked
-	// leases whose device is no longer in the list; the ones still selected stay,
-	// because resolve_static_leases has already recognised them.
+	// leases whose device is no longer named by any rule; the ones still named
+	// stay, because resolve_static_leases has already recognised them.
 	let selected = {};
 	for (let client in clients)
 		selected[client.mac] = true;
-	let stale = [];
+	let stale_leases = [];
 	uci.foreach('dhcp', 'host', function(section) {
 		let raw_mac = type(section.mac) == 'array' ? section.mac[0] : section.mac;
 		if (section.zarap_managed == '1' && !selected[normalize_mac(raw_mac)])
-			push(stale, section['.name']);
+			push(stale_leases, section['.name']);
 	});
-	for (let section in stale)
+	for (let section in stale_leases)
 		uci.delete('dhcp', section);
 
 	for (let client in clients) {
@@ -483,6 +713,23 @@ function configure_uci(uci, parsed, enabled, clients) {
 		uci.set('dhcp', section, 'mac', client.mac);
 		uci.set('dhcp', section, 'ip', client.ip);
 		uci.set('dhcp', section, 'zarap_managed', '1');
+	}
+
+	// The capture is IPv4 only, so an advertised IPv6 would be a path around
+	// sing-box for the whole LAN. Not handing it out beats rejecting it packet
+	// by packet: a device that never gets a global address never tries to use
+	// one, instead of falling back to IPv4 on every connection.
+	//
+	// This holds whether or not Zarap is enabled, to match the blanket IPv6
+	// reject in the kill switch chain — restoring advertisement while that rule
+	// stands would hand out addresses that cannot work.
+	for (let key in ['ra', 'dhcpv6', 'ndp']) {
+		let previous = uci.get('dhcp', 'lan', key);
+		// Recorded once, on the first apply, so removing the package can put
+		// back what the router had rather than a guess at the default.
+		if (uci.get('zarap', 'main', 'saved_' + key) == null)
+			uci.set('zarap', 'main', 'saved_' + key, previous == null ? '' : previous);
+		uci.set('dhcp', 'lan', key, 'disabled');
 	}
 	uci.load('sing-box');
 	uci.set('sing-box', 'main', 'sing-box');
@@ -500,7 +747,7 @@ function cleanup_uci_candidate() {
 	}
 }
 
-function prepare_uci_candidate(parsed, enabled, clients) {
+function prepare_uci_candidate(outbounds, rules, final, enabled, clients) {
 	mkdir(UCI_CANDIDATE);
 	chmod(UCI_CANDIDATE, 0700);
 	mkdir(UCI_CANDIDATE_DELTA);
@@ -516,7 +763,7 @@ function prepare_uci_candidate(parsed, enabled, clients) {
 	}
 
 	let candidate = cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA);
-	if (!configure_uci(candidate, parsed, enabled, clients)) {
+	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients)) {
 		cleanup_uci_candidate();
 		return result_error('Не удалось сформировать временный UCI-кандидат', '', 'startup_error');
 	}
@@ -537,44 +784,89 @@ function activate_uci_candidate() {
 	return true;
 }
 
-function read_clients() {
-	let uci = cursor(), clients = [];
+function saved_outbounds() {
+	let uci = cursor(), outbounds = [];
 	uci.load('zarap');
-	uci.foreach('zarap', 'client', function(section) {
-		push(clients, {
-			mac: normalize_mac(section.mac) || '',
-			ip: section.ip || '',
-			name: section.name || ''
+	uci.foreach('zarap', 'outbound', function(section) {
+		let tag = section['.name'];
+		if (!valid_outbound_tag(tag))
+			return;
+		push(outbounds, {
+			tag: tag,
+			label: section.label || '',
+			server: section.server || '',
+			server_port: int(section.server_port || 0),
+			uuid: section.uuid || '',
+			flow: section.flow || '',
+			server_name: section.server_name || '',
+			public_key: section.public_key || '',
+			short_id: section.short_id || '',
+			fingerprint: section.fingerprint || 'chrome'
 		});
 	});
-	return clients;
+	return outbounds;
 }
 
-function saved_proxy_config() {
+// The order of the sections in the file is the order of the rules, and the
+// first match wins — so this must not be sorted or deduplicated on the way out.
+function saved_rules() {
+	let uci = cursor(), rules = [];
+	uci.load('zarap');
+	uci.foreach('zarap', 'rule', function(section) {
+		let raw = section.client;
+		if (type(raw) != 'array')
+			raw = raw ? [raw] : [];
+		let clients = [];
+		for (let value in raw) {
+			let mac = normalize_mac(value);
+			if (mac)
+				push(clients, mac);
+		}
+		push(rules, { clients: clients, target: section.target || '' });
+	});
+	return rules;
+}
+
+function saved_final() {
 	let uci = cursor();
 	uci.load('zarap');
-	let server = uci.get('zarap', 'main', 'server') || '';
-	if (!server)
-		return null;
-	return {
-		name: uci.get('zarap', 'main', 'name') || '',
-		server: server,
-		server_port: int(uci.get('zarap', 'main', 'server_port') || 0),
-		uuid: uci.get('zarap', 'main', 'uuid') || '',
-		flow: uci.get('zarap', 'main', 'flow') || '',
-		server_name: uci.get('zarap', 'main', 'server_name') || '',
-		public_key: uci.get('zarap', 'main', 'public_key') || '',
-		short_id: uci.get('zarap', 'main', 'short_id') || '',
-		fingerprint: uci.get('zarap', 'main', 'fingerprint') || 'chrome'
-	};
+	return uci.get('zarap', 'main', 'final') || 'direct';
 }
 
-function masked_proxy(parsed) {
-	if (!parsed)
+// Every device named by a rule is guarded, whatever that rule targets, and it
+// stays guarded until the last rule naming it is deleted.
+function guarded_macs(rules) {
+	let macs = {};
+	for (let rule in rules)
+		for (let mac in rule.clients)
+			macs[mac] = true;
+	return macs;
+}
+
+function lease_addresses() {
+	let leases = static_leases(), address_of = {};
+	for (let mac, lease in leases.by_mac)
+		address_of[mac] = lease.ip;
+	return address_of;
+}
+
+// Which target a device's traffic actually reaches: the first rule naming it
+// wins, and a device no rule names falls through to the configured remainder.
+function resolved_target(mac, rules, final) {
+	for (let rule in rules)
+		for (let named in rule.clients)
+			if (named == mac)
+				return rule.target;
+	return final;
+}
+
+function masked_link(outbound) {
+	if (!outbound)
 		return '';
-	return 'vless://********@' + parsed.server + ':' + parsed.server_port +
-		'?security=reality&type=tcp&sni=' + parsed.server_name +
-		(parsed.flow ? '&flow=' + parsed.flow : '') + '#' + (parsed.name || 'Zarap');
+	return 'vless://********@' + outbound.server + ':' + outbound.server_port +
+		'?security=reality&type=tcp&sni=' + outbound.server_name +
+		(outbound.flow ? '&flow=' + outbound.flow : '') +
+		'#' + (outbound.label || 'Zarap');
 }
 
 function tproxy_listening() {
@@ -624,11 +916,25 @@ function recent_connection_error() {
 	return false;
 }
 
-function validate_candidate(parsed, clients, proxying) {
+function validate_candidate(outbounds, rules, final, clients, proxying) {
+	let lan = lan_device();
+	// A redirect without an interface condition would capture traffic arriving
+	// from the WAN, so an unanswered ubus has to fail the apply outright.
+	if (!lan)
+		return result_error('Не удалось определить LAN-интерфейс через ubus', '', 'startup_error');
+
+	let address_of = {};
+	for (let client in clients)
+		address_of[client.mac] = client.ip;
+	let guarded = [];
+	for (let mac in guarded_macs(rules))
+		if (address_of[mac])
+			push(guarded, address_of[mac]);
+
 	mkdir('/etc/zarap');
 	chmod('/etc/zarap', 0700);
-	let sing_box = sprintf('%J', sing_box_config(parsed, 7893)) + '\n';
-	let nft = nft_config(clients, 7893, proxying);
+	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of)) + '\n';
+	let nft = nft_config(guarded, lan, proxying);
 	let config_written = writefile(CONFIG_TMP, sing_box);
 	let nft_written = writefile(NFT_TMP, nft);
 	if (config_written == null || nft_written == null) {
@@ -649,7 +955,7 @@ function validate_candidate(parsed, clients, proxying) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
 		return result_error('nftables отклонил сгенерированные правила', '', 'compatibility_error');
 	}
-	return { ok: true, sing_box: sing_box, nft: nft };
+	return { ok: true, sing_box: sing_box, nft: nft, guarded: guarded, lan: lan };
 }
 
 // firewall4 rebuilds the chains from the generated file but leaves the contents
@@ -658,15 +964,10 @@ function validate_candidate(parsed, clients, proxying) {
 // the previous addresses in the kernel, so a deselected device stayed in the
 // kill switch and kept having its traffic sent to a TProxy port nothing was
 // listening on. Drive the live sets to the intended contents explicitly.
-function sync_live_sets(clients) {
-	let ips = [], macs = [], direct = direct_networks();
-	for (let client in clients) {
-		if (client.ip) push(ips, client.ip);
-		if (client.mac) push(macs, client.mac);
-	}
+function sync_live_sets(guarded_ips) {
+	let direct = direct_networks();
 	let wanted = {
-		zarap_clients_v4: ips,
-		zarap_clients_mac: macs,
+		zarap_guarded_v4: guarded_ips,
 		zarap_direct_v4: direct.v4,
 		zarap_direct_v6: direct.v6
 	};
@@ -689,12 +990,12 @@ function sync_live_sets(clients) {
 
 // Reads back what the kernel holds, so an apply cannot report success while the
 // device is still caught by rules that were only cleared on paper.
-function live_clients_match(clients) {
-	let live = capture('/usr/sbin/nft list set inet fw4 zarap_clients_v4').output;
-	for (let client in clients)
-		if (client.ip && index(live, client.ip) < 0)
+function live_clients_match(guarded_ips) {
+	let live = capture('/usr/sbin/nft list set inet fw4 zarap_guarded_v4').output;
+	for (let address in guarded_ips)
+		if (index(live, address) < 0)
 			return false;
-	if (!length(clients) && index(live, 'elements') >= 0)
+	if (!length(guarded_ips) && index(live, 'elements') >= 0)
 		return false;
 	return true;
 }
@@ -710,8 +1011,12 @@ function rollback(backups) {
 	chmod('/etc/config/zarap', 0600);
 	unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
 	if (system(['/etc/init.d/firewall', 'reload']) != 0) ok = false;
-	// The restored selection keeps its kill switch whatever the master switch says.
-	let resynced = sync_live_sets(read_clients());
+	// The restored rules keep their kill switch whatever the master switch says.
+	let restored_addresses = lease_addresses(), restored_guarded = [];
+	for (let mac in guarded_macs(saved_rules()))
+		if (restored_addresses[mac])
+			push(restored_guarded, restored_addresses[mac]);
+	let resynced = sync_live_sets(restored_guarded);
 	if (!resynced.ok) {
 		system('/usr/bin/logger -t zarap "nft sync failed during rollback: ' + replace(resynced.output, /"/g, "'") + '"');
 		ok = false;
@@ -744,7 +1049,7 @@ function restore_update_files(backups, restart_proxy) {
 
 function resource_conflict() {
 	let listeners = capture('/usr/sbin/ss -H -lntup sport = :7893').output;
-	if (listeners && (!saved_proxy_config() || index(lc(listeners), 'sing-box') < 0))
+	if (listeners && (!length(saved_outbounds()) || index(lc(listeners), 'sing-box') < 0))
 		return result_error('Порт 7893 уже занят другим процессом');
 
 	let routes = capture('/sbin/ip -4 route show table 2022').output;
@@ -771,35 +1076,70 @@ function resource_conflict() {
 	return { ok: true };
 }
 
-function apply_configuration(args) {
-	let link = trim('' + (args?.link || ''));
-	let parsed_result;
-	if (link) {
-		parsed_result = parse_vless(link);
-		if (!parsed_result.ok)
-			return parsed_result;
-	}
-	else {
-		let saved = saved_proxy_config();
-		if (!saved)
-			return input_error('Для первоначальной настройки вставьте VLESS Reality-ссылку');
-		parsed_result = { ok: true, config: saved };
-	}
+// Everything both apply and validate have to agree on, in one place: the
+// connections, the rules that point at them, the leases the rules depend on and
+// the target for whatever no rule matched.
+function validate_request(args, enabled) {
+	let outbound_result = validate_outbounds(args?.outbounds);
+	if (!outbound_result.ok)
+		return outbound_result;
+	let outbounds = outbound_result.outbounds;
+
+	let tags = {};
+	for (let outbound in outbounds)
+		tags[outbound.tag] = true;
+
+	let rule_result = validate_rules(args?.rules, tags);
+	if (!rule_result.ok)
+		return rule_result;
+	let rules = rule_result.rules;
+
+	let final = trim('' + (args?.final || 'direct'));
+	if (!valid_target(final, tags))
+		return input_error('Некорректная цель для остального трафика: ' + (final || '—'));
+
+	// Capturing the whole LAN with nowhere to send it would put the household
+	// through sing-box only to hand it straight back out.
+	if (enabled && !length(outbounds))
+		return input_error('Добавьте хотя бы одно подключение');
+
 	let client_result = validate_clients(args?.clients);
 	if (!client_result.ok)
 		return client_result;
+
+	// A rule names a MAC; the address comes from the static lease, so every
+	// device under a rule has to have one.
+	let offered = {};
+	for (let client in client_result.clients)
+		offered[client.mac] = true;
+	for (let mac in guarded_macs(rules))
+		if (!offered[mac])
+			return input_error('Для устройства ' + mac + ' не указан статический IPv4-адрес');
+
 	client_result = resolve_static_leases(client_result.clients);
 	if (!client_result.ok)
 		return client_result;
+
+	return { ok: true, outbounds: outbounds, rules: rules, final: final,
+		clients: client_result.clients };
+}
+
+function apply_configuration(args) {
+	let enabled = !!args?.enabled;
+	let request = validate_request(args, enabled);
+	if (!request.ok)
+		return request;
+
 	let conflict = resource_conflict();
 	if (!conflict.ok)
 		return conflict;
 
-	let enabled = !!args?.enabled;
-	let candidate = validate_candidate(parsed_result.config, client_result.clients, enabled);
+	let candidate = validate_candidate(request.outbounds, request.rules, request.final,
+		request.clients, enabled);
 	if (!candidate.ok)
 		return candidate;
-	let uci_candidate = prepare_uci_candidate(parsed_result.config, enabled, client_result.clients);
+	let uci_candidate = prepare_uci_candidate(request.outbounds, request.rules,
+		request.final, enabled, request.clients);
 	if (!uci_candidate.ok) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
 		return uci_candidate;
@@ -838,11 +1178,12 @@ function apply_configuration(args) {
 			'Критическая ошибка firewall4 и rollback; загруженный kill switch не отключался', '', 'startup_error');
 	}
 
-	// Selected devices stay in the sets even with Zarap switched off; releasing
-	// one means deselecting it, which is the only thing that opens its WAN path.
-	let live_clients = client_result.clients;
-	let synced = sync_live_sets(live_clients);
-	if (!synced.ok || !live_clients_match(live_clients)) {
+	// Devices under a rule stay in the set even with Zarap switched off;
+	// releasing one means deleting its rule, which is the only thing that opens
+	// its WAN path.
+	let live_guarded = candidate.guarded;
+	let synced = sync_live_sets(live_guarded);
+	if (!synced.ok || !live_clients_match(live_guarded)) {
 		let restored = rollback(backups);
 		return result_error(restored ? 'Правила firewall в ядре не совпали с сохранёнными; восстановлена предыдущая конфигурация' :
 			'Критическая ошибка синхронизации правил и rollback; kill switch оставлен активным',
@@ -872,14 +1213,49 @@ function apply_configuration(args) {
 			'Критическая ошибка проверки и rollback; kill switch оставлен активным', sprintf('%J', health), 'startup_error');
 	}
 
-	return { ok: true, enabled: enabled, clients: client_result.clients, health: health };
+	return { ok: true, enabled: enabled, clients: request.clients, health: health };
 }
 
-function device_list() {
-	let devices = {}, selected = {}, leases = static_leases();
+// The capture covers the whole LAN, so a rule can name any device on it, not
+// just a Wi-Fi client. Leases are therefore the base of the list — they know
+// about wired hosts — and hostapd only adds what leases cannot tell: whether a
+// station is associated right now, and on which radio.
+function device_list(rules, final) {
+	let devices = {}, leases = static_leases();
 	let dynamic_leases = current_dhcp_leases();
-	for (let client in read_clients())
-		selected[client.mac] = client;
+	let guarded = guarded_macs(rules);
+
+	function record(mac) {
+		if (!devices[mac]) {
+			let lease = leases.by_mac[mac] || {};
+			let dynamic = dynamic_leases[mac] || {};
+			devices[mac] = {
+				mac: mac,
+				name: lease.name || dynamic.name || ('Устройство ' + mac),
+				ip: lease.ip || dynamic.ip || '',
+				connected: false,
+				wireless: false,
+				has_static_lease: !!lease.ip,
+				private_mac: is_private_mac(mac),
+				guarded: !!guarded[mac],
+				resolved_target: resolved_target(mac, rules, final)
+			};
+		}
+		return devices[mac];
+	}
+
+	for (let mac in leases.by_mac)
+		record(mac);
+	for (let mac in dynamic_leases) {
+		let device = record(mac);
+		// A current lease is not proof of presence, but it is the best the DHCP
+		// server can say about a wired host.
+		device.connected = true;
+	}
+	// A device named by a rule belongs in the list even with no lease at all,
+	// or the rule would refer to something the page cannot show.
+	for (let mac in guarded)
+		record(mac);
 
 	let ubus = connect();
 	if (ubus) {
@@ -891,39 +1267,15 @@ function device_list() {
 			for (let raw_mac, station in (response.clients || {})) {
 				let mac = normalize_mac(raw_mac);
 				if (!mac) continue;
-				let lease = leases.by_mac[mac] || {};
-				let dynamic = dynamic_leases[mac] || {};
-				devices[mac] = {
-					mac: mac,
-					name: lease.name || dynamic.name || selected[mac]?.name || ('Устройство ' + mac),
-					ip: lease.ip || dynamic.ip || selected[mac]?.ip || '',
-					connected: true,
-					wireless: true,
-					network: substr(object, 8),
-					signal: station?.signal || 0,
-					has_static_lease: !!lease.ip,
-					private_mac: is_private_mac(mac),
-					selected: !!selected[mac]
-				};
+				let device = record(mac);
+				device.connected = true;
+				device.wireless = true;
+				device.network = substr(object, 8);
+				device.signal = station?.signal || 0;
 			}
 		}
 		ubus.disconnect();
 	}
-
-	for (let mac, client in selected)
-		if (!devices[mac]) {
-			let lease = leases.by_mac[mac] || {};
-			devices[mac] = {
-				mac: mac,
-				name: lease.name || client.name || ('Устройство ' + mac),
-				ip: lease.ip || client.ip,
-				connected: false,
-				wireless: true,
-				has_static_lease: !!lease.ip,
-				private_mac: is_private_mac(mac),
-				selected: true
-			};
-		}
 
 	let result = [];
 	for (let mac, device in devices)
@@ -945,10 +1297,11 @@ function status() {
 	let uci = cursor();
 	uci.load('zarap');
 	let enabled = uci.get('zarap', 'main', 'enabled') == '1';
-	let configured = !!uci.get('zarap', 'main', 'server');
+	let outbounds = saved_outbounds(), rules = saved_rules(), final = saved_final();
+	let configured = length(outbounds) > 0;
 	let health = check_runtime(enabled);
 	let state = 'disabled', message = 'Zarap выключен';
-	let held = !enabled && length(read_clients()) > 0;
+	let held = !enabled && length(guarded_macs(rules)) > 0;
 	if (!configured) {
 		state = 'not_configured';
 		message = unmanaged_sing_box() ?
@@ -972,9 +1325,24 @@ function status() {
 		message = 'Zarap работает';
 	}
 	else if (held) {
-		message = 'Zarap выключен. Отмеченные устройства остаются без выхода в интернет: kill switch не пускает их напрямую. Снимите отметку с устройства, чтобы вернуть ему прямой доступ';
+		message = 'Zarap выключен. Устройства с правилами остаются без выхода в интернет: kill switch не пускает их напрямую. Удалите правило, чтобы вернуть устройству прямой доступ';
 	}
-	let saved = saved_proxy_config();
+
+	let in_use = {};
+	if (final != 'direct' && final != 'block')
+		in_use[final] = true;
+	for (let rule in rules)
+		if (rule.target != 'direct' && rule.target != 'block')
+			in_use[rule.target] = true;
+
+	let listed = [];
+	for (let outbound in outbounds)
+		push(listed, {
+			tag: outbound.tag,
+			label: outbound.label,
+			masked_link: masked_link(outbound),
+			in_use: !!in_use[outbound.tag]
+		});
 
 	return {
 		ok: true,
@@ -986,19 +1354,22 @@ function status() {
 		listener: health.listener,
 		firewall: health.firewall,
 		routing: health.routing,
-		masked_link: masked_proxy(saved),
-		devices: device_list()
+		outbounds: listed,
+		rules: rules,
+		final: final,
+		capture: { interface: lan_device(), active: enabled && health.listener },
+		devices: device_list(rules, final)
 	};
 }
 
 function logs() {
-	let uci = cursor();
-	uci.load('zarap');
-	let secrets = [
-		uci.get('zarap', 'main', 'uuid') || '',
-		uci.get('zarap', 'main', 'public_key') || '',
-		uci.get('zarap', 'main', 'short_id') || ''
-	];
+	// Every connection, not just the first: missing one would put the uuid of a
+	// second proxy into the log the user copies out.
+	let secrets = [];
+	for (let outbound in saved_outbounds())
+		for (let key in ['uuid', 'public_key', 'short_id'])
+			if (outbound[key])
+				push(secrets, outbound[key]);
 	let output = capture('/sbin/logread -e zarap -e sing-box').output;
 	let lines = split(output, '\n');
 	if (length(lines) > 200)
@@ -1142,28 +1513,30 @@ function update_component(name) {
 const methods = {
 	status: { call: function() { return status(); } },
 	validate: {
-		args: { link: '', clients: [] },
+		args: { outbounds: [], rules: [], clients: [], final: '' },
 		call: function(request) {
-			let link = trim('' + (request.args?.link || ''));
-			let parsed = link ? parse_vless(link) : { ok: true, config: saved_proxy_config() };
-			if (!parsed.ok) return parsed;
-			if (!parsed.config) return input_error('Для первоначальной проверки вставьте VLESS Reality-ссылку');
-			let clients = validate_clients(request.args?.clients);
-			if (!clients.ok) return clients;
-			clients = resolve_static_leases(clients.clients);
-			if (!clients.ok) return clients;
+			let checked = validate_request(request.args || {}, true);
+			if (!checked.ok) return checked;
 			let conflict = resource_conflict();
 			if (!conflict.ok) return conflict;
-			let candidate = validate_candidate(parsed.config, clients.clients, true);
+			let candidate = validate_candidate(checked.outbounds, checked.rules,
+				checked.final, checked.clients, true);
 			if (!candidate.ok) return candidate;
-			let uci_candidate = prepare_uci_candidate(parsed.config, true, clients.clients);
+			let uci_candidate = prepare_uci_candidate(checked.outbounds, checked.rules,
+				checked.final, true, checked.clients);
 			unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
 			if (!uci_candidate.ok) return uci_candidate;
-			return { ok: true, masked_link: masked_proxy(parsed.config), clients: length(clients.clients) };
+			return {
+				ok: true,
+				outbounds: length(checked.outbounds),
+				rules: length(checked.rules),
+				clients: length(checked.clients),
+				capture: candidate.lan
+			};
 		}
 	},
 	apply: {
-		args: { link: '', enabled: true, clients: [] },
+		args: { enabled: true, outbounds: [], rules: [], clients: [], final: '' },
 		call: function(request) {
 			let lock = acquire_lock();
 			if (!lock) return result_error('Другая операция Zarap уже выполняется');

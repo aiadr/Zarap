@@ -35,8 +35,10 @@ function connect() {
 }
 """
 
-CLIENTS = ("[ { ip: '192.168.10.167', mac: 'EA:76:7F:24:D1:79' },"
-           "  { ip: '192.168.10.42', mac: '00:11:22:33:44:55' } ]")
+# The kill switch set now holds the addresses of devices named in rules; the
+# capture no longer looks at them at all.
+GUARDED = "[ '192.168.10.167', '192.168.10.42' ]"
+LAN = "'br-lan'"
 
 
 class NftRulesTests(unittest.TestCase):
@@ -47,7 +49,10 @@ class NftRulesTests(unittest.TestCase):
             raise unittest.SkipTest("no ucode interpreter available")
         cls.nft_command = cls.resolve_nft()
         source = BACKEND.read_text()
-        cls.prelude = UBUS_STUB + "\n".join(
+        constants = "\n".join(
+            line for line in source.splitlines()
+            if line.startswith(("const CAPTURE_PORT", "const MARK ")))
+        cls.prelude = UBUS_STUB + constants + "\n" + "\n".join(
             lift(source, name)
             for name in ("valid_ipv4", "network_v4", "v4_covered", "nft_set",
                          "direct_networks", "nft_config"))
@@ -75,8 +80,9 @@ class NftRulesTests(unittest.TestCase):
             raise unittest.SkipTest(f"cannot run nft: {done.stderr.strip()}")
         return command
 
-    def generate(self, clients=CLIENTS, proxying="true"):
-        script = "%s\nprint(nft_config(%s, 7893, %s));\n" % (self.prelude, clients, proxying)
+    def generate(self, guarded=GUARDED, proxying="true", lan=LAN):
+        script = "%s\nprint(nft_config(%s, %s, %s));\n" % (
+            self.prelude, guarded, lan, proxying)
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name
@@ -103,7 +109,7 @@ class NftRulesTests(unittest.TestCase):
         done = self.check(self.generate())
         self.assertEqual(done.returncode, 0, done.stderr)
 
-    def test_nftables_accepts_a_ruleset_with_no_clients(self):
+    def test_nftables_accepts_a_ruleset_with_no_guarded_devices(self):
         done = self.check(self.generate("[]"))
         self.assertEqual(done.returncode, 0, done.stderr)
 
@@ -172,7 +178,7 @@ const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
             "\n".join(lift(BACKEND.read_text(), name)
                        for name in ("valid_ipv4", "network_v4", "v4_covered",
                                     "direct_networks", "sync_live_sets")),
-            CLIENTS)
+            GUARDED)
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name
@@ -183,7 +189,7 @@ const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
         finally:
             os.unlink(path)
 
-        self.assertIn("flush set inet fw4 zarap_clients_v4", rendered)
+        self.assertIn("flush set inet fw4 zarap_guarded_v4", rendered)
         self.assertIn("192.168.10.167", rendered)
         self.assertNotIn("192.168.10.0/24", rendered)
 
@@ -193,8 +199,7 @@ const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
         # Zarap since before that flag existed still has the plain interval set
         # — and that is where the overlapping element was rejected.
         setup = ("table inet zarap_selftest {\n"
-                 "\tset zarap_clients_v4 { type ipv4_addr\n\t}\n"
-                 "\tset zarap_clients_mac { type ether_addr\n\t}\n"
+                 "\tset zarap_guarded_v4 { type ipv4_addr\n\t}\n"
                  "\tset zarap_direct_v4 { type ipv4_addr\n\t\tflags interval\n\t}\n"
                  "\tset zarap_direct_v6 { type ipv6_addr\n\t\tflags interval\n\t}\n}\n")
 
@@ -218,10 +223,9 @@ const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
             subprocess.run(self.nft_command + ["delete", "table", *table],
                            capture_output=True, text=True)
 
-    def test_generated_sets_carry_the_client_data(self):
+    def test_generated_sets_carry_the_guarded_addresses(self):
         ruleset = self.generate()
         self.assertIn("192.168.10.167", ruleset)
-        self.assertIn("EA:76:7F:24:D1:79", ruleset)
         # The LAN already sits inside 192.168.0.0/16, so emitting it again
         # would only create an overlap an interval set refuses.
         self.assertNotIn("192.168.10.0/24", ruleset)
@@ -229,18 +233,53 @@ const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
 
     def test_tproxy_and_kill_switch_rules_are_present(self):
         ruleset = self.generate()
+        self.assertIn('iifname "br-lan" meta l4proto { tcp, udp }', ruleset)
         self.assertIn("tproxy ip to 127.0.0.1:7893", ruleset)
-        self.assertIn("ip saddr @zarap_clients_v4 reject", ruleset)
-        self.assertIn("ether saddr @zarap_clients_mac ether type ip6 reject", ruleset)
+        self.assertIn("ip saddr @zarap_guarded_v4 reject", ruleset)
 
     def test_switching_the_proxy_off_keeps_the_kill_switch(self):
         # Rejecting outright beats redirecting to a port nothing listens on.
         ruleset = self.generate(proxying="false")
         self.assertNotIn("tproxy ip to", ruleset)
         self.assertNotIn("meta mark set", ruleset)
-        self.assertIn("ip saddr @zarap_clients_v4 reject", ruleset)
+        self.assertIn("ip saddr @zarap_guarded_v4 reject", ruleset)
         self.assertIn("192.168.10.167", ruleset)
         self.assertEqual(self.check(ruleset).returncode, 0)
+
+    def test_capture_does_not_depend_on_the_guarded_devices(self):
+        """Invariant 1: capture is a property of the network, not of a device.
+
+        The redirect matches on the LAN interface, so the chain has to come out
+        identical whatever the rule list says. Nothing may thread a device into
+        it — that is how a rule targeting `direct` would end up bypassing TProxy
+        and handing the device a path out through forward.
+        """
+        def prerouting(ruleset):
+            body = ruleset.split("chain zarap_prerouting {", 1)[1]
+            return body.split("}", 1)[0]
+
+        empty = prerouting(self.generate("[]"))
+        one = prerouting(self.generate("[ '192.168.10.167' ]"))
+        many = prerouting(self.generate())
+        self.assertEqual(empty, one)
+        self.assertEqual(one, many)
+
+    def test_ipv6_is_barred_for_the_whole_lan(self):
+        """IPv6 is not handed out at all, so there is no device to single out.
+
+        The blanket rule also covers an address configured by hand, which is
+        what the per-MAC set used to be kept for.
+        """
+        for guarded in ("[]", GUARDED):
+            ruleset = self.generate(guarded)
+            self.assertIn('iifname "br-lan" ether type ip6 reject', ruleset)
+            self.assertNotIn("ether saddr", ruleset)
+            self.assertNotIn("zarap_guarded_mac", ruleset)
+
+    def test_an_unguarded_device_is_absent_from_the_kill_switch(self):
+        ruleset = self.generate("[ '192.168.10.167' ]")
+        self.assertIn("192.168.10.167", ruleset)
+        self.assertNotIn("192.168.10.42", ruleset)
 
 
 if __name__ == "__main__":

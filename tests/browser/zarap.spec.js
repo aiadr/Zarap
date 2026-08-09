@@ -7,6 +7,12 @@ async function openZarap(page) {
   await expect.poll(() => page.locator('body').getAttribute('data-ready')).toBe('true');
 }
 
+// Components and the log live on the second tab; configuration is on the first.
+async function openMaintenance(page) {
+  await page.getByRole('link', { name: 'Обслуживание' }).click();
+  await expect(page.locator('#zarap-tab-maintenance')).toBeVisible();
+}
+
 test('renders status and enforces private MAC restriction', async ({ page }) => {
   await openZarap(page);
 
@@ -16,14 +22,27 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
   await expect(page.getByText('kill switch активен')).toBeVisible();
   await expect(page.getByText('маршрутизация активна')).toBeVisible();
 
-  await expect(page.locator('#zarap-devices tbody tr')).toHaveCount(3);
-  const privateDevice = page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"]');
-  await expect(privateDevice.getByRole('checkbox')).toBeDisabled();
-  await expect(privateDevice).toContainText('Приватный MAC');
+  await expect(page.getByText('Захват трафика: интерфейс br-lan')).toBeVisible();
 
-  const selectedDevice = page.locator('tr[data-mac="00:11:22:33:44:55"]');
-  await expect(selectedDevice.getByRole('checkbox')).toBeChecked();
-  await expect(selectedDevice).toContainText('kill switch');
+  // Configuration opens first; maintenance is a click away.
+  await expect(page.locator('#zarap-tab-setup')).toBeVisible();
+  await expect(page.locator('#zarap-tab-maintenance')).toBeHidden();
+
+  await expect(page.locator('#zarap-devices tbody tr')).toHaveCount(4);
+  const privateDevice = page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"]');
+  await expect(privateDevice).toContainText('Приватный MAC');
+  // Not named by any rule, so it carries no lease to edit and no kill switch.
+  await expect(privateDevice.locator('input[data-field="ip"]')).toHaveCount(0);
+  await expect(privateDevice).not.toContainText('kill switch');
+
+  const guarded = page.locator('tr[data-mac="00:11:22:33:44:55"]');
+  await expect(guarded).toContainText('kill switch');
+  await expect(guarded).toContainText('Нидерланды');
+  await expect(guarded.locator('input[data-field="ip"]')).toHaveValue('192.168.1.50');
+
+  await expect(page.locator('#zarap-outbounds tbody tr')).toHaveCount(2);
+  await expect(page.locator('#zarap-rules tbody tr')).toHaveCount(2);
+  await expect(page.getByText('Остальной трафик: напрямую')).toBeVisible();
 
   await expect(page.locator('body')).not.toContainText('123e4567-e89b-42d3-a456-426614174000');
   await expect(page.locator('body')).not.toContainText('0123456789abcdefghijklmnopqrstuvwxyzABCDE');
@@ -33,38 +52,47 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
   expect(calls.some(call => call.method === 'devices')).toBe(false);
 });
 
-test('validates and applies the exact selected devices', async ({ page }) => {
+test('sends the leases of guarded devices and keeps saved connections masked', async ({ page }) => {
   await openZarap(page);
 
-  await page.getByLabel('VLESS Reality-ссылка').fill(validLink);
+  await page.getByLabel('Добавить подключение').fill(validLink);
   const tablet = page.locator('tr[data-mac="10:20:30:40:50:60"]');
-  await tablet.getByRole('checkbox').check();
   await tablet.locator('input[data-field="name"]').fill('Планшет ребёнка');
   await tablet.locator('input[data-field="ip"]').fill('192.168.1.62');
 
   await page.getByRole('button', { name: 'Проверить конфигурацию', exact: true }).click();
-  await expect(page.getByText('Ссылка и список устройств корректны')).toBeVisible();
+  await expect(page.getByText('Конфигурация корректна')).toBeVisible();
 
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const validate = calls.find(call => call.method === 'validate');
   const apply = calls.find(call => call.method === 'apply');
-  expect(validate.args[0]).toBe(validLink);
-  expect(apply.args[0]).toBe(validLink);
-  expect(apply.args[1]).toBe(true);
+  expect(apply.args[0]).toBe(true);
+  // Saved connections round-trip by tag with an empty link, so their secrets
+  // never leave the router; the pasted one is the only link on the wire.
+  expect(apply.args[1]).toEqual([
+    { tag: 'out_1', label: 'Нидерланды', link: '' },
+    { tag: 'out_2', label: 'Германия', link: '' },
+    { tag: '', label: '', link: validLink }
+  ]);
   expect(apply.args[2]).toEqual([
+    { clients: ['00:11:22:33:44:55'], target: 'out_1' },
+    { clients: ['10:20:30:40:50:60'], target: 'block' }
+  ]);
+  // Only devices a rule names carry a lease.
+  expect(apply.args[3]).toEqual([
     { mac: '00:11:22:33:44:55', name: 'Телевизор', ip: '192.168.1.50' },
     { mac: '10:20:30:40:50:60', name: 'Планшет ребёнка', ip: '192.168.1.62' }
   ]);
-  expect(apply.args[2].some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
+  expect(apply.args[3].some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
+  expect(apply.args[4]).toBe('direct');
 });
 
 test('shows backend validation errors without applying configuration', async ({ page }) => {
   await openZarap(page);
   await page.evaluate(() => { window.__mockState.validateError = 'MVP поддерживает только транспорт TCP'; });
-  await page.getByLabel('VLESS Reality-ссылка').fill(validLink.replace('type=tcp', 'type=ws'));
+  await page.getByLabel('Добавить подключение').fill(validLink.replace('type=tcp', 'type=ws'));
   await page.getByRole('button', { name: 'Проверить конфигурацию', exact: true }).click();
 
   await expect(page.getByText('MVP поддерживает только транспорт TCP')).toBeVisible();
@@ -75,6 +103,7 @@ test('shows backend validation errors without applying configuration', async ({ 
 
 test('refreshes both components and confirms each update separately', async ({ page }) => {
   await openZarap(page);
+  await openMaintenance(page);
   await expect(page.getByRole('button', { name: 'Обновить' })).toHaveCount(0);
 
   await page.getByRole('button', { name: 'Проверить обновления' }).click();
@@ -103,6 +132,7 @@ test('refreshes both components and confirms each update separately', async ({ p
 test('copies the scrubbed log to the clipboard', async ({ page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await openZarap(page);
+  await openMaintenance(page);
 
   await page.getByRole('button', { name: 'Скопировать журнал' }).click();
   await expect(page.getByText('Журнал скопирован в буфер обмена')).toBeVisible();
@@ -114,6 +144,7 @@ test('copies the scrubbed log to the clipboard', async ({ page, context }) => {
 
 test('shows what apk reported when the update check fails', async ({ page }) => {
   await openZarap(page);
+  await openMaintenance(page);
   await page.evaluate(() => {
     window.__mockState.updatesError = 'ERROR: unable to select packages: no repositories available';
   });
@@ -141,6 +172,7 @@ test('keeps an action pair aligned instead of at opposite edges', async ({ page 
 
 test('names the failure when the update RPC itself does not complete', async ({ page }) => {
   await openZarap(page);
+  await openMaintenance(page);
   // A failed ubus call resolves with the status code, not an object.
   await page.evaluate(() => { window.__mockState.updatesRpcStatus = 7; });
 
@@ -162,4 +194,129 @@ test('keeps showing the kill switch while Zarap is switched off', async ({ page 
   await expect(page.getByText('kill switch активен')).toBeVisible();
   const held = page.locator('tr[data-mac="00:11:22:33:44:55"]');
   await expect(held).toContainText('kill switch');
+});
+
+test('adds a rule and picks its devices without touching the router', async ({ page }) => {
+  await openZarap(page);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await expect(page.locator('#zarap-rules-body tr')).toHaveCount(3);
+
+  const added = page.locator('#zarap-rules-body tr[data-rule="2"]');
+  await expect(added).toContainText('устройства не выбраны');
+  await added.getByRole('button', { name: 'Устройства…' }).click();
+
+  // The phone is unguarded before this and has no address field.
+  await expect(page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"] input[data-field="ip"]')).toHaveCount(0);
+  await page.locator('#zarap-picker input[data-mac="10:20:30:40:50:60"]').check();
+  await page.getByRole('button', { name: 'Готово' }).click();
+
+  await expect(added).toContainText('10:20:30:40:50:60');
+  // Nothing reaches the router until the configuration is applied.
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.some(call => call.method === 'apply')).toBe(false);
+});
+
+test('a device added to a rule immediately gets an address field', async ({ page }) => {
+  await openZarap(page);
+  const phone = page.locator('tr[data-mac="02:AA:BB:CC:DD:EE"]');
+  await expect(phone.locator('input[data-field="ip"]')).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Добавить правило' }).click();
+  await page.locator('#zarap-rules-body tr[data-rule="2"]')
+    .getByRole('button', { name: 'Устройства…' }).click();
+  // A private MAC cannot be pinned by a lease, so it is refused here rather
+  // than after an apply.
+  await expect(page.locator('#zarap-picker input[data-mac="02:AA:BB:CC:DD:EE"]')).toBeDisabled();
+  await page.getByRole('button', { name: 'Отмена' }).click();
+
+  // A device that can be pinned gets the field as soon as a rule names it.
+  await page.locator('#zarap-rules-body tr[data-rule="2"]')
+    .getByRole('button', { name: 'Устройства…' }).click();
+  await page.locator('#zarap-picker input[data-mac="AA:BB:CC:DD:EE:FF"]').check();
+  await page.getByRole('button', { name: 'Готово' }).click();
+  await expect(page.locator('tr[data-mac="AA:BB:CC:DD:EE:FF"] input[data-field="ip"]')).toHaveCount(1);
+});
+
+test('reorders rules and applies them in the shown order', async ({ page }) => {
+  await openZarap(page);
+
+  const first = page.locator('#zarap-rules-body tr[data-rule="0"]');
+  await first.getByRole('button', { name: '↓' }).click();
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  expect(apply.args[2]).toEqual([
+    { clients: ['10:20:30:40:50:60'], target: 'block' },
+    { clients: ['00:11:22:33:44:55'], target: 'out_1' }
+  ]);
+});
+
+test('refuses to delete a connection a rule still points at', async ({ page }) => {
+  await openZarap(page);
+
+  const used = page.locator('#zarap-outbounds-body tr[data-tag="out_1"]');
+  const spare = page.locator('#zarap-outbounds-body tr[data-tag="out_2"]');
+  const usedButton = used.getByRole('button', { name: 'Удалить' });
+  await expect(usedButton).toBeDisabled();
+  // The refusal has to name the reference, or there is nothing to act on.
+  await expect(usedButton).toHaveAttribute('title', /правило 1/);
+
+  await spare.getByRole('button', { name: 'Удалить' }).click();
+  await expect(page.locator('#zarap-outbounds-body tr')).toHaveCount(1);
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  expect(apply.args[1]).toEqual([{ tag: 'out_1', label: 'Нидерланды', link: '' }]);
+});
+
+test('a connection stops being deletable once the remainder points at it', async ({ page }) => {
+  await openZarap(page);
+
+  const spare = page.locator('#zarap-outbounds-body tr[data-tag="out_2"]');
+  await expect(spare.getByRole('button', { name: 'Удалить' })).toBeEnabled();
+
+  await page.locator('#zarap-final select').selectOption('out_2');
+  await expect(spare.getByRole('button', { name: 'Удалить' })).toBeDisabled();
+  await expect(spare.getByRole('button', { name: 'Удалить' }))
+    .toHaveAttribute('title', /остальной трафик/);
+  // Routing everyone through a proxy guards nobody; the page has to say so.
+  await expect(page.locator('#zarap-final'))
+    .toContainText('kill switch от этого ни у кого не появляется');
+});
+
+test('blocking the remainder is confirmed and can be backed out of', async ({ page }) => {
+  await openZarap(page);
+
+  await page.locator('#zarap-final select').selectOption('block');
+  await expect(page.locator('#modal')).toContainText('Без интернета останется весь дом');
+  await page.locator('#modal').getByRole('button', { name: 'Отмена' }).click();
+  await expect(page.locator('#zarap-final select')).toHaveValue('direct');
+
+  await page.locator('#zarap-final select').selectOption('block');
+  await page.locator('#modal').getByRole('button', { name: 'Заблокировать' }).click();
+  await expect(page.locator('#zarap-final select')).toHaveValue('block');
+
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.find(call => call.method === 'apply').args[4]).toBe('block');
+});
+
+test('deleting a rule warns what the device loses', async ({ page }) => {
+  await openZarap(page);
+
+  await page.locator('#zarap-rules-body tr[data-rule="0"]')
+    .getByRole('button', { name: 'Удалить' }).click();
+  const dialog = page.locator('#modal');
+  await expect(dialog).toContainText('получат прямой выход в интернет и лишатся закреплённого адреса');
+  await expect(dialog).toContainText('Телевизор (00:11:22:33:44:55)');
+
+  await page.locator('#modal').getByRole('button', { name: 'Удалить' }).click();
+  await expect(page.locator('#zarap-rules-body tr')).toHaveCount(1);
+  // The television is no longer guarded, so its lease is no longer editable.
+  await expect(page.locator('tr[data-mac="00:11:22:33:44:55"] input[data-field="ip"]')).toHaveCount(0);
 });

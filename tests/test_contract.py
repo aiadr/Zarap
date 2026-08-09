@@ -99,7 +99,9 @@ class PackageContractTests(unittest.TestCase):
         for type_name in ("'bool'", "'string'", "'number'", "'array'", "'boolean'"):
             self.assertNotIn(type_name, methods_body)
         self.assertIn("args: { refresh: true }", methods_body)
-        self.assertIn("args: { link: '', enabled: true, clients: [] }", methods_body)
+        self.assertIn(
+            "args: { enabled: true, outbounds: [], rules: [], clients: [], final: '' }",
+            methods_body)
 
     def test_atomic_temporary_files_share_target_directories(self):
         self.assertIn("const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp'", BACKEND)
@@ -130,21 +132,39 @@ class PackageContractTests(unittest.TestCase):
         # earlier version sent it to /dev/null and left a failure unexplained.
         self.assertIn("/usr/sbin/nft -f ' + NFT_SYNC + ' 2>&1", BACKEND)
         self.assertIn("synced.output", BACKEND)
-        self.assertIn("!synced.ok || !live_clients_match(live_clients)", BACKEND)
-        # The rollback path has to converge the kernel too.
-        self.assertIn("sync_live_sets(read_clients())", BACKEND)
+        self.assertIn("!synced.ok || !live_clients_match(live_guarded)", BACKEND)
+        # The rollback path has to converge the kernel too, from the rules that
+        # were restored rather than from the ones being applied.
+        self.assertIn("guarded_macs(saved_rules())", BACKEND)
+        self.assertIn("sync_live_sets(restored_guarded)", BACKEND)
 
     def test_the_kill_switch_outlives_the_master_switch(self):
-        # A selected device must not reach the WAN directly just because the
-        # proxy was switched off; only deselecting it opens that path. The
-        # TProxy redirect is the part tied to the proxy running, since sending
-        # traffic to a dead port would swallow it instead of rejecting it.
-        self.assertIn("validate_candidate(parsed_result.config, client_result.clients, enabled)", BACKEND)
-        self.assertIn("let live_clients = client_result.clients;", BACKEND)
+        # A device named by a rule must not reach the WAN directly just because
+        # the proxy was switched off; only deleting the rule opens that path.
+        # The TProxy redirect is the part tied to the proxy running, since
+        # sending traffic to a dead port would swallow it instead of rejecting.
+        self.assertIn(
+            "validate_candidate(request.outbounds, request.rules, request.final,",
+            BACKEND)
+        self.assertIn("let live_guarded = candidate.guarded;", BACKEND)
         self.assertIn("if (proxying)", BACKEND)
-        self.assertNotIn("enabled ? client_result.clients : []", BACKEND)
+        self.assertNotIn("enabled ? request.rules : []", BACKEND)
         view = (PACKAGE_ROOT / "htdocs/luci-static/resources/view/zarap/overview.js").read_text()
-        self.assertIn("device.kill_switch = !!(status.firewall && device.selected)", view)
+        # The page marks a device held by the kill switch from the rules it is
+        # showing, not from the guarded flag status reported: a device added to
+        # a rule that has not been applied yet still needs its address field.
+        self.assertIn("const killSwitch = state.firewall && guarded;", view)
+        self.assertIn("function guardedMacs()", view)
+        self.assertNotIn("device.guarded", view)
+
+    def test_the_guarded_set_comes_only_from_the_rules(self):
+        # Invariant 2: capture is a property of the network, the kill switch a
+        # property of a device, and only a rule puts a device under it.
+        self.assertIn("function guarded_macs(rules)", BACKEND)
+        self.assertIn("for (let mac in guarded_macs(rules))", BACKEND)
+        # Nothing may pull the set out of the device list or the capture.
+        self.assertNotIn("zarap_clients_v4", BACKEND)
+        self.assertNotIn("function read_clients()", BACKEND)
 
     def test_deselecting_a_device_releases_its_managed_lease(self):
         # zarap_managed was written and read but never acted on, so a static
@@ -161,9 +181,18 @@ class PackageContractTests(unittest.TestCase):
         self.assertIn("/etc/init.d/rpcd reload", BACKEND)
         self.assertIn("/etc/init.d/rpcd reload", UCI_DEFAULTS)
 
-    def test_device_discovery_uses_hostapd_and_dhcp_leases(self):
+    def test_device_discovery_covers_the_whole_lan(self):
+        # Capture takes every device on the LAN, so a rule can name a wired host
+        # too. Leases are the base of the list; hostapd only adds what a lease
+        # cannot say — whether a station is associated, and on which radio.
         self.assertIn('/bin/ubus list "hostapd.*"', BACKEND)
         self.assertIn("/tmp/dhcp.leases", BACKEND)
+        body = BACKEND.split("function device_list(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("for (let mac in leases.by_mac)", body)
+        self.assertIn("for (let mac in dynamic_leases)", body)
+        # A device a rule names has to appear even with no lease at all.
+        self.assertIn("for (let mac in guarded)", body)
+        self.assertNotIn("wireless: true,", body)
 
     def test_update_check_is_required_before_update_buttons(self):
         view = (PACKAGE_ROOT / "htdocs/luci-static/resources/view/zarap/overview.js").read_text()
@@ -176,19 +205,53 @@ class PackageContractTests(unittest.TestCase):
         self.assertNotRegex("00:11:22:33:44:55", pattern)
 
     def test_fixed_tproxy_resources(self):
-        for value in ("7893", "0x5a52", "2022", "zarap_clients_v4"):
+        for value in ("7893", "0x5a52", "2022", "zarap_guarded_v4"):
             self.assertIn(value, BACKEND + NFT)
 
     def test_kill_switch_covers_ipv4_and_ipv6(self):
-        self.assertIn("ip saddr @zarap_clients_v4 reject", NFT)
-        self.assertIn("ether saddr @zarap_clients_mac ether type ip6 reject", NFT)
+        # The shipped file is the empty-but-safe state: the kill switch chain
+        # exists with nothing in its set, and there is no capture yet. IPv6 is
+        # barred for the whole LAN, which needs the interface the backend reads
+        # at generation time, so those rules appear only in generated output.
+        self.assertIn("ip saddr @zarap_guarded_v4 reject", NFT)
+        self.assertNotIn("tproxy ip to", NFT)
+        self.assertIn('ether type ip6 reject', BACKEND)
+        self.assertNotIn("zarap_clients_mac", BACKEND + NFT)
 
     def test_the_masked_link_carries_the_saved_connection_name(self):
         # It used to end in a hardcoded #Zarap, discarding the name the link came
         # with. The name is a label, not a secret, so it survives round-tripping.
-        self.assertIn("'#' + (parsed.name || 'Zarap')", BACKEND)
-        self.assertIn("name: uci.get('zarap', 'main', 'name')", BACKEND)
-        self.assertIn("for (let key in ['name', 'server'", BACKEND)
+        self.assertIn("'#' + (outbound.label || 'Zarap')", BACKEND)
+        self.assertIn("label: section.label || ''", BACKEND)
+
+    def test_logs_scrub_every_connection(self):
+        # Walking only the first section would leak the uuid of a second proxy
+        # into the log the user copies out.
+        logs_body = BACKEND.split("function logs()", 1)[1].split("function package_version", 1)[0]
+        self.assertIn("for (let outbound in saved_outbounds())", logs_body)
+        self.assertNotIn("uci.get('zarap', 'main', 'uuid')", logs_body)
+
+    def test_ipv6_advertisement_is_turned_off_and_handed_back(self):
+        # The capture is IPv4 only, so an advertised IPv6 would be a path around
+        # sing-box for the whole LAN. It is somebody else's setting, so the
+        # previous value is recorded on the first apply and restored on removal.
+        self.assertIn("for (let key in ['ra', 'dhcpv6', 'ndp'])", BACKEND)
+        self.assertIn("uci.set('dhcp', 'lan', key, 'disabled')", BACKEND)
+        self.assertIn("uci.set('zarap', 'main', 'saved_' + key", BACKEND)
+        self.assertIn("define Package/luci-app-zarap/prerm", MAKEFILE)
+        self.assertIn("zarap.main.saved_$$key", MAKEFILE)
+
+    def test_fixed_resources_are_not_pretend_settings(self):
+        # They used to sit in uci looking configurable while every consumer
+        # substituted the literal, so changing one produced a system that
+        # disagreed with itself.
+        config = (PACKAGE_ROOT / "root/etc/config/zarap").read_text()
+        init = (PACKAGE_ROOT / "root/etc/init.d/zarap").read_text()
+        for option in ("listen_port", "mark", "route_table"):
+            self.assertNotIn(option, config)
+        self.assertNotIn("config_get mark", init)
+        self.assertNotIn("config_get route_table", init)
+        self.assertIn("const CAPTURE_PORT = 7893", BACKEND)
 
     def test_status_does_not_return_proxy_secrets(self):
         status_body = BACKEND.split("function status()", 1)[1].split("function logs()", 1)[0]
