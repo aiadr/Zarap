@@ -31,9 +31,11 @@ class BootstrapDnsTests(unittest.TestCase):
         constants = "\n".join(
             line for line in source.splitlines()
             if line.startswith(("const DNS_UPSTREAM", "const BOOTSTRAP_TAG",
-                                "const BOOTSTRAP_DEFAULT", "const BOOTSTRAP_SCHEMES")))
+                                "const BOOTSTRAP_DEFAULT", "const BOOTSTRAP_SCHEMES",
+                                "const TUNNEL_DEFAULT")))
         cls.prelude = constants + "\n" + "\n".join(lift(source, name) for name in (
-            "result_error", "input_error", "valid_ipv4", "parse_bootstrap"))
+            "result_error", "input_error", "valid_ipv4", "parse_resolver",
+            "parse_bootstrap", "parse_tunnel_dns"))
 
     def parse(self, value):
         script = "%s\nprintf('%%J', parse_bootstrap(%s));\n" % (
@@ -156,6 +158,36 @@ class BootstrapDnsTests(unittest.TestCase):
         unknown = self.parse("quic://1.1.1.1")
         self.assertEqual(unknown.get("kind"), "input_error")
         self.assertIn("quic", unknown["error"])
+
+
+    def test_the_tunnel_resolver_is_its_own_setting(self):
+        # Раньше он стоял константой с доводом «через туннель выбор ничего не
+        # решает». Довод — утверждение о чужой сети: у провайдера сервера
+        # Cloudflare может быть закрыт так же, как у своего.
+        script = "%s\nprintf('%%J', parse_tunnel_dns(%s));\n"
+        def parse_tunnel(value):
+            import subprocess, tempfile, os, json as j
+            with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
+                handle.write(script % (self.prelude, j.dumps(value)))
+                path = handle.name
+            try:
+                done = subprocess.run([self.ucode, path], capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                return j.loads(done.stdout)
+            finally:
+                os.unlink(path)
+
+        # Умолчание — то, что стояло константой.
+        self.assertEqual(parse_tunnel("")["value"], "https://1.1.1.1")
+        # Тег и detour ставит вызывающий: сервер свой на каждое подключение.
+        self.assertEqual(parse_tunnel("")["server"],
+                         {"type": "https", "server": "1.1.1.1"})
+        self.assertEqual(parse_tunnel("tls://9.9.9.9")["server"]["type"], "tls")
+        # `local` здесь бессмыслен: он читает resolv.conf роутера, а спрашивают
+        # его через туннель.
+        refused = parse_tunnel("local")
+        self.assertEqual(refused.get("kind"), "input_error")
+        self.assertIn("local", refused["error"])
 
 
 if __name__ == "__main__":

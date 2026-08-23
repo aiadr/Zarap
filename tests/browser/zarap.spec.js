@@ -28,7 +28,7 @@ async function openMaintenance(page) {
 // все позиции за собой, и тест ломается там, где ничего не менялось. Порядок
 // один в один повторяет объявление rpc в overview.js.
 const APPLY_ARGS = ['enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour',
-                    'bootstrap_dns', 'resolve_all', 'clients', 'final'];
+                    'bootstrap_dns', 'resolve_all', 'tunnel_dns', 'clients', 'final'];
 
 function applyArgs(call) {
   return Object.fromEntries(APPLY_ARGS.map((name, index) => [name, call.args[index]]));
@@ -491,6 +491,22 @@ test('hands the household DNS over only when asked, and says the cost', async ({
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = applyArgs(calls.find(call => call.method === 'apply'));
   expect(apply.resolve_all).toBe(true);
+});
+
+test('sends the resolver used inside the tunnel', async ({ page }) => {
+  // Он стоял константой, и довод «через туннель выбор ничего не решает» был
+  // утверждением о чужой сети.
+  await openZarap(page);
+  const field = page.locator('#zarap-tunnel-dns');
+  await expect(field).toHaveValue('https://1.1.1.1');
+
+  await field.fill('tls://9.9.9.9');
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(applyArgs(calls.find(call => call.method === 'apply')).tunnel_dns)
+    .toEqual('tls://9.9.9.9');
 });
 
 test('sends the resolver chosen for the address of the server', async ({ page }) => {

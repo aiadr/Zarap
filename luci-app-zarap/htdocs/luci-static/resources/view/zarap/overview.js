@@ -5,8 +5,8 @@
 'require view';
 
 const callStatus = rpc.declare({ object: 'zarap', method: 'status' });
-const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'resolve_all', 'clients', 'final' ] });
-const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'resolve_all', 'clients', 'final' ] });
+const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'resolve_all', 'tunnel_dns', 'clients', 'final' ] });
+const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'resolve_all', 'tunnel_dns', 'clients', 'final' ] });
 const callRestart = rpc.declare({ object: 'zarap', method: 'restart' });
 const callStop = rpc.declare({ object: 'zarap', method: 'stop' });
 const callLogs = rpc.declare({ object: 'zarap', method: 'logs' });
@@ -109,6 +109,8 @@ const state = {
 	// Резолвить ли имена всей сети через подключение. Меняет DNS дома, поэтому
 	// выключено по умолчанию: существующая установка ничего не замечает.
 	resolveAll: false,
+	// Чем резолвятся имена, уезжающие в подключение.
+	tunnelDns: 'https://1.1.1.1',
 	cache: { size: 0, free: 0 },
 	// Сколько имён резолвится через прокси; считается роутером из применённых
 	// правил, поэтому это состояние роутера, а не страницы.
@@ -160,6 +162,7 @@ function loadState(status) {
 	state.rulesetDetour = status.ruleset_detour || 'direct';
 	state.bootstrapDns = status.bootstrap_dns || 'local';
 	state.resolveAll = !!status.resolve_all;
+	state.tunnelDns = status.tunnel_dns || 'https://1.1.1.1';
 	state.cache = status.cache || { size: 0, free: 0 };
 	state.dns = status.dns || { forwarded: 0 };
 	state.final = status.final || 'direct';
@@ -1230,6 +1233,11 @@ function bootstrapNote() {
 
 // Значение читается из поля, а не из state: change срабатывает по потере
 // фокуса, и набранное, но не покинутое поле иначе уехало бы прежним.
+function tunnelValue() {
+	const field = document.querySelector('#zarap-tunnel-dns');
+	return field ? field.value.trim() : state.tunnelDns;
+}
+
 function resolveAllValue() {
 	const box = document.querySelector('#zarap-resolve-all');
 	return box ? box.checked : state.resolveAll;
@@ -1455,6 +1463,19 @@ return view.extend({
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-tunnel-dns' }, _('Резолвер через подключение')),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'zarap-tunnel-dns', 'class': 'cbi-input-text',
+								'style': 'width:100%', 'placeholder': 'https://1.1.1.1',
+								'value': state.tunnelDns,
+								'change': function(ev) { state.tunnelDns = ev.target.value.trim(); }
+							}),
+							E('div', { 'class': 'cbi-value-description' },
+								_('Чем резолвятся имена, которые правило отправляет в подключение. Запрос уходит внутри туннеля, поэтому провайдер и соседние роутеры его не видят, а ответ приходит с того выхода, куда пойдёт трафик. Формы те же, что у резолвера адреса сервера, кроме local: он читает /etc/resolv.conf роутера, а спрашивают отсюда через туннель. По умолчанию https://1.1.1.1.'))
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-resolve-all' }, _('Резолвить имена через подключение')),
 						E('div', { 'class': 'cbi-value-field' }, [
 							E('input', { 'id': 'zarap-resolve-all', 'type': 'checkbox',
@@ -1593,7 +1614,7 @@ return view.extend({
 									return;
 								notify(await callValidate(submittedOutbounds(), state.rules,
 									state.rulesets, state.rulesetDetour, bootstrapValue(),
-									resolveAllValue(), leasedClients(), state.final),
+									resolveAllValue(), tunnelValue(), leasedClients(), state.final),
 									_('Конфигурация корректна'));
 							})
 						}, _('Проверить конфигурацию')),
@@ -1611,6 +1632,7 @@ return view.extend({
 									state.rulesetDetour,
 									bootstrapValue(),
 									resolveAllValue(),
+									tunnelValue(),
 									leasedClients(),
 									state.final
 								);
