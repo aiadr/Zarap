@@ -449,6 +449,30 @@ test('picks the download connection once for every list', async ({ page }) => {
   expect(apply.rulesets.every(ruleset => !('detour' in ruleset))).toBe(true);
 });
 
+test('names the host that would not resolve, next to the field that fixes it', async ({ page }) => {
+  // Отказ резолвера — единственная поломка, которая выглядит как здоровье:
+  // соединения устанавливаются, ошибок нет, и ничего не работает. Пока страница
+  // об этом молчала, догадаться до причины можно было только вручную.
+  await page.addInitScript(() => {
+    window.__statusOverride = {
+      bootstrap_dns: 'https://1.1.1.1',
+      dns: { forwarded: 0, unresolved: 'cdn1.aidar.one', bootstrap: 'https://1.1.1.1' }
+    };
+  });
+  await openZarap(page);
+
+  const note = page.locator('[data-field="bootstrap-unresolved"]');
+  await expect(note).toContainText('cdn1.aidar.one');
+  // Резолвер назван вместе с именем: без него сообщение отправляет искать
+  // поломку в подключении, а чинится она полем на этой же странице.
+  await expect(note).toContainText('https://1.1.1.1');
+});
+
+test('says nothing about the resolver while names resolve', async ({ page }) => {
+  await openZarap(page);
+  await expect(page.locator('[data-field="bootstrap-unresolved"]')).toHaveCount(0);
+});
+
 test('sends the resolver chosen for the address of the server', async ({ page }) => {
   // DoH до 1.1.1.1 закрывают ровно те провайдеры, ради которых Zarap и ставят,
   // и тогда имя сервера не разрешается вовсе. Подставить свой резолвер — это
@@ -456,7 +480,7 @@ test('sends the resolver chosen for the address of the server', async ({ page })
   await openZarap(page);
 
   const field = page.locator('#zarap-bootstrap-dns');
-  await expect(field).toHaveValue('https://1.1.1.1');
+  await expect(field).toHaveValue('local');
 
   await field.fill('udp://192.168.1.1');
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();

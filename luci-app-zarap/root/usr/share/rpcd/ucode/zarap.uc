@@ -57,8 +57,17 @@ const BOOTSTRAP_TAG = 'dns_bootstrap';
 // А вот здесь выбор решает всё, поэтому это настройка, а не константа: DoH до
 // 1.1.1.1 закрывают ровно те провайдеры, ради которых Zarap и ставят, и тогда
 // имя сервера не разрешается вовсе — подставить свой резолвер больше нечем.
-// Умолчание прежнее: шифрованный запрос к 1.1.1.1.
-const BOOTSTRAP_DEFAULT = 'https://' + DNS_UPSTREAM;
+//
+// Умолчанием стоит `local` — резолвер самого роутера. DoH к 1.1.1.1, стоявший
+// здесь до того, оказался умолчанием, которое не работает ровно там, ради чего
+// пакет и написан: на живой установке имя сервера не разрешалось, и выглядело
+// это как тишина. `local` не требует, чтобы наружу был доступен чей-то
+// конкретный адрес: он работает везде, где у роутера вообще есть DNS.
+//
+// Цена названа честно и в 7.6: `local` — это ответ провайдера, открытый и
+// подменяемый, тогда как DoH прятал имя сервера от него же. Кому важнее второе,
+// ставит `https://…` руками; умолчание выбирает работоспособность.
+const BOOTSTRAP_DEFAULT = 'local';
 // Схема выбирает не адрес, а то, что уедет в сеть: https и tls запрос
 // шифруют, udp и tcp — нет. `local` отдаёт резолв самому роутеру.
 const BOOTSTRAP_SCHEMES = { https: true, tls: true, udp: true, tcp: true };
@@ -1601,20 +1610,28 @@ function check_runtime(enabled, wait_seconds) {
 	};
 }
 
-function recent_connection_error() {
+// Что журнал говорит о последних соединениях — за один проход. Отдельно от
+// «что-то не соединяется» вынут неразрешившийся адрес сервера: это единственный
+// отказ, который выглядит как полное здоровье. Соединения устанавливаются,
+// ошибок нет, статус говорит «работает» — и ничего не работает. Один рабочий
+// день ушёл на то, чтобы догадаться до строчки, которую программа знала.
+function recent_failures() {
 	let output = lc(capture('/sbin/logread -e sing-box -l 80').output);
+	// «… using outbound/vless[out_4]: lookup cdn1.aidar.one: i/o timeout».
+	// Двоеточие после имени обязательно: оно отличает отказ от удачного резолва
+	// на уровне `debug` («dns: lookup domain …», «dns: lookup failed for …»),
+	// где за словом lookup двоеточия нет.
+	let failed = match(output, /: lookup ([a-z0-9._-]+): /);
+	if (failed)
+		return { connection: true, unresolved: failed[1] };
+
 	for (let marker in [
 		'connection refused', 'network is unreachable', 'i/o timeout',
-		'connection reset', 'reality handshake', 'tls handshake',
-		// Имя сервера не разрешилось: подключение с доменом в ссылке не
-		// состоится, и в журнале это единственный след. Маркер опирается на
-		// уровень `info` из конфига: на `debug` так же выглядит и удачный
-		// резолв («dns: lookup domain …»).
-		': lookup '
+		'connection reset', 'reality handshake', 'tls handshake'
 	])
 		if (index(output, marker) >= 0)
-			return true;
-	return false;
+			return { connection: true, unresolved: '' };
+	return { connection: false, unresolved: '' };
 }
 
 function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour, bootstrap) {
@@ -2146,6 +2163,7 @@ function status() {
 	let outbounds = saved_outbounds(), rules = saved_rules(), final = saved_final();
 	let configured = length(outbounds) > 0;
 	let health = check_runtime(enabled);
+	let failures = recent_failures();
 	let state = 'disabled', message = 'Zarap выключен';
 	let held = !enabled && length(guarded_macs(rules)) > 0;
 	if (!configured) {
@@ -2162,9 +2180,16 @@ function status() {
 		state = 'startup_error';
 		message = 'Процесс, TProxy, nftables или policy routing не прошли проверку';
 	}
-	else if (enabled && recent_connection_error()) {
+	else if (enabled && failures.connection) {
 		state = 'connection_error';
-		message = 'Локальная инфраструктура работает, но в журнале есть ошибка соединения с прокси';
+		// Неразрешившееся имя называется вместе с резолвером, которым его
+		// пытались разрешить: без второго сообщение отправляет искать поломку
+		// в подключении, тогда как чинится она одним полем на этой же странице.
+		message = failures.unresolved ?
+			'Имя сервера подключения не разрешается: ' + failures.unresolved +
+				' через резолвер ' + saved_bootstrap() +
+				'. Пока имя не разрешается, подключение не поднимается, и со стороны это выглядит как тишина: соединения устанавливаются, а трафик не идёт. Смените резолвер в поле «Резолвер адреса сервера» — например на local' :
+			'Локальная инфраструктура работает, но в журнале есть ошибка соединения с прокси';
 	}
 	else if (enabled) {
 		state = 'working';
@@ -2228,7 +2253,13 @@ function status() {
 		cache: cache_state(),
 		// Сколько имён резолвится через прокси. Ноль означает, что доменные
 		// правила работают только против DPI: подменённый DNS они не обходят.
-		dns: { forwarded: length(keys(dns_routes(rules).by_outbound)) ? dns_forwarded(rules) : 0 },
+		dns: {
+			forwarded: length(keys(dns_routes(rules).by_outbound)) ? dns_forwarded(rules) : 0,
+			// Имя, которое не разрешилось, отдельным полем: страница показывает
+			// его рядом с резолвером, а не только в общей строке состояния.
+			unresolved: failures.unresolved,
+			bootstrap: saved_bootstrap()
+		},
 		rules: rules,
 		final: final,
 		capture: { interface: lan_device(), active: enabled && health.listener },
