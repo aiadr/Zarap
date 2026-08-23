@@ -824,9 +824,6 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 	// something asks for a domain — sniffing delays the first packet while it
 	// waits for the header, and paying that with no domain rule buys nothing.
 	//
-	// It routes by name and dials by address: the connection still goes to the
-	// address the client resolved. A domain rule therefore beats DPI on the SNI
-	// and does nothing about a name blocked in DNS.
 	// Запросы, которые dnsmasq переслал на наш порт, уходят в DNS-модуль
 	// sing-box; правило стоит первым и ловит их по своему inbound, так что с
 	// захваченным трафиком оно не пересекается.
@@ -834,11 +831,31 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 	if (length(dns.order))
 		push(route_rules, { inbound: [DNS_TAG], action: 'hijack-dns' });
 
-	let wants_sniff = false;
-	for (let rule in rules)
+	let wants_sniff = false, wants_ranges = false;
+	for (let rule in rules) {
 		if (length(rule.domains || []) || length(rule.rule_sets || []))
 			wants_sniff = true;
-	if (wants_sniff)
+		if (length(rule.ip_cidr || []))
+			wants_ranges = true;
+	}
+
+	// Имя, вытащенное из первого пакета, может не только маршрутизировать, но и
+	// стать назначением — тогда наружу уезжает оно, а адрес, который клиенту
+	// выдал резолвер, выбрасывается. Это снимает зависимость от DNS целиком:
+	// подменённый адрес (сосед с FakeIP, отравленный ответ провайдера) больше
+	// ничего не решает, потому что имя разрешает уже дальний конец туннеля.
+	// Списки `.srs` при этом работают наравне с доменами, выписанными в
+	// правиле, — DNS-маршрутизация (7.2) их покрыть не может в принципе.
+	//
+	// Цена — правила по диапазонам адресов: назначение перестаёт быть адресом,
+	// и `ip_cidr` совпадать перестаёт. Поэтому подмена включается сама и только
+	// там, где ни одно правило диапазонами не пользуется; выбирать вручную
+	// нечего, а сломать существующее правило нельзя.
+	//
+	// Форма старая и с `action: "sniff"` не сочетается: вместе они дают снифинг
+	// без подмены, и раздел 15.2 мерил именно эту смесь.
+	let override = wants_sniff && !wants_ranges;
+	if (wants_sniff && !override)
 		push(route_rules, { inbound: [INBOUND_TAG], action: 'sniff' });
 
 	for (let rule in rules) {
@@ -915,12 +932,17 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 	if (length(declared))
 		route.rule_set = declared;
 
-	let inbounds = [{
+	let capture = {
 		type: 'tproxy',
 		tag: INBOUND_TAG,
 		listen: '0.0.0.0',
 		listen_port: CAPTURE_PORT
-	}];
+	};
+	if (override) {
+		capture.sniff = true;
+		capture.sniff_override_destination = true;
+	}
+	let inbounds = [capture];
 	if (length(dns.order))
 		push(inbounds, {
 			type: 'direct',

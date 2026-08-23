@@ -233,23 +233,29 @@ class RouteMappingTests(unittest.TestCase):
 
     def test_a_domain_covers_the_name_and_everything_under_it(self):
         rules = [{"domains": ["youtube.com", ".googlevideo.com"], "target": "out_1"}]
-        element = self.generate([OUT_1], rules, "direct")["route"]["rules"][2]
+        element = self.generate([OUT_1], rules, "direct")["route"]["rules"][1]
         self.assertEqual(element["domain"], ["youtube.com"])
         # A leading dot asked for the subdomains alone, so the name itself is
         # not in `domain` and only its suffix form is kept.
         self.assertEqual(element["domain_suffix"],
                          [".youtube.com", ".googlevideo.com"])
 
-    def test_sniff_is_emitted_only_for_domains_and_before_any_matching(self):
+    def test_nothing_to_match_by_name_pays_nothing_for_sniffing(self):
         # Sniffing delays the first packet while it waits for the header, so a
-        # configuration with nothing to match by name must not pay for it.
+        # configuration with nothing to match by name must not pay for it —
+        # neither by a rule nor on the capture itself.
         without = self.generate(
             [OUT_1], [{"ip_cidr": ["10.0.0.0/8"], "target": "out_1"}], "direct")
         self.assertNotIn("sniff", str(without["route"]["rules"]))
+        self.assertNotIn("sniff", without["inbounds"][0])
 
+    def test_the_sniff_rule_still_precedes_every_matching_one(self):
+        # Где подмена назначения невозможна (правило по диапазону), снифинг
+        # остаётся действием, и оно обязано стоять до правил, которые ждут имя.
         emitted = self.generate(
             [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "direct"},
-                      {"domains": ["youtube.com"], "target": "out_1"}],
+                      {"domains": ["youtube.com"], "ip_cidr": ["10.0.0.0/8"],
+                       "target": "out_1"}],
             "direct")["route"]["rules"]
         sniff = [index for index, rule in enumerate(emitted)
                  if rule.get("action") == "sniff"]
@@ -355,15 +361,55 @@ class RouteMappingTests(unittest.TestCase):
         self.assertNotIn("rule_set", config["route"])
         self.assertNotIn("experimental", config)
 
+    def test_the_sniffed_name_becomes_the_destination(self):
+        # Иначе наружу уезжает адрес, который клиенту выдал резолвер, — и если
+        # его подменили (сосед с FakeIP, отравленный ответ провайдера), туннель
+        # везёт в никуда. С подменой назначения имя разрешает дальний конец, и
+        # DNS на роутере перестаёт что-либо решать. Списки `.srs` при этом
+        # работают наравне с доменами: DNS-маршрутизация их не покрывает.
+        config = self.generate(
+            [OUT_1], [{"rule_sets": ["rs_1"], "target": "out_1"}], "direct",
+            rulesets=[{"tag": "rs_1", "label": "", "url": "https://e.org/a.srs",
+                       "update_interval": ""}])
+        capture = config["inbounds"][0]
+        self.assertTrue(capture["sniff"])
+        self.assertTrue(capture["sniff_override_destination"])
+        # Старая форма с `action: "sniff"` не сочетается: вместе они снифают,
+        # но назначение не подменяют.
+        self.assertEqual(
+            [rule for rule in config["route"]["rules"] if rule.get("action") == "sniff"], [])
+
+    def test_a_rule_by_range_keeps_the_address_and_the_sniff_action(self):
+        # Подменённое назначение перестаёт быть адресом, и `ip_cidr` совпадать
+        # перестаёт. Значит там, где диапазоны используются, подмены быть не
+        # должно — и выбирать это вручную не нужно, генератор видит правила.
+        config = self.generate(
+            [OUT_1], [{"rule_sets": ["rs_1"], "ip_cidr": ["149.154.160.0/20"],
+                       "target": "out_1"}], "direct",
+            rulesets=[{"tag": "rs_1", "label": "", "url": "https://e.org/a.srs",
+                       "update_interval": ""}])
+        capture = config["inbounds"][0]
+        self.assertNotIn("sniff", capture)
+        self.assertNotIn("sniff_override_destination", capture)
+        self.assertEqual(config["route"]["rules"][0],
+                         {"inbound": ["zarap-tproxy"], "action": "sniff"})
+
+    def test_nothing_asks_for_a_name_and_nothing_sniffs(self):
+        config = self.generate(
+            [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}], "direct")
+        self.assertNotIn("sniff", config["inbounds"][0])
+        self.assertEqual(
+            [rule for rule in config["route"]["rules"] if rule.get("action") == "sniff"], [])
+
     def test_a_rule_set_asks_for_sniffing_too(self):
         # An .srs usually carries domains, and without the name they cannot
-        # match at all.
+        # match at all. Без правил по диапазонам снифинг живёт на самом входе,
+        # вместе с подменой назначения.
         config = self.generate(
             [OUT_1], [{"rule_sets": ["rs_1"], "target": "block"}], "direct",
             rulesets=[{"tag": "rs_1", "label": "", "url": "https://e.org/a.srs",
                        "update_interval": ""}])
-        self.assertEqual(config["route"]["rules"][0],
-                         {"inbound": ["zarap-tproxy"], "action": "sniff"})
+        self.assertTrue(config["inbounds"][0]["sniff"])
 
     def test_named_domains_are_resolved_through_the_outbound_that_routes_them(self):
         # The answer has to come from the exit the traffic will take, or a CDN
