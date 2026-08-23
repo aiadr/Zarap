@@ -43,9 +43,9 @@ const fixtures = {
     ],
     ruleset_detour: 'out_1',
     ruleset_detour_missing: false,
-    bootstrap_dns: 'https://1.1.1.1',
+    bootstrap_dns: 'local',
     cache: { size: 1258291, free: 20971520 },
-    dns: { forwarded: 0 },
+    dns: { forwarded: 0, unresolved: '', bootstrap: 'local' },
     final: 'direct',
     capture: { interface: 'br-lan', active: true },
     devices: [

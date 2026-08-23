@@ -105,7 +105,7 @@ const state = {
 	rulesetDetour: 'direct',
 	// Чем резолвится адрес сервера из ссылки. Мимо туннеля — через туннель было
 	// бы кругом, — и потому единственный запрос Zarap, который видит провайдер.
-	bootstrapDns: 'https://1.1.1.1',
+	bootstrapDns: 'local',
 	cache: { size: 0, free: 0 },
 	// Сколько имён резолвится через прокси; считается роутером из применённых
 	// правил, поэтому это состояние роутера, а не страницы.
@@ -155,7 +155,7 @@ function loadState(status) {
 		return Object.assign({}, ruleset);
 	});
 	state.rulesetDetour = status.ruleset_detour || 'direct';
-	state.bootstrapDns = status.bootstrap_dns || 'https://1.1.1.1';
+	state.bootstrapDns = status.bootstrap_dns || 'local';
 	state.cache = status.cache || { size: 0, free: 0 };
 	state.dns = status.dns || { forwarded: 0 };
 	state.final = status.final || 'direct';
@@ -1209,6 +1209,21 @@ function renderDevices() {
 		: E('tr', {}, E('td', { 'colspan': 5 }, _('Устройства пока не обнаружены')));
 }
 
+// Отказ резолвера — единственная поломка, которая выглядит как здоровье:
+// соединения устанавливаются, ошибок в журнале нет, а трафик не идёт. Поэтому
+// он говорится прямо у того поля, которым чинится, а не только строкой
+// состояния наверху страницы.
+function bootstrapNote() {
+	const unresolved = (state.dns || {}).unresolved || '';
+	if (!unresolved)
+		return '';
+	return E('div', { 'class': 'alert-message warning', 'data-field': 'bootstrap-unresolved' }, [
+		E('strong', {}, _('Имя сервера подключения не разрешается: ') + unresolved),
+		E('br'),
+		_('Резолвер %s не отвечает или отдаёт неверный ответ. Пока имя не разрешается, подключение не поднимается: соединения устанавливаются, а трафик не идёт. Попробуйте local — резолвер самого роутера.').format(state.bootstrapDns)
+	]);
+}
+
 // Значение читается из поля, а не из state: change срабатывает по потере
 // фокуса, и набранное, но не покинутое поле иначе уехало бы прежним.
 function bootstrapValue() {
@@ -1227,6 +1242,7 @@ function refresh() {
 	dom.content(document.querySelector('#zarap-cache'), renderCache());
 	dom.content(document.querySelector('#zarap-ruleset-refresh'), rulesetRefreshRow());
 	dom.content(document.querySelector('#zarap-dns-note'), renderDnsNote());
+	dom.content(document.querySelector('#zarap-bootstrap-note'), bootstrapNote());
 	dom.content(document.querySelector('#zarap-devices-body'), renderDevices());
 	dom.content(document.querySelector('#zarap-final'), finalRow(finalRow.owner));
 }
@@ -1420,12 +1436,13 @@ return view.extend({
 						E('div', { 'class': 'cbi-value-field' }, [
 							E('input', {
 								'id': 'zarap-bootstrap-dns', 'class': 'cbi-input-text',
-								'style': 'width:100%', 'placeholder': 'https://1.1.1.1',
+								'style': 'width:100%', 'placeholder': 'local',
 								'value': state.bootstrapDns,
 								'change': function(ev) { state.bootstrapDns = ev.target.value.trim(); }
 							}),
+							E('div', { 'id': 'zarap-bootstrap-note' }, bootstrapNote()),
 							E('div', { 'class': 'cbi-value-description' },
-								_('Нужен, когда в ссылке подключения указан домен, а не адрес: имя сервера надо разрешить прежде, чем до него дозвониться, и через сам туннель это сделать нельзя. Запрос идёт мимо прокси — он единственный, который видит провайдер. Схема обязательна и решает, шифруется ли запрос: https:// (DoH, по умолчанию 1.1.1.1), tls:// (DoT), udp:// или tcp:// — открытый запрос, который проходит там, где DoH закрыт, и local — резолвер самого роутера. Адрес только IPv4: sing-box не стартует с резолвером, заданным именем. Если шифрованный резолвер отвечает ошибкой сертификата (нет IP SAN), имя для проверки дописывается через решётку, как в systemd-resolved: tls://77.88.8.8#common.dot.dns.yandex.net.'))
+								_('Нужен, когда в ссылке подключения указан домен, а не адрес: имя сервера надо разрешить прежде, чем до него дозвониться, и через сам туннель это сделать нельзя. По умолчанию local — резолвер самого роутера, тот же, которым пользуются устройства сети. Остальные формы шифруют запрос и прячут имя сервера от провайдера, но требуют, чтобы указанный адрес был доступен: https:// (DoH), tls:// (DoT), udp:// и tcp:// — открытый запрос. Адрес только IPv4: sing-box не стартует с резолвером, заданным именем. Если шифрованный резолвер отвечает ошибкой сертификата (нет IP SAN), имя для проверки дописывается через решётку, как в systemd-resolved: tls://77.88.8.8#common.dot.dns.yandex.net.'))
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [

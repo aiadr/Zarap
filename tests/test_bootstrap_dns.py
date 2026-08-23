@@ -48,15 +48,16 @@ class BootstrapDnsTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_an_empty_setting_keeps_the_encrypted_default(self):
-        # A configuration written before the setting existed has no value, and
-        # it has to keep behaving as it did rather than losing its resolver.
+    def test_an_empty_setting_falls_back_to_the_router_itself(self):
+        # Умолчание — резолвер самого роутера. DoH к 1.1.1.1, стоявший здесь
+        # раньше, оказался умолчанием, которое не работает ровно там, ради чего
+        # пакет и написан, а его отказ выглядит как тишина.
         for value in ("", "   ", None):
             parsed = self.parse(value)
             self.assertTrue(parsed["ok"])
-            self.assertEqual(parsed["value"], "https://1.1.1.1")
-            self.assertEqual(parsed["server"], {
-                "type": "https", "tag": "dns_bootstrap", "server": "1.1.1.1"})
+            self.assertEqual(parsed["value"], "local")
+            self.assertEqual(parsed["server"],
+                             {"type": "local", "tag": "dns_bootstrap"})
 
     def test_the_scheme_decides_what_leaves_the_router(self):
         # This is the whole point of the setting: https and tls encrypt the

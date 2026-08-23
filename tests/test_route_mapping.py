@@ -374,7 +374,7 @@ class RouteMappingTests(unittest.TestCase):
         ], "direct")
         self.assertEqual(config["dns"]["servers"], [
             # Both servers carry domains, so the bootstrap resolver leads.
-            {"type": "https", "tag": "dns_bootstrap", "server": "1.1.1.1"},
+            {"type": "local", "tag": "dns_bootstrap"},
             {"type": "https", "tag": "dns_out_1", "server": "1.1.1.1", "detour": "out_1"},
             {"type": "https", "tag": "dns_out_2", "server": "1.1.1.1", "detour": "out_2"},
         ])
@@ -399,11 +399,14 @@ class RouteMappingTests(unittest.TestCase):
         self.assertEqual(config["route"]["default_domain_resolver"],
                          "dns_bootstrap")
         bootstrap = config["dns"]["servers"][0]
-        self.assertEqual(bootstrap, {"type": "https", "tag": "dns_bootstrap",
-                                     "server": "1.1.1.1"})
+        self.assertEqual(bootstrap, {"type": "local", "tag": "dns_bootstrap"})
         # `detour: "direct"` is refused by name — "detour to an empty direct
         # outbound makes no sense" — and leaving it out is what dials directly.
+        # Holds for the encrypted forms too, which do carry an address.
         self.assertNotIn("detour", bootstrap)
+        self.assertNotIn("detour", self.generate(
+            [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}],
+            "out_1", bootstrap="https://1.1.1.1")["dns"]["servers"][0])
         # Nothing points at the direct outbound, so it stays undeclared: the
         # bootstrap resolver does not reach the WAN through it.
         self.assertEqual(self.tags(config), ["out_1"])
@@ -413,7 +416,9 @@ class RouteMappingTests(unittest.TestCase):
         # setting is the only way left to name a resolver that gets through.
         rules = [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}]
         for value, expected in (
-            ("", {"type": "https", "tag": "dns_bootstrap", "server": "1.1.1.1"}),
+            ("", {"type": "local", "tag": "dns_bootstrap"}),
+            ("https://1.1.1.1", {"type": "https", "tag": "dns_bootstrap",
+                                 "server": "1.1.1.1"}),
             ("udp://192.168.1.1", {"type": "udp", "tag": "dns_bootstrap",
                                    "server": "192.168.1.1"}),
             ("local", {"type": "local", "tag": "dns_bootstrap"}),
