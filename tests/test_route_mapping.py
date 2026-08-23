@@ -58,21 +58,25 @@ class RouteMappingTests(unittest.TestCase):
                                 "const RESERVED_TAGS", "const CACHE_FILE",
                                 "const DNS_TAG", "const DNS_PORT",
                                 "const DNS_UPSTREAM", "const BOOTSTRAP_TAG",
-                                "const BOOTSTRAP_DEFAULT", "const BOOTSTRAP_SCHEMES")))
+                                "const BOOTSTRAP_DEFAULT", "const BOOTSTRAP_SCHEMES",
+                                "const TUNNEL_DEFAULT")))
         cls.prelude = constants + "\n" + "\n".join(
             lift(source, name) for name in
             ("valid_outbound_tag", "valid_ipv4", "is_domain", "result_error",
-             "input_error", "parse_bootstrap", "outbound_json", "dns_routes",
-             "domain_json", "rule_jsons", "sing_box_config"))
+             "input_error", "parse_resolver", "parse_bootstrap", "parse_tunnel_dns",
+             "outbound_json", "dns_routes", "domain_json", "rule_jsons",
+             "sing_box_config"))
 
     def generate(self, outbounds, rules, final, addresses=None, rulesets=None,
-                 ruleset_detour="direct", bootstrap="", resolve_all=False):
-        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s, %s, %s, %s));\n" % (
+                 ruleset_detour="direct", bootstrap="", resolve_all=False,
+                 tunnel_dns=""):
+        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s, %s, %s, %s, %s));\n" % (
             self.prelude,
             json.dumps(outbounds), json.dumps(rules), json.dumps(final),
             json.dumps(ADDRESSES if addresses is None else addresses),
             json.dumps(rulesets or []), json.dumps(ruleset_detour),
-            json.dumps(bootstrap), "true" if resolve_all else "false")
+            json.dumps(bootstrap), "true" if resolve_all else "false",
+            json.dumps(tunnel_dns))
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name

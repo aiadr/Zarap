@@ -45,6 +45,7 @@ const fixtures = {
     ruleset_detour_missing: false,
     bootstrap_dns: 'local',
     resolve_all: false,
+    tunnel_dns: 'https://1.1.1.1',
     cache: { size: 1258291, free: 20971520 },
     dns: { forwarded: 0, unresolved: '', bootstrap: 'local' },
     final: 'direct',
