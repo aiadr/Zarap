@@ -28,7 +28,7 @@ async function openMaintenance(page) {
 // все позиции за собой, и тест ломается там, где ничего не менялось. Порядок
 // один в один повторяет объявление rpc в overview.js.
 const APPLY_ARGS = ['enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour',
-                    'bootstrap_dns', 'clients', 'final'];
+                    'bootstrap_dns', 'resolve_all', 'clients', 'final'];
 
 function applyArgs(call) {
   return Object.fromEntries(APPLY_ARGS.map((name, index) => [name, call.args[index]]));
@@ -471,6 +471,26 @@ test('names the host that would not resolve, next to the field that fixes it', a
 test('says nothing about the resolver while names resolve', async ({ page }) => {
   await openZarap(page);
   await expect(page.locator('[data-field="bootstrap-unresolved"]')).toHaveCount(0);
+});
+
+test('hands the household DNS over only when asked, and says the cost', async ({ page }) => {
+  // Переключатель меняет DNS всей сети, поэтому по умолчанию он выключен и
+  // существующая установка ничего не замечает.
+  await openZarap(page);
+
+  const box = page.locator('#zarap-resolve-all');
+  await expect(box).not.toBeChecked();
+  // Цена названа рядом с переключателем, а не в документации.
+  await expect(page.getByText(/внешних имён в сети нет/)).toBeVisible();
+  await expect(page.getByText(/возвращаются при выключении Zarap/)).toBeVisible();
+
+  await box.check();
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.resolve_all).toBe(true);
 });
 
 test('sends the resolver chosen for the address of the server', async ({ page }) => {
