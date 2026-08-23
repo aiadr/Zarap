@@ -113,9 +113,41 @@ class BootstrapDnsTests(unittest.TestCase):
         self.assertEqual(self.parse("udp://8.8.8.8/dns-query").get("kind"), "input_error")
 
     def test_a_name_is_refused_because_it_would_need_this_very_resolver(self):
+        # sing-box отказывается стартовать с DNS-сервером, заданным именем:
+        # "missing domain resolver for domain server address".
         parsed = self.parse("https://cloudflare-dns.com")
         self.assertEqual(parsed.get("kind"), "input_error")
         self.assertIn("имя", parsed["error"])
+        # Отказ обязан назвать форму, которой имя всё-таки записывается.
+        self.assertIn("имя@адрес", parsed["error"])
+
+    def test_an_encrypted_resolver_can_be_dialled_by_address_and_checked_by_name(self):
+        # DoT и DoH по голому адресу проверяются только там, где в сертификате
+        # есть IP SAN. Он есть у Cloudflare и далеко не у всех остальных, и без
+        # этой формы такой резолвер просто нельзя было бы назвать.
+        parsed = self.parse("tls://common.dot.dns.yandex.net@77.88.8.8")
+        self.assertTrue(parsed["ok"], parsed.get("error"))
+        # enabled обязателен: без него блок принимается check и молча
+        # игнорируется на запуске, а проверка идёт по адресу.
+        self.assertEqual(parsed["server"], {
+            "type": "tls", "tag": "dns_bootstrap", "server": "77.88.8.8",
+            "tls": {"enabled": True, "server_name": "common.dot.dns.yandex.net"}})
+        self.assertEqual(parsed["value"], "tls://common.dot.dns.yandex.net@77.88.8.8")
+
+        # Порт и путь никуда не деваются от того, что появилось имя.
+        doh = self.parse("https://common.dns.yandex.net@77.88.8.8:8443/dns-query")
+        self.assertTrue(doh["ok"], doh.get("error"))
+        self.assertEqual(doh["server"]["server_port"], 8443)
+        self.assertEqual(doh["server"]["path"], "/dns-query")
+        self.assertEqual(doh["server"]["tls"]["server_name"], "common.dns.yandex.net")
+
+    def test_a_certificate_name_makes_no_sense_without_encryption(self):
+        # Открытый запрос ничего не проверяет, и принять здесь имя значило бы
+        # пообещать проверку, которой не будет.
+        for value in ("udp://dns.yandex.net@77.88.8.8", "tcp://dns.yandex.net@77.88.8.8"):
+            parsed = self.parse(value)
+            self.assertEqual(parsed.get("kind"), "input_error", value)
+        self.assertEqual(self.parse("tls://не имя@77.88.8.8").get("kind"), "input_error")
 
     def test_ipv6_and_unknown_schemes_are_named_in_the_refusal(self):
         self.assertEqual(self.parse("udp://[2606:4700:4700::1111]").get("kind"),
