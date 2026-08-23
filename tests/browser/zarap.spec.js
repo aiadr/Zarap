@@ -95,12 +95,12 @@ test('sends the leases of guarded devices and the connections as they stand', as
     { clients: ['10:20:30:40:50:60'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'block' }
   ]);
   // Only devices a rule names carry a lease.
-  expect(apply.args[4]).toEqual([
+  expect(apply.args[5]).toEqual([
     { mac: '00:11:22:33:44:55', name: 'Телевизор', ip: '192.168.1.50' },
     { mac: '10:20:30:40:50:60', name: 'Планшет ребёнка', ip: '192.168.1.62' }
   ]);
-  expect(apply.args[4].some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
-  expect(apply.args[5]).toBe('direct');
+  expect(apply.args[5].some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
+  expect(apply.args[6]).toBe('direct');
 });
 
 test('shows backend validation errors without applying configuration', async ({ page }) => {
@@ -282,8 +282,9 @@ test('shows conditions by destination and hands them back untouched', async ({ p
     window.__statusOverride = {
       rulesets: [
         { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
-          detour: 'direct', update_interval: '1d', in_use: true }
+          update_interval: '1d', in_use: true }
       ],
+      ruleset_detour: 'direct',
       rules: [
         { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
           rule_sets: ['rs_1'], ip_cidr: ['149.154.160.0/20'],
@@ -313,8 +314,9 @@ test('shows conditions by destination and hands them back untouched', async ({ p
   const sent = calls.find(call => call.method === 'apply');
   expect(sent.args[3]).toEqual([
     { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
-      detour: 'direct', update_interval: '1d' }
+      update_interval: '1d' }
   ]);
+  expect(sent.args[4]).toEqual('direct');
   expect(sent.args[2]).toEqual([
     { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
       rule_sets: ['rs_1'], ip_cidr: ['149.154.160.0/20'],
@@ -389,9 +391,10 @@ test('adds a rule set and points a rule at it', async ({ page }) => {
 
   const added = page.locator('tr[data-ruleset="rs_2"]');
   await expect(added).toContainText('Заблокированное');
-  // Источники списков заблокированы там же, где и всё остальное, поэтому по
-  // умолчанию предлагается подключение.
-  await expect(added).toContainText('Нидерланды');
+  // Подключение выбирается один раз на все списки, а не в строке списка: в
+  // фикстуре оно уже выбрано, и добавленный список едет через него же.
+  await expect(added).not.toContainText('Нидерланды');
+  await expect(page.locator('#zarap-ruleset-detour')).toHaveValue('out_1');
 
   // Ничего не ушло на роутер: список уезжает вместе с применением.
   let calls = await page.evaluate(() => window.__rpcCalls);
@@ -410,9 +413,45 @@ test('adds a rule set and points a rule at it', async ({ page }) => {
   const apply = calls.find(call => call.method === 'apply');
   expect(apply.args[3]).toContainEqual({
     tag: 'rs_2', label: 'Заблокированное', url: 'https://example.org/geosite-ru.srs',
-    detour: 'out_1', update_interval: '1d'
+    update_interval: '1d'
   });
+  expect(apply.args[4]).toEqual('out_1');
   expect(apply.args[2][1].rule_sets).toEqual(['rs_2']);
+});
+
+test('picks the download connection once for every list', async ({ page }) => {
+  // Раньше подключение стояло у каждого списка, и десять списков означали
+  // десять раз один и тот же ответ. Теперь выбор один, и уезжает он один.
+  await openZarap(page);
+
+  const detour = page.locator('#zarap-ruleset-detour');
+  await expect(detour).toHaveValue('out_1');
+  // В строке списка подключения больше нет: колонки с ним не осталось.
+  await expect(page.locator('#zarap-rulesets thead')).not.toContainText('Скачивать через');
+
+  await detour.selectOption('direct');
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = calls.find(call => call.method === 'apply');
+  expect(apply.args[4]).toEqual('direct');
+  expect(apply.args[3].every(ruleset => !('detour' in ruleset))).toBe(true);
+});
+
+test('says so when the connection the lists download through is gone', async ({ page }) => {
+  // Подключение удалили, а выбор на него остался: списки просто перестанут
+  // обновляться, и молчать об этом нельзя.
+  await page.addInitScript(() => {
+    window.__statusOverride = { ruleset_detour: 'out_9' };
+  });
+  await openZarap(page);
+
+  await expect(page.locator('[data-field="ruleset-detour-missing"]'))
+    .toHaveText('подключение удалено — списки не обновятся');
+  // Значение не подменяется на direct: это увело бы загрузку туда, где
+  // источник и заблокирован, — молча.
+  await expect(page.locator('#zarap-ruleset-detour')).toHaveValue('out_9');
 });
 
 test('refuses to delete a rule set a rule still points at', async ({ page }) => {
@@ -535,7 +574,7 @@ test('names a device while picking it for a rule', async ({ page }) => {
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[4]).toContainEqual({
+  expect(apply.args[5]).toContainEqual({
     mac: 'AA:BB:CC:DD:EE:FF', name: 'realme', ip: '192.168.1.81'
   });
 });
@@ -562,7 +601,7 @@ test('a device with no lease is offered a free address when a rule names it', as
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[4]).toContainEqual({
+  expect(apply.args[5]).toContainEqual({
     mac: 'FC:D2:02:D3:28:63', name: 'Устройство FC:D2:02:D3:28:63', ip: '192.168.1.90'
   });
 });
@@ -612,7 +651,7 @@ test('a MAC typed by hand gets a row to carry its address', async ({ page }) => 
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[4]).toContainEqual({
+  expect(apply.args[5]).toContainEqual({
     mac: '10:34:56:78:9A:BC', name: 'Кладовка', ip: '192.168.1.99'
   });
 });
@@ -682,7 +721,7 @@ test('blocking the remainder is confirmed and can be backed out of', async ({ pa
 
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   const calls = await page.evaluate(() => window.__rpcCalls);
-  expect(calls.find(call => call.method === 'apply').args[5]).toBe('block');
+  expect(calls.find(call => call.method === 'apply').args[6]).toBe('block');
 });
 
 test('deleting a rule warns what the device loses', async ({ page }) => {

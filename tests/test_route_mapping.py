@@ -58,12 +58,13 @@ class RouteMappingTests(unittest.TestCase):
             ("valid_outbound_tag", "outbound_json", "dns_routes", "domain_json",
              "rule_jsons", "sing_box_config"))
 
-    def generate(self, outbounds, rules, final, addresses=None, rulesets=None):
-        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s));\n" % (
+    def generate(self, outbounds, rules, final, addresses=None, rulesets=None,
+                 ruleset_detour="direct"):
+        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s, %s));\n" % (
             self.prelude,
             json.dumps(outbounds), json.dumps(rules), json.dumps(final),
             json.dumps(ADDRESSES if addresses is None else addresses),
-            json.dumps(rulesets or []))
+            json.dumps(rulesets or []), json.dumps(ruleset_detour))
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name
@@ -297,10 +298,10 @@ class RouteMappingTests(unittest.TestCase):
         # exactly where the source is blocked.
         rulesets = [{"tag": "rs_1", "label": "Реклама",
                      "url": "https://example.org/ads.srs",
-                     "detour": "out_1", "update_interval": "1d"}]
+                     "update_interval": "1d"}]
         config = self.generate(
             [OUT_1], [{"rule_sets": ["rs_1"], "target": "block"}], "direct",
-            rulesets=rulesets)
+            rulesets=rulesets, ruleset_detour="out_1")
         self.assertEqual(config["route"]["rule_set"], [{
             "type": "remote", "tag": "rs_1", "format": "binary",
             "url": "https://example.org/ads.srs",
@@ -309,9 +310,23 @@ class RouteMappingTests(unittest.TestCase):
         self.assertEqual(config["experimental"]["cache_file"],
                          {"enabled": True, "path": "/etc/zarap/cache.db"})
 
+    def test_one_detour_covers_every_declared_set(self):
+        # The connection is chosen once for all the lists, so each declaration
+        # carries the same download_detour — sing-box has no place to say it
+        # once.
+        rulesets = [{"tag": "rs_1", "label": "", "url": "https://example.org/a.srs",
+                     "update_interval": ""},
+                    {"tag": "rs_2", "label": "", "url": "https://example.org/b.srs",
+                     "update_interval": "1d"}]
+        declared = self.generate(
+            [OUT_1], [{"rule_sets": ["rs_1", "rs_2"], "target": "block"}], "direct",
+            rulesets=rulesets, ruleset_detour="out_1")["route"]["rule_set"]
+        self.assertEqual([entry["download_detour"] for entry in declared],
+                         ["out_1", "out_1"])
+
     def test_a_direct_detour_is_left_out_being_the_default(self):
         rulesets = [{"tag": "rs_1", "label": "", "url": "https://example.org/a.srs",
-                     "detour": "direct", "update_interval": ""}]
+                     "update_interval": ""}]
         declared = self.generate(
             [OUT_1], [{"rule_sets": ["rs_1"], "target": "block"}], "direct",
             rulesets=rulesets)["route"]["rule_set"][0]
@@ -322,7 +337,7 @@ class RouteMappingTests(unittest.TestCase):
         # A declaration alone would be downloaded and cached, so it follows the
         # same rule as the direct outbound: emitted when something points at it.
         rulesets = [{"tag": "rs_1", "label": "", "url": "https://example.org/a.srs",
-                     "detour": "direct", "update_interval": ""}]
+                     "update_interval": ""}]
         config = self.generate(
             [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}],
             "direct", rulesets=rulesets)
@@ -335,7 +350,7 @@ class RouteMappingTests(unittest.TestCase):
         config = self.generate(
             [OUT_1], [{"rule_sets": ["rs_1"], "target": "block"}], "direct",
             rulesets=[{"tag": "rs_1", "label": "", "url": "https://e.org/a.srs",
-                       "detour": "direct", "update_interval": ""}])
+                       "update_interval": ""}])
         self.assertEqual(config["route"]["rules"][0],
                          {"inbound": ["zarap-tproxy"], "action": "sniff"})
 

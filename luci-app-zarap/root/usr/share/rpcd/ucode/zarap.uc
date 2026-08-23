@@ -387,10 +387,11 @@ function valid_ruleset_tag(tag) {
 	return !!match(tag || '', /^rs_[0-9]+$/);
 }
 
-// A ruleset section describes what sing-box should fetch: where from, through
-// what and how often. Zarap keeps no copy of the file and knows nothing about
-// its contents, so what can be checked here is exactly these three things.
-function validate_rulesets(input, tags) {
+// A ruleset section describes what sing-box should fetch: where from and how
+// often. Through what is not here — that is one choice for every list, kept in
+// main.ruleset_detour. Zarap keeps no copy of the file and knows nothing about
+// its contents, so what can be checked here is exactly these two things.
+function validate_rulesets(input) {
 	if (input == null)
 		input = [];
 	if (type(input) != 'array')
@@ -414,10 +415,6 @@ function validate_rulesets(input, tags) {
 		if (!match(url, /^https?:\/\/[!-~]+$/))
 			return input_error('Адрес набора ' + tag + ' должен начинаться с http:// или https://');
 
-		let detour = trim('' + (entry?.detour || 'direct'));
-		if (detour != 'direct' && !tags[detour])
-			return input_error('Набор ' + tag + ' скачивается через несуществующее подключение: ' + detour);
-
 		let interval = lc(trim('' + (entry?.update_interval || '')));
 		if (interval != '' && !match(interval, /^[0-9]{1,4}[hd]$/))
 			return input_error('Интервал обновления набора ' + tag + ' пишется как 12h или 1d');
@@ -426,10 +423,23 @@ function validate_rulesets(input, tags) {
 		if (length(label) > 64)
 			label = trim(substr(label, 0, 64));
 
-		push(result, { tag: tag, label: label, url: url, detour: detour,
+		push(result, { tag: tag, label: label, url: url,
 			update_interval: interval });
 	}
 	return { ok: true, rulesets: result };
+}
+
+// Через что качать — один выбор на все списки сразу. Источники .srs
+// заблокированы там же, где и всё остальное, поэтому ответ у них общий, и
+// спрашивать его на каждый список значило бы повторять одно и то же решение
+// столько раз, сколько списков заведено.
+function validate_ruleset_detour(value, tags) {
+	let detour = trim('' + (value || ''));
+	if (detour == '')
+		detour = 'direct';
+	if (detour != 'direct' && !tags[detour])
+		return input_error('Списки правил скачиваются через несуществующее подключение: ' + detour);
+	return { ok: true, detour: detour };
 }
 
 function valid_target(target, tags) {
@@ -668,7 +678,7 @@ function rule_jsons(rule, address_of) {
 	return emitted;
 }
 
-function sing_box_config(outbounds, rules, final, address_of, rulesets) {
+function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour) {
 	let emitted = [], route_rules = [], wants_direct = false;
 
 	for (let outbound in outbounds)
@@ -727,6 +737,9 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets) {
 	for (let rule in rules)
 		for (let tag in (rule.rule_sets || []))
 			used[tag] = true;
+	// Одно подключение на все списки: поле пишется в каждое объявление, потому
+	// что своего места для «через что качать вообще» в схеме sing-box нет.
+	let detour = trim('' + (ruleset_detour || 'direct'));
 	let declared = [];
 	for (let ruleset in (rulesets || [])) {
 		if (!used[ruleset.tag])
@@ -739,8 +752,8 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets) {
 		};
 		// `direct` is the default detour, so saying it changes nothing and only
 		// adds a field that a later version could rename.
-		if (ruleset.detour && ruleset.detour != 'direct')
-			json.download_detour = ruleset.detour;
+		if (detour != 'direct')
+			json.download_detour = detour;
 		if (ruleset.update_interval)
 			json.update_interval = ruleset.update_interval;
 		push(declared, json);
@@ -1078,11 +1091,12 @@ function configure_dnsmasq(uci, rules) {
 		uci.delete('dhcp', section, 'server');
 }
 
-function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets) {
+function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour) {
 	uci.load('zarap');
 	uci.set('zarap', 'main', 'zarap');
 	uci.set('zarap', 'main', 'enabled', enabled ? '1' : '0');
 	uci.set('zarap', 'main', 'final', final);
+	uci.set('zarap', 'main', 'ruleset_detour', ruleset_detour || 'direct');
 	// Leftovers from the single-connection schema and from the three options
 	// that only ever looked like settings.
 	for (let key in ['name', 'server', 'server_port', 'uuid', 'flow', 'server_name',
@@ -1106,9 +1120,11 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets)
 		                 'public_key', 'short_id', 'fingerprint'])
 			uci.set('zarap', outbound.tag, key, '' + outbound[key]);
 	}
+	// Секции переписываются целиком, поэтому `option detour` из старой схемы,
+	// где подключение стояло у каждого списка, исчезает вместе с секцией.
 	for (let ruleset in rulesets) {
 		uci.set('zarap', ruleset.tag, 'ruleset');
-		for (let key in ['label', 'url', 'detour', 'update_interval'])
+		for (let key in ['label', 'url', 'update_interval'])
 			uci.set('zarap', ruleset.tag, key, '' + ruleset[key]);
 	}
 	for (let rule in rules) {
@@ -1191,7 +1207,7 @@ function cleanup_uci_candidate() {
 	}
 }
 
-function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulesets) {
+function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulesets, ruleset_detour) {
 	mkdir(UCI_CANDIDATE);
 	chmod(UCI_CANDIDATE, 0700);
 	mkdir(UCI_CANDIDATE_DELTA);
@@ -1207,7 +1223,7 @@ function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulese
 	}
 
 	let candidate = cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA);
-	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients, rulesets)) {
+	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour)) {
 		cleanup_uci_candidate();
 		return result_error('Не удалось сформировать временный UCI-кандидат', '', 'startup_error');
 	}
@@ -1295,11 +1311,20 @@ function saved_rulesets() {
 			tag: tag,
 			label: section.label || '',
 			url: section.url || '',
-			detour: section.detour || 'direct',
 			update_interval: section.update_interval || ''
 		});
 	});
 	return rulesets;
+}
+
+// Подключение для загрузки списков — одно на все списки, и живёт оно в main.
+// `option detour` из прежней схемы, где оно стояло у каждого набора, не
+// читается: конфигурация с той схемы возвращается к `direct`, а выбрать
+// подключение заново — одно действие на странице.
+function saved_ruleset_detour() {
+	let uci = cursor();
+	uci.load('zarap');
+	return uci.get('zarap', 'main', 'ruleset_detour') || 'direct';
 }
 
 function saved_final() {
@@ -1426,7 +1451,7 @@ function recent_connection_error() {
 	return false;
 }
 
-function validate_candidate(outbounds, rules, final, clients, proxying, rulesets) {
+function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour) {
 	let lan = lan_device();
 	// A redirect without an interface condition would capture traffic arriving
 	// from the WAN, so an unanswered ubus has to fail the apply outright.
@@ -1443,7 +1468,7 @@ function validate_candidate(outbounds, rules, final, clients, proxying, rulesets
 
 	mkdir('/etc/zarap');
 	chmod('/etc/zarap', 0700);
-	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of, rulesets)) + '\n';
+	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour)) + '\n';
 	let nft = nft_config(guarded, lan, proxying);
 	let config_written = writefile(CONFIG_TMP, sing_box);
 	let nft_written = writefile(NFT_TMP, nft);
@@ -1599,9 +1624,12 @@ function validate_request(args, enabled) {
 	for (let outbound in outbounds)
 		tags[outbound.tag] = true;
 
-	let ruleset_result = validate_rulesets(args?.rulesets, tags);
+	let ruleset_result = validate_rulesets(args?.rulesets);
 	if (!ruleset_result.ok)
 		return ruleset_result;
+	let detour_result = validate_ruleset_detour(args?.ruleset_detour, tags);
+	if (!detour_result.ok)
+		return detour_result;
 	let declared = {};
 	for (let ruleset in ruleset_result.rulesets)
 		declared[ruleset.tag] = true;
@@ -1638,7 +1666,8 @@ function validate_request(args, enabled) {
 		return client_result;
 
 	return { ok: true, outbounds: outbounds, rules: rules, final: final,
-		clients: client_result.clients, rulesets: ruleset_result.rulesets };
+		clients: client_result.clients, rulesets: ruleset_result.rulesets,
+		ruleset_detour: detour_result.detour };
 }
 
 // Списки скачивает sing-box, и до первой удачной загрузки старт зависит от
@@ -1653,8 +1682,8 @@ function startup_hint(rulesets) {
 		push(names, ruleset.label ? (ruleset.label + ' (' + ruleset.tag + ')') : ruleset.tag);
 	return 'Проверьте наборы правил: ' + join(', ', names) +
 		'. Их скачивает sing-box, и пока список не попал в кэш, запуск зависит от ' +
-		'доступности его адреса — в том числе через выбранное для него подключение. ' +
-		'Причина отказа есть в журнале.';
+		'доступности его адреса — в том числе через подключение, выбранное для ' +
+		'загрузки списков. Причина отказа есть в журнале.';
 }
 
 function apply_configuration(args) {
@@ -1668,11 +1697,12 @@ function apply_configuration(args) {
 		return conflict;
 
 	let candidate = validate_candidate(request.outbounds, request.rules, request.final,
-		request.clients, enabled, request.rulesets);
+		request.clients, enabled, request.rulesets, request.ruleset_detour);
 	if (!candidate.ok)
 		return candidate;
 	let uci_candidate = prepare_uci_candidate(request.outbounds, request.rules,
-		request.final, enabled, request.clients, request.rulesets);
+		request.final, enabled, request.clients, request.rulesets,
+		request.ruleset_detour);
 	if (!uci_candidate.ok) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
 		return uci_candidate;
@@ -1980,21 +2010,21 @@ function status() {
 	}
 
 	let listed_sets = [];
-	for (let ruleset in saved_rulesets()) {
-		// Скачивание идёт через подключение, а подключение могли удалить: тогда
-		// набор не обновится, и сказать об этом должен интерфейс.
-		let detour = ruleset.detour;
+	for (let ruleset in saved_rulesets())
 		push(listed_sets, {
 			tag: ruleset.tag,
 			label: ruleset.label,
 			url: ruleset.url,
-			detour: detour,
-			detour_missing: detour != 'direct' && !length(filter(outbounds,
-				function(outbound) { return outbound.tag == detour; })),
 			update_interval: ruleset.update_interval,
 			in_use: !!sets_in_use[ruleset.tag]
 		});
-	}
+
+	// Скачивание идёт через одно подключение на все списки, а подключение могли
+	// удалить: тогда ни один список не обновится, и сказать об этом должен
+	// интерфейс.
+	let ruleset_detour = saved_ruleset_detour();
+	let ruleset_detour_missing = ruleset_detour != 'direct' && !length(filter(outbounds,
+		function(outbound) { return outbound.tag == ruleset_detour; }));
 
 	let listed = [];
 	for (let outbound in outbounds)
@@ -2017,6 +2047,8 @@ function status() {
 		routing: health.routing,
 		outbounds: listed,
 		rulesets: listed_sets,
+		ruleset_detour: ruleset_detour,
+		ruleset_detour_missing: ruleset_detour_missing,
 		cache: cache_state(),
 		// Сколько имён резолвится через прокси. Ноль означает, что доменные
 		// правила работают только против DPI: подменённый DNS они не обходят.
@@ -2179,17 +2211,19 @@ function update_component(name) {
 const methods = {
 	status: { call: function() { return status(); } },
 	validate: {
-		args: { outbounds: [], rules: [], rulesets: [], clients: [], final: '' },
+		args: { outbounds: [], rules: [], rulesets: [], ruleset_detour: '', clients: [], final: '' },
 		call: function(request) {
 			let checked = validate_request(request.args || {}, true);
 			if (!checked.ok) return checked;
 			let conflict = resource_conflict();
 			if (!conflict.ok) return conflict;
 			let candidate = validate_candidate(checked.outbounds, checked.rules,
-				checked.final, checked.clients, true, checked.rulesets);
+				checked.final, checked.clients, true, checked.rulesets,
+				checked.ruleset_detour);
 			if (!candidate.ok) return candidate;
 			let uci_candidate = prepare_uci_candidate(checked.outbounds, checked.rules,
-				checked.final, true, checked.clients, checked.rulesets);
+				checked.final, true, checked.clients, checked.rulesets,
+				checked.ruleset_detour);
 			unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
 			if (!uci_candidate.ok) return uci_candidate;
 			return {
@@ -2203,7 +2237,7 @@ const methods = {
 		}
 	},
 	apply: {
-		args: { enabled: true, outbounds: [], rules: [], rulesets: [], clients: [], final: '' },
+		args: { enabled: true, outbounds: [], rules: [], rulesets: [], ruleset_detour: '', clients: [], final: '' },
 		call: function(request) {
 			let lock = acquire_lock();
 			if (!lock) return result_error('Другая операция Zarap уже выполняется');

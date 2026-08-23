@@ -34,7 +34,8 @@ class RuleConditionTests(unittest.TestCase):
             "result_error", "input_error", "normalize_mac", "is_private_mac",
             "valid_ipv4", "normalize_domain", "normalize_cidr", "normalize_port",
             "valid_target", "valid_ruleset_tag", "validate_rulesets",
-            "validate_rule_list", "validate_rules", "startup_hint"))
+            "validate_ruleset_detour", "validate_rule_list", "validate_rules",
+            "startup_hint"))
 
     def validate(self, rules, tags=None, declared=None):
         script = "%s\nprintf('%%J', validate_rules(%s, %s, %s));\n" % (
@@ -180,10 +181,8 @@ class RuleConditionTests(unittest.TestCase):
             self.assertTrue(
                 self.validate([{"clients": [TABLET], "target": target}])["ok"])
 
-    def rulesets(self, entries, tags=None):
-        script = "%s\nprintf('%%J', validate_rulesets(%s, %s));\n" % (
-            self.prelude, json.dumps(entries),
-            json.dumps({"out_1": True} if tags is None else tags))
+    def run_ucode(self, expression):
+        script = "%s\nprintf('%%J', %s);\n" % (self.prelude, expression)
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name
@@ -194,23 +193,39 @@ class RuleConditionTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_a_ruleset_needs_a_name_an_address_and_a_reachable_detour(self):
+    def rulesets(self, entries):
+        return self.run_ucode("validate_rulesets(%s)" % json.dumps(entries))
+
+    def detour(self, value, tags=None):
+        return self.run_ucode("validate_ruleset_detour(%s, %s)" % (
+            json.dumps(value),
+            json.dumps({"out_1": True} if tags is None else tags)))
+
+    def test_a_ruleset_needs_a_name_an_address_and_a_schedule(self):
         good = self.rulesets([{"tag": "rs_1", "label": "Реклама",
                                "url": "https://example.org/a.srs",
-                               "detour": "out_1", "update_interval": "1d"}])
+                               "update_interval": "1d"}])
         self.assertTrue(good["ok"], good)
-        self.assertEqual(good["rulesets"][0]["detour"], "out_1")
+        # Через что качать, набор больше не решает: это один выбор на все
+        # списки, и он приезжает отдельным аргументом.
+        self.assertNotIn("detour", good["rulesets"][0])
 
         self.assertIn("Некорректное имя", self.rulesets(
             [{"tag": "ads", "url": "https://example.org/a.srs"}])["error"])
         self.assertIn("http", self.rulesets(
             [{"tag": "rs_1", "url": "example.org/a.srs"}])["error"])
-        self.assertIn("несуществующее подключение", self.rulesets(
-            [{"tag": "rs_1", "url": "https://example.org/a.srs",
-              "detour": "out_9"}])["error"])
         self.assertIn("12h", self.rulesets(
             [{"tag": "rs_1", "url": "https://example.org/a.srs",
               "update_interval": "каждый день"}])["error"])
+
+    def test_one_detour_answers_for_every_list(self):
+        self.assertEqual(self.detour("out_1")["detour"], "out_1")
+        self.assertEqual(self.detour("direct")["detour"], "direct")
+        # Ничего не выбрано — качаем напрямую: это единственный выход, который
+        # есть всегда, даже когда подключений ещё нет.
+        self.assertEqual(self.detour("")["detour"], "direct")
+        self.assertEqual(self.detour(None)["detour"], "direct")
+        self.assertIn("несуществующее подключение", self.detour("out_9")["error"])
 
     def test_a_rule_points_only_at_a_declared_set(self):
         # The section list and the rules are submitted together, so a reference
