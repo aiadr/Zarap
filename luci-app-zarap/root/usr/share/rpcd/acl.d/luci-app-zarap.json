@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"zarap": [ "apply", "restart", "stop", "update_component" ]
+				"zarap": [ "apply", "restart", "stop", "refresh_rulesets", "update_component" ]
 			},
 			"uci": [ "zarap", "dhcp" ]
 		}

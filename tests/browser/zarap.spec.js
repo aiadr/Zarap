@@ -506,6 +506,67 @@ test('says how much room the rule set cache leaves', async ({ page }) => {
   await expect(page.locator('[data-field="cache-warning"]')).toBeVisible();
 });
 
+test('forces every list to be downloaded again', async ({ page }) => {
+  // Ждать интервала нечего, когда список поправили на источнике или он не
+  // скачался, пока роутер был без интернета. Обновляются все списки сразу.
+  await openZarap(page);
+
+  const button = page.locator('#zarap-refresh-rulesets');
+  await expect(button).toBeEnabled();
+  await button.click();
+
+  await expect(page.getByText('Списки скачаны заново')).toBeVisible();
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  expect(calls.filter(call => call.method === 'refresh_rulesets')).toHaveLength(1);
+  // Размер кэша приезжает в ответе, поэтому строка про место обновляется без
+  // перезагрузки страницы — а с ней остались бы несохранённые правки.
+  await expect(page.locator('#zarap-cache')).toContainText('2.0 МиБ');
+  await expect(button).toBeEnabled();
+  await expect(button).toHaveText('Обновить списки сейчас');
+});
+
+test('says the lists will be fetched at the next start when Zarap is off', async ({ page }) => {
+  await page.addInitScript(() => { window.__statusOverride = { enabled: false }; });
+  await openZarap(page);
+  // runtime.js пересоздаёт __mockState при загрузке, поэтому ответ мока
+  // настраивается после неё, как и в остальных тестах.
+  await page.evaluate(() => { window.__mockState.refreshRestarted = false; });
+
+  await expect(page.locator('#zarap-ruleset-refresh')).toContainText('Zarap выключен');
+  await page.locator('#zarap-refresh-rulesets').click();
+  await expect(page.getByText('Кэш списков очищен')).toBeVisible();
+});
+
+test('keeps the old lists when the refresh cannot reach their source', async ({ page }) => {
+  // Обновление списка не должно стоить дому интернета: роутер возвращает
+  // прежний кэш, а страница обязана сказать, что нового списка нет.
+  await openZarap(page);
+  await page.evaluate(() => {
+    window.__mockState.refreshError = 'Списки не обновились: без кэша sing-box не поднялся. Прежний кэш возвращён, служба работает на нём';
+  });
+
+  await page.locator('#zarap-refresh-rulesets').click();
+  await expect(page.getByText('Прежний кэш возвращён')).toBeVisible();
+  await expect(page.getByText('Проверьте наборы правил')).toBeVisible();
+  // Кнопка вернулась: попробовать ещё раз можно, ничего не перезагружая.
+  await expect(page.locator('#zarap-refresh-rulesets')).toBeEnabled();
+});
+
+test('refreshing goes after the lists the router has, not the ones on the page', async ({ page }) => {
+  await openZarap(page);
+
+  await page.locator('#zarap-ruleset-url').fill('https://example.org/geosite-ru.srs');
+  await page.locator('#zarap-add-ruleset').click();
+  await expect(page.locator('[data-field="ruleset-refresh-pending"]'))
+    .toContainText('обновится то, что уже применено');
+
+  // Списков на роутере нет вовсе — обновлять нечего, и кнопка это говорит.
+  await page.addInitScript(() => { window.__statusOverride = { rulesets: [] }; });
+  await page.reload();
+  await expect.poll(() => page.locator('body').getAttribute('data-ready')).toBe('true');
+  await expect(page.locator('#zarap-refresh-rulesets')).toBeDisabled();
+});
+
 test('adds a rule and picks its devices without touching the router', async ({ page }) => {
   await openZarap(page);
 

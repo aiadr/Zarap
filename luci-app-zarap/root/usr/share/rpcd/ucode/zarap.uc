@@ -12,6 +12,11 @@ const CONFIG = '/etc/zarap/sing-box.json';
 // purpose: in /tmp every reboot would send it back to the network for lists
 // that had already been fetched.
 const CACHE_FILE = '/etc/zarap/cache.db';
+// Куда кэш отодвигается на время принудительного обновления. Переименование, а
+// не копия: лишнего места на flash оно не просит, а вернуть кэш на место —
+// единственный способ пережить обновление, при котором источник оказался
+// недоступен и без кэша служба уже не поднимается.
+const CACHE_BACKUP = '/etc/zarap/cache.db.bak';
 const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp';
 const NFT_CONFIG = '/etc/nftables.d/90-zarap.nft';
 const NFT_TMP = '/etc/nftables.d/.90-zarap.nft.tmp';
@@ -1735,9 +1740,12 @@ function apply_configuration(args) {
 	chmod(CONFIG, 0600);
 	unlink(NFT_CHECK);
 	// Ни одного набора не осталось — держать их кэш незачем, а место на flash
-	// он занимает настоящее.
-	if (!length(request.rulesets))
+	// он занимает настоящее. Вместе с ним уходит и отложенная копия: она того
+	// же кэша, и пережить последний набор ей тем более незачем.
+	if (!length(request.rulesets)) {
 		unlink(CACHE_FILE);
+		unlink(CACHE_BACKUP);
+	}
 
 	if (system(['/etc/init.d/firewall', 'reload']) != 0) {
 		let restored = rollback(backups);
@@ -2060,6 +2068,71 @@ function status() {
 	};
 }
 
+// «Обновить сейчас». Списки обновляет sing-box сам, по интервалу, и команды
+// «сходи за ними прямо сейчас» у него нет: скачанное лежит в cache.db, и
+// запуск берёт список оттуда, а не из сети. Единственный рычаг — убрать кэш и
+// перезапустить: без кэша sing-box идёт за каждым списком заново.
+//
+// Поэтому обновление одно на все списки сразу. Кэш внутри принадлежит sing-box,
+// вынуть из него один набор нечем, и обещать построчное обновление значило бы
+// обещать то, чего под ним нет, — как и выбор подключения, ответ здесь один на
+// весь роутер.
+//
+// Кэш при этом не удаляется, а отодвигается. Старт без кэша зависит от чужого
+// сервера: если списка нет ни в кэше, ни в сети, служба может не подняться, и
+// тогда обновление списка стоило бы дому интернета. Отложенная копия
+// возвращается на место, sing-box снова работает на ней, а пользователь читает,
+// что обновление не состоялось.
+function refresh_rulesets() {
+	let rulesets = saved_rulesets();
+	if (!length(rulesets))
+		return input_error('На роутере нет ни одного списка: обновлять нечего');
+
+	let uci = cursor();
+	uci.load('zarap');
+	let enabled = uci.get('zarap', 'main', 'enabled') == '1';
+
+	// Копия с прошлого раза означает прерванное обновление. Держать её незачем:
+	// её содержимое старше того, за чем сейчас идут в сеть, а место на flash
+	// она занимает настоящее.
+	unlink(CACHE_BACKUP);
+
+	// Выключенный Zarap перезапускать нечем: sing-box под его конфигурацией не
+	// работает. Кэша достаточно убрать — за списками он сходит на запуске.
+	if (!enabled) {
+		unlink(CACHE_FILE);
+		return { ok: true, restarted: false, cache: cache_state() };
+	}
+
+	let cached = !!access(CACHE_FILE);
+	if (cached && !rename(CACHE_FILE, CACHE_BACKUP))
+		return result_error('Не удалось отложить кэш списков; ничего не менялось',
+			CACHE_FILE, 'operation_error');
+
+	let code = system(['/etc/init.d/sing-box', 'restart']);
+	let health = code == 0 ? check_runtime(true, LISTENER_WAIT) : { ok: false };
+	if (code == 0 && health.ok) {
+		unlink(CACHE_BACKUP);
+		return { ok: true, restarted: true, cache: cache_state(), health: health };
+	}
+
+	// Не поднялось без кэша — значит, за списком идти оказалось некуда. Свежий
+	// кэш, если он успел появиться, теперь чужой этой конфигурации: на его
+	// место возвращается прежний.
+	unlink(CACHE_FILE);
+	let restored = cached && rename(CACHE_BACKUP, CACHE_FILE);
+	let back = system(['/etc/init.d/sing-box', 'restart']) == 0 &&
+		check_runtime(true, LISTENER_WAIT).ok;
+	let details = startup_hint(rulesets) + '\n' + sprintf('%J', health);
+	if (back)
+		return result_error(restored ?
+			'Списки не обновились: без кэша sing-box не поднялся. Прежний кэш возвращён, служба работает на нём' :
+			'Списки не обновились: sing-box не поднялся, а кэша, чтобы вернуться к нему, не было',
+			details, 'startup_error');
+	return result_error('Списки не обновились, и вернуть службу не удалось; kill switch остаётся активным',
+		details, 'startup_error');
+}
+
 function logs() {
 	// Every connection, not just the first: missing one would put the uuid of a
 	// second proxy into the log the user copies out.
@@ -2265,6 +2338,15 @@ const methods = {
 		}
 	},
 	logs: { call: function() { return logs(); } },
+	refresh_rulesets: {
+		call: function() {
+			let lock = acquire_lock();
+			if (!lock) return result_error('Другая операция Zarap уже выполняется');
+			let result = refresh_rulesets();
+			release_lock(lock);
+			return result;
+		}
+	},
 	updates: {
 		args: { refresh: true },
 		call: function(request) {

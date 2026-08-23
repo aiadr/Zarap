@@ -131,6 +131,18 @@ const handlers = {
     ? { ok: false, error: window.__mockState.applyError }
     : { ok: true, enabled: true },
   restart: () => ({ ok: true }),
+  refresh_rulesets: () => window.__mockState.refreshError
+    ? {
+      ok: false,
+      error: window.__mockState.refreshError,
+      details: 'Проверьте наборы правил: Реклама (rs_1).',
+      kind: 'startup_error'
+    }
+    : {
+      ok: true,
+      restarted: window.__mockState.refreshRestarted !== false,
+      cache: { size: 2097152, free: 20971520 }
+    },
   stop: () => ({ ok: true }),
   update_component: name => window.__mockState.updateError
     ? { ok: false, error: window.__mockState.updateError }
