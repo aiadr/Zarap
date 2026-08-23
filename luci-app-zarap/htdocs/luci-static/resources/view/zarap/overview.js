@@ -10,6 +10,7 @@ const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'ena
 const callRestart = rpc.declare({ object: 'zarap', method: 'restart' });
 const callStop = rpc.declare({ object: 'zarap', method: 'stop' });
 const callLogs = rpc.declare({ object: 'zarap', method: 'logs' });
+const callRefreshRulesets = rpc.declare({ object: 'zarap', method: 'refresh_rulesets' });
 const callUpdates = rpc.declare({ object: 'zarap', method: 'updates', params: [ 'refresh' ] });
 const callUpdateComponent = rpc.declare({ object: 'zarap', method: 'update_component', params: [ 'name' ] });
 
@@ -96,6 +97,9 @@ const state = {
 	outbounds: [],
 	rules: [],
 	rulesets: [],
+	// Списки, которые уже лежат на роутере. Обновление идёт за ними, а не за
+	// тем, что набрано на странице: sing-box качает то, что ему применили.
+	appliedRulesets: [],
 	// Через что скачивать списки — один выбор на все списки сразу: их источники
 	// заблокированы там же, где и всё остальное, так что ответ у них общий.
 	rulesetDetour: 'direct',
@@ -143,6 +147,9 @@ function loadState(status) {
 			url: ruleset.url || '',
 			update_interval: ruleset.update_interval || ''
 		};
+	});
+	state.appliedRulesets = state.rulesets.map(function(ruleset) {
+		return Object.assign({}, ruleset);
 	});
 	state.rulesetDetour = status.ruleset_detour || 'direct';
 	state.cache = status.cache || { size: 0, free: 0 };
@@ -1064,6 +1071,50 @@ function renderCache() {
 	]);
 }
 
+// «Обновить сейчас». Обычно списки обновляет sing-box сам, по интервалу, и
+// кнопка нужна там, где ждать интервал нечего: список поправили на источнике,
+// или он не скачался, пока роутер был без интернета. Обновляются все списки
+// сразу — кэш у sing-box общий, и вынуть из него один набор нечем.
+function rulesetRefreshRow(owner) {
+	if (owner)
+		rulesetRefreshRow.owner = owner;
+	const context = rulesetRefreshRow.owner;
+	// Роутер обновит то, что ему применили, поэтому и кнопка смотрит на
+	// применённое: набранный, но не сохранённый список sing-box ещё не видел.
+	const applied = state.appliedRulesets.length;
+	const pending = JSON.stringify(state.rulesets) !== JSON.stringify(state.appliedRulesets);
+	const note = !applied
+		? _('Списки появятся здесь после применения.')
+		: state.enabled
+		? _('Кэш очищается, sing-box перезапускается и скачивает все списки заново: связь прервётся на несколько секунд. Не скачался — прежний кэш вернётся на место.')
+		: _('Zarap выключен: кэш очистится, а списки скачаются при следующем запуске.');
+	return E('span', {}, [
+		E('button', {
+			'id': 'zarap-refresh-rulesets',
+			'class': 'btn cbi-button-action',
+			'disabled': applied ? null : '',
+			'title': applied ? '' : _('На роутере пока нет применённых списков'),
+			'click': ui.createHandlerFn(context, async function(ev) {
+				const button = ev.currentTarget;
+				button.disabled = true;
+				dom.content(button, _('Обновление…'));
+				const result = await callRefreshRulesets();
+				if (result && result.ok)
+					state.cache = result.cache || state.cache;
+				notify(result, result && result.restarted
+					? _('Списки скачаны заново: кэш очищен, sing-box перезапущен')
+					: _('Кэш списков очищен: sing-box скачает их заново при следующем запуске'));
+				// Перерисовка возвращает кнопку в исходное состояние и заодно
+				// показывает новый размер кэша.
+				refresh();
+			})
+		}, _('Обновить списки сейчас')),
+		E('small', { 'style': 'margin-left:.5em' }, note),
+		applied && pending ? E('div', { 'data-field': 'ruleset-refresh-pending' },
+			E('small', {}, _('на странице есть несохранённые изменения списков — обновится то, что уже применено'))) : ''
+	]);
+}
+
 // Доменное правило меняет путь, но не точку назначения: наружу уходит адрес,
 // который клиент получил от DNS. Пока имя не резолвится через прокси, такое
 // правило обходит DPI по SNI и не обходит блокировку, устроенную в DNS.
@@ -1163,6 +1214,7 @@ function refresh() {
 	dom.content(document.querySelector('#zarap-rulesets-body'), renderRulesets());
 	dom.content(document.querySelector('#zarap-ruleset-detour-row'), rulesetDetourRow());
 	dom.content(document.querySelector('#zarap-cache'), renderCache());
+	dom.content(document.querySelector('#zarap-ruleset-refresh'), rulesetRefreshRow());
 	dom.content(document.querySelector('#zarap-dns-note'), renderDnsNote());
 	dom.content(document.querySelector('#zarap-devices-body'), renderDevices());
 	dom.content(document.querySelector('#zarap-final'), finalRow(finalRow.owner));
@@ -1406,6 +1458,7 @@ return view.extend({
 					]),
 					E('p', { 'id': 'zarap-ruleset-detour-row' }, rulesetDetourRow()),
 					E('p', { 'id': 'zarap-cache' }, renderCache()),
+					E('p', { 'id': 'zarap-ruleset-refresh' }, rulesetRefreshRow(this)),
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-ruleset-url' }, _('Добавить список')),
 						E('div', { 'class': 'cbi-value-field' }, [

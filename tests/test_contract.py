@@ -86,7 +86,7 @@ class PackageContractTests(unittest.TestCase):
         methods_body = BACKEND.split("const methods = {", 1)[1]
         for method in (
             "status", "validate", "apply", "restart", "stop", "logs",
-            "updates", "update_component",
+            "refresh_rulesets", "updates", "update_component",
         ):
             self.assertRegex(methods_body, rf"\b{method}:\s*{{")
         self.assertNotRegex(methods_body, r"\bdevices:\s*{")
@@ -103,6 +103,36 @@ class PackageContractTests(unittest.TestCase):
             "args: { enabled: true, outbounds: [], rules: [], rulesets: [], "
             "ruleset_detour: '', clients: [], final: '' }",
             methods_body)
+
+    def test_every_rpc_method_is_granted_by_the_acl(self):
+        # A method rpcd publishes but the ACL never names is unreachable from
+        # LuCI, and the failure reads as a permission error with nothing to fix.
+        acl = json.loads(
+            (PACKAGE_ROOT / "root/usr/share/rpcd/acl.d/luci-app-zarap.json").read_text()
+        )["luci-app-zarap"]
+        granted = set(acl["read"]["ubus"]["zarap"]) | set(acl["write"]["ubus"]["zarap"])
+        methods_body = BACKEND.split("const methods = {", 1)[1]
+        declared = set(re.findall(r"^\t(\w+): \{", methods_body, re.M))
+        self.assertEqual(declared, granted)
+        # Обновление списков перезапускает службу, значит это запись.
+        self.assertIn("refresh_rulesets", acl["write"]["ubus"]["zarap"])
+
+    def test_forced_refresh_can_put_the_previous_cache_back(self):
+        # Обновление — это старт без кэша, а он зависит от чужого сервера: если
+        # списка нет ни в кэше, ни в сети, служба может не подняться. Прежний
+        # кэш поэтому откладывается, а не удаляется, и возвращается на место.
+        self.assertIn("const CACHE_BACKUP = '/etc/zarap/cache.db.bak'", BACKEND)
+        body = BACKEND.split("function refresh_rulesets(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("rename(CACHE_FILE, CACHE_BACKUP)", body)
+        self.assertIn("rename(CACHE_BACKUP, CACHE_FILE)", body)
+        self.assertIn("check_runtime(true, LISTENER_WAIT)", body)
+        self.assertIn("startup_hint(rulesets)", body)
+        # Выключенный Zarap перезапускать нечем: sing-box под его конфигурацией
+        # не работает, и кэша достаточно убрать.
+        self.assertIn("if (!enabled) {", body)
+        # Ушёл последний список — уходит и отложенная копия: место на flash она
+        # занимает настоящее.
+        self.assertIn("unlink(CACHE_FILE);\n\t\tunlink(CACHE_BACKUP);", BACKEND)
 
     def test_atomic_temporary_files_share_target_directories(self):
         self.assertIn("const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp'", BACKEND)
