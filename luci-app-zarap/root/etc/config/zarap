@@ -1,3 +1,4 @@
 config zarap 'main'
 	option enabled '0'
 	option final 'direct'
+	option ruleset_detour 'direct'

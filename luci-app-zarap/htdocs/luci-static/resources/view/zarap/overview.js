@@ -5,8 +5,8 @@
 'require view';
 
 const callStatus = rpc.declare({ object: 'zarap', method: 'status' });
-const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'clients', 'final' ] });
-const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'clients', 'final' ] });
+const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'clients', 'final' ] });
+const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'clients', 'final' ] });
 const callRestart = rpc.declare({ object: 'zarap', method: 'restart' });
 const callStop = rpc.declare({ object: 'zarap', method: 'stop' });
 const callLogs = rpc.declare({ object: 'zarap', method: 'logs' });
@@ -96,6 +96,9 @@ const state = {
 	outbounds: [],
 	rules: [],
 	rulesets: [],
+	// Через что скачивать списки — один выбор на все списки сразу: их источники
+	// заблокированы там же, где и всё остальное, так что ответ у них общий.
+	rulesetDetour: 'direct',
 	cache: { size: 0, free: 0 },
 	// Сколько имён резолвится через прокси; считается роутером из применённых
 	// правил, поэтому это состояние роутера, а не страницы.
@@ -138,10 +141,10 @@ function loadState(status) {
 			tag: ruleset.tag,
 			label: ruleset.label || '',
 			url: ruleset.url || '',
-			detour: ruleset.detour || 'direct',
 			update_interval: ruleset.update_interval || ''
 		};
 	});
+	state.rulesetDetour = status.ruleset_detour || 'direct';
 	state.cache = status.cache || { size: 0, free: 0 };
 	state.dns = status.dns || { forwarded: 0 };
 	state.final = status.final || 'direct';
@@ -981,15 +984,6 @@ function rulesetRow(ruleset, owner) {
 	return E('tr', { 'class': 'tr', 'data-ruleset': ruleset.tag }, [
 		E('td', { 'class': 'td' }, ruleset.label || ruleset.tag),
 		E('td', { 'class': 'td' }, E('code', { 'style': 'word-break:break-all' }, ruleset.url)),
-		E('td', { 'class': 'td' }, [
-			ruleset.detour === 'direct' ? _('напрямую') : targetLabel(ruleset.detour),
-			// Подключение могли удалить, а набор остался на него ссылаться:
-			// тогда список просто перестанет обновляться, и молчать об этом
-			// нельзя.
-			ruleset.detour !== 'direct' && !state.outbounds.some(function(outbound) {
-				return outbound.tag === ruleset.detour;
-			}) ? E('div', { 'class': 'error' }, _('подключение удалено — список не обновится')) : ''
-		]),
 		E('td', { 'class': 'td' }, ruleset.update_interval || _('не обновлять')),
 		E('td', { 'class': 'td' }, used.length
 			? statusPill(true, _('используется'), '')
@@ -1019,7 +1013,42 @@ function renderRulesets(owner) {
 	const context = renderRulesets.owner;
 	return state.rulesets.length
 		? state.rulesets.map(function(ruleset) { return rulesetRow(ruleset, context); })
-		: E('tr', {}, E('td', { 'colspan': 6 }, _('Списков пока нет')));
+		: E('tr', {}, E('td', { 'colspan': 5 }, _('Списков пока нет')));
+}
+
+// Одна строка на все списки: подключение выбирается здесь, а не в каждом
+// списке. Скачивает sing-box, и повторять один и тот же ответ построчно —
+// работа, которую страница не должна просить.
+function rulesetDetourRow() {
+	// Подключение могли удалить, а выбор остался на него ссылаться: тогда ни
+	// один список не обновится, и молчать об этом нельзя. Оставшийся выбор
+	// показывается как есть — подменить его на direct значило бы тихо увести
+	// загрузку туда, где источник и заблокирован.
+	const missing = state.rulesetDetour !== 'direct' && !state.outbounds.some(function(outbound) {
+		return outbound.tag === state.rulesetDetour;
+	});
+	const options = [ E('option', { 'value': 'direct' }, _('напрямую')) ]
+		.concat(state.outbounds.map(function(outbound) {
+			return E('option', { 'value': outbound.tag }, outbound.label || outbound.tag);
+		}));
+	if (missing)
+		options.push(E('option', { 'value': state.rulesetDetour }, state.rulesetDetour));
+	const select = E('select', {
+		'id': 'zarap-ruleset-detour', 'class': 'cbi-input-select'
+	}, options);
+	// Через свойство, а не через атрибут selected: значение читает обработчик
+	// change, и ему не должно быть дела до того, как применились атрибуты.
+	select.value = state.rulesetDetour;
+	select.addEventListener('change', function() {
+		state.rulesetDetour = select.value;
+		refresh();
+	});
+	return E('span', {}, [
+		E('span', {}, _('Скачивать списки через: ')),
+		select,
+		missing ? E('div', { 'class': 'error', 'data-field': 'ruleset-detour-missing' },
+			_('подключение удалено — списки не обновятся')) : ''
+	]);
 }
 
 // Строка про место. Размер отдельного списка сказать нечем — файл принадлежит
@@ -1132,6 +1161,7 @@ function refresh() {
 	dom.content(document.querySelector('#zarap-outbounds-body'), renderOutbounds());
 	dom.content(document.querySelector('#zarap-rules-body'), renderRules());
 	dom.content(document.querySelector('#zarap-rulesets-body'), renderRulesets());
+	dom.content(document.querySelector('#zarap-ruleset-detour-row'), rulesetDetourRow());
 	dom.content(document.querySelector('#zarap-cache'), renderCache());
 	dom.content(document.querySelector('#zarap-dns-note'), renderDnsNote());
 	dom.content(document.querySelector('#zarap-devices-body'), renderDevices());
@@ -1363,18 +1393,18 @@ return view.extend({
 
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('Списки правил')),
-					E('p', {}, _('Готовые наборы доменов и подсетей в формате .srs. Скачивает и обновляет их сам sing-box через выбранное подключение — у Zarap своей копии нет, и проверить адрес заранее он не может: недоступный список выяснится на запуске и откатит применение.')),
+					E('p', {}, _('Готовые наборы доменов и подсетей в формате .srs. Скачивает и обновляет их сам sing-box через выбранное подключение — одно на все списки: их источники заблокированы там же, где и всё остальное. У Zarap своей копии нет, и проверить адрес заранее он не может: недоступный список выяснится на запуске и откатит применение.')),
 					E('table', { 'class': 'table', 'id': 'zarap-rulesets' }, [
 						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
 							E('th', { 'class': 'th' }, _('Название')),
 							E('th', { 'class': 'th' }, _('Адрес')),
-							E('th', { 'class': 'th' }, _('Скачивать через')),
 							E('th', { 'class': 'th' }, _('Обновлять')),
 							E('th', { 'class': 'th' }, _('Состояние')),
 							E('th', { 'class': 'th' }, '')
 						])),
 						E('tbody', { 'id': 'zarap-rulesets-body' }, renderRulesets(this))
 					]),
+					E('p', { 'id': 'zarap-ruleset-detour-row' }, rulesetDetourRow()),
 					E('p', { 'id': 'zarap-cache' }, renderCache()),
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-ruleset-url' }, _('Добавить список')),
@@ -1386,7 +1416,6 @@ return view.extend({
 							E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:.5em;margin-top:.5em' }, [
 								E('input', { 'id': 'zarap-ruleset-label', 'class': 'cbi-input-text',
 									'placeholder': _('Название') }),
-								E('select', { 'id': 'zarap-ruleset-detour', 'class': 'cbi-input-select' }),
 								E('select', { 'id': 'zarap-ruleset-interval', 'class': 'cbi-input-select' })
 							]),
 							E('div', { 'style': ACTION_ROW }, [
@@ -1396,7 +1425,6 @@ return view.extend({
 									'click': ui.createHandlerFn(this, function() {
 										const url = document.querySelector('#zarap-ruleset-url');
 										const label = document.querySelector('#zarap-ruleset-label');
-										const detour = document.querySelector('#zarap-ruleset-detour');
 										const interval = document.querySelector('#zarap-ruleset-interval');
 										const address = url.value.trim();
 										if (!/^https?:\/\/[!-~]+$/.test(address)) {
@@ -1409,9 +1437,16 @@ return view.extend({
 											ui.addNotification(null, E('p', {}, _('Слишком много списков')), 'error');
 											return;
 										}
+										// Источники списков заблокированы там же, где и всё
+										// остальное, поэтому первый заведённый список сам
+										// поднимает загрузку на подключение. Дальше выбор
+										// принадлежит пользователю, и добавление ещё одного
+										// списка его уже не трогает.
+										if (!state.rulesets.length && state.rulesetDetour === 'direct'
+											&& state.outbounds.length)
+											state.rulesetDetour = state.outbounds[0].tag;
 										state.rulesets.push({
 											tag: tag, label: label.value.trim(), url: address,
-											detour: detour.value || 'direct',
 											update_interval: interval.value || ''
 										});
 										url.value = '';
@@ -1445,7 +1480,8 @@ return view.extend({
 								if (!readyToSend())
 									return;
 								notify(await callValidate(submittedOutbounds(), state.rules,
-									state.rulesets, leasedClients(), state.final),
+									state.rulesets, state.rulesetDetour, leasedClients(),
+									state.final),
 									_('Конфигурация корректна'));
 							})
 						}, _('Проверить конфигурацию')),
@@ -1460,6 +1496,7 @@ return view.extend({
 									submittedOutbounds(),
 									state.rules,
 									state.rulesets,
+									state.rulesetDetour,
 									leasedClients(),
 									state.final
 								);
@@ -1541,17 +1578,6 @@ return view.extend({
 		// selection has to wait for the page to be in the document.
 		window.setTimeout(function() {
 			selectTab('setup');
-			const detour = document.querySelector('#zarap-ruleset-detour');
-			if (detour) {
-				dom.content(detour, [ E('option', { 'value': 'direct' }, _('напрямую')) ]
-					.concat(state.outbounds.map(function(outbound) {
-						return E('option', { 'value': outbound.tag }, outbound.label || outbound.tag);
-					})));
-				// Источники списков заблокированы там же, где и всё остальное,
-				// поэтому по умолчанию предлагается подключение, а не direct.
-				if (state.outbounds.length)
-					detour.value = state.outbounds[0].tag;
-			}
 			const interval = document.querySelector('#zarap-ruleset-interval');
 			if (interval)
 				dom.content(interval, [

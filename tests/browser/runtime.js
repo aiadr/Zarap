@@ -38,9 +38,11 @@ const fixtures = {
     rulesets: [
       {
         tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
-        detour: 'out_1', update_interval: '1d', in_use: false
+        update_interval: '1d', in_use: false
       }
     ],
+    ruleset_detour: 'out_1',
+    ruleset_detour_missing: false,
     cache: { size: 1258291, free: 20971520 },
     dns: { forwarded: 0 },
     final: 'direct',

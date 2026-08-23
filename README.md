@@ -9,7 +9,7 @@ Zarap — LuCI-приложение для OpenWrt 25.12.x, которое за�
 - импорт нескольких VLESS Reality TCP-ссылок, включая `xtls-rprx-vision`; каждая становится отдельным outbound;
 - список правил, который преобразуется в `route.rules` конфига sing-box: правило называет устройства и цель — подключение, `direct` или `block`;
 - условия правила по назначению: домены, списки `.srs`, диапазоны IPv4, порты и протокол (`tcp`/`udp`), в любом сочетании с устройствами или без них;
-- списки правил скачивает и обновляет сам sing-box через выбранное подключение, кэш лежит в `/etc/zarap/cache.db` и переживает перезагрузку;
+- списки правил скачивает и обновляет сам sing-box через выбранное подключение — одно на все списки сразу, кэш лежит в `/etc/zarap/cache.db` и переживает перезагрузку;
 - маршрутизация DNS: домены, отправленные правилом в подключение, резолвятся через него же по DoH — dnsmasq пересылает только их, остальные имена идут как раньше;
 - цель для остального трафика (`direct` по умолчанию), выраженная в `route.final`;
 - захват всего исходящего трафика LAN по интерфейсу `br-lan`, а не по списку адресов;
@@ -103,6 +103,7 @@ rm -f /tmp/zarap-apk.pem
 config zarap 'main'
 	option enabled '1'
 	option final 'direct'
+	option ruleset_detour 'out_1'
 
 config outbound 'out_1'
 	option label 'Нидерланды'
@@ -121,7 +122,6 @@ config rule
 config ruleset 'rs_1'
 	option label 'Реклама'
 	option url 'https://example.org/geosite-ads.srs'
-	option detour 'out_1'
 	option update_interval '1d'
 
 config rule
