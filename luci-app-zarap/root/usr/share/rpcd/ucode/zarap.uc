@@ -47,6 +47,13 @@ const DNS_PORT = 5353;
 // настройка: выбор здесь ничего не решает, потому что запрос всё равно уходит
 // внутри туннеля, а лишняя ручка требует объяснения, чем один адрес лучше.
 const DNS_UPSTREAM = '1.1.1.1';
+// Резолвер для имён, которые роутер набирает сам: адрес сервера из ссылки и
+// хост, откуда качается список. Он не может ходить через подключение — чтобы
+// поднять подключение, пришлось бы сперва резолвить его же адрес через него.
+// Поэтому bootstrap идёт мимо туннеля, и detour у него не указан: sing-box
+// дозванивается напрямую, а `detour: "direct"` отвергает прямым текстом
+// («detour to an empty direct outbound makes no sense»).
+const BOOTSTRAP_TAG = 'dns_bootstrap';
 
 // Outbound section names double as sing-box tags, so they have to stay clear of
 // the tags sing-box gives its own meanings.
@@ -102,6 +109,14 @@ function valid_ipv4(value) {
 			return false;
 
 	return true;
+}
+
+// Имя, которое перед звонком придётся резолвить, — в отличие от адреса, который
+// набирается как есть. IPv6-литерал ссылка отдаёт без скобок, и опознать его
+// можно по двоеточию: в имени его быть не может.
+function is_domain(value) {
+	let text = trim('' + (value || ''));
+	return text != '' && !valid_ipv4(text) && index(text, ':') < 0;
 }
 
 // A destination range as sing-box wants it: a bare address is its own /32, and
@@ -764,7 +779,24 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 		push(declared, json);
 	}
 
+	// Имена, которые роутер резолвит сам: адрес сервера в ссылке и, когда список
+	// качается напрямую, хост его источника. Через прокси такое имя резолвить
+	// нельзя — до прокси ещё надо дозвониться, — поэтому им нужен отдельный
+	// резолвер мимо туннеля. Без него sing-box берёт `dns.final`, то есть
+	// туннельный DoH, и уходит в бесконечный круг: чтобы поднять подключение,
+	// он резолвит его адрес через него же.
+	let wants_bootstrap = false;
+	for (let outbound in outbounds)
+		if (is_domain(outbound.server))
+			wants_bootstrap = true;
+	if (length(declared) && detour == 'direct')
+		wants_bootstrap = true;
+
 	let route = { auto_detect_interface: true, rules: route_rules, final: final_tag };
+	// Названный так резолвер спрашивается напрямую, минуя `dns.rules`, —
+	// поэтому перечислять адреса серверов ещё и правилом не нужно.
+	if (wants_bootstrap)
+		route.default_domain_resolver = BOOTSTRAP_TAG;
 	if (length(declared))
 		route.rule_set = declared;
 
@@ -791,28 +823,37 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 
 	// Резолв только названных доменов, и каждый — через своё подключение.
 	// Перенаправлять сюда весь DNS дома нельзя: при остановленном sing-box дом
-	// потерял бы имена целиком, включая имена в самой локальной сети.
-	if (length(dns.order)) {
-		let servers = [], dns_rules = [];
-		for (let tag in dns.order) {
-			push(servers, {
-				type: 'https',
-				tag: 'dns_' + tag,
-				server: DNS_UPSTREAM,
-				detour: tag
-			});
-			let json = domain_json(dns.by_outbound[tag]);
-			json.server = 'dns_' + tag;
-			push(dns_rules, json);
-		}
+	// потерял бы имена целиком, включая имена в самой локальной сети. Рядом с
+	// ними — bootstrap, единственный, кто резолвит мимо туннеля.
+	let servers = [], dns_rules = [];
+	// DoH, а не обычный запрос: имя сервера подменяют ровно там, где Zarap и
+	// нужен, и подменённый ответ увёл бы подключение в никуда. Адресом указан
+	// сам резолвер, поэтому резолвить для него нечего.
+	if (wants_bootstrap)
+		push(servers, { type: 'https', tag: BOOTSTRAP_TAG, server: DNS_UPSTREAM });
+	for (let tag in dns.order) {
+		push(servers, {
+			type: 'https',
+			tag: 'dns_' + tag,
+			server: DNS_UPSTREAM,
+			detour: tag
+		});
+		let json = domain_json(dns.by_outbound[tag]);
+		json.server = 'dns_' + tag;
+		push(dns_rules, json);
+	}
+	if (length(servers)) {
 		config.dns = {
 			servers: servers,
-			rules: dns_rules,
 			// IPv6 в LAN не раздаётся, и AAAA-ответ отправил бы клиента по
 			// адресу, до которого он не дойдёт.
 			strategy: 'ipv4_only',
-			final: 'dns_' + dns.order[0]
+			// Без доменных правил слушателя нет и спрашивать некого; поле
+			// названо явно, чтобы умолчание не зависело от порядка серверов.
+			final: length(dns.order) ? 'dns_' + dns.order[0] : BOOTSTRAP_TAG
 		};
+		if (length(dns_rules))
+			config.dns.rules = dns_rules;
 	}
 	// Without the cache every restart is a trip to the network for lists that
 	// were already fetched; with nothing to cache the file is not worth the
@@ -1449,7 +1490,12 @@ function recent_connection_error() {
 	let output = lc(capture('/sbin/logread -e sing-box -l 80').output);
 	for (let marker in [
 		'connection refused', 'network is unreachable', 'i/o timeout',
-		'connection reset', 'reality handshake', 'tls handshake'
+		'connection reset', 'reality handshake', 'tls handshake',
+		// Имя сервера не разрешилось: подключение с доменом в ссылке не
+		// состоится, и в журнале это единственный след. Маркер опирается на
+		// уровень `info` из конфига: на `debug` так же выглядит и удачный
+		// резолв («dns: lookup domain …»).
+		': lookup '
 	])
 		if (index(output, marker) >= 0)
 			return true;

@@ -33,6 +33,11 @@ OUT_1 = {
 
 OUT_2 = dict(OUT_1, tag="out_2", server="de.example.test", flow="", short_id="")
 
+# A link may carry an address instead of a name, and then there is nothing to
+# resolve before dialling it.
+OUT_ADDR = dict(OUT_1, tag="out_1", server="203.0.113.10")
+OUT_ADDR6 = dict(OUT_1, tag="out_1", server="2001:db8::1")
+
 ADDRESSES = {
     "00:11:22:33:44:55": "192.168.1.50",
     "AA:BB:CC:DD:EE:FF": "192.168.1.51",
@@ -52,11 +57,11 @@ class RouteMappingTests(unittest.TestCase):
             if line.startswith(("const CAPTURE_PORT", "const INBOUND_TAG",
                                 "const RESERVED_TAGS", "const CACHE_FILE",
                                 "const DNS_TAG", "const DNS_PORT",
-                                "const DNS_UPSTREAM")))
+                                "const DNS_UPSTREAM", "const BOOTSTRAP_TAG")))
         cls.prelude = constants + "\n" + "\n".join(
             lift(source, name) for name in
-            ("valid_outbound_tag", "outbound_json", "dns_routes", "domain_json",
-             "rule_jsons", "sing_box_config"))
+            ("valid_outbound_tag", "valid_ipv4", "is_domain", "outbound_json",
+             "dns_routes", "domain_json", "rule_jsons", "sing_box_config"))
 
     def generate(self, outbounds, rules, final, addresses=None, rulesets=None,
                  ruleset_detour="direct"):
@@ -77,6 +82,9 @@ class RouteMappingTests(unittest.TestCase):
 
     def tags(self, config):
         return [outbound["tag"] for outbound in config["outbounds"]]
+
+    def dns_tags(self, config):
+        return [server["tag"] for server in config.get("dns", {}).get("servers", [])]
 
     def test_capture_without_any_policy_routes_nothing(self):
         # One connection and no rules must not quietly send the house through
@@ -362,6 +370,8 @@ class RouteMappingTests(unittest.TestCase):
             {"domains": ["example.com"], "target": "out_2"},
         ], "direct")
         self.assertEqual(config["dns"]["servers"], [
+            # Both servers carry domains, so the bootstrap resolver leads.
+            {"type": "https", "tag": "dns_bootstrap", "server": "1.1.1.1"},
             {"type": "https", "tag": "dns_out_1", "server": "1.1.1.1", "detour": "out_1"},
             {"type": "https", "tag": "dns_out_2", "server": "1.1.1.1", "detour": "out_2"},
         ])
@@ -371,6 +381,54 @@ class RouteMappingTests(unittest.TestCase):
         # an address it cannot reach.
         self.assertEqual(config["dns"]["strategy"], "ipv4_only")
         self.assertEqual(config["dns"]["final"], "dns_out_1")
+        # The tunnel resolvers answer clients; the address of the server is
+        # not theirs to resolve, or the tunnel would wait on itself.
+        self.assertEqual(config["route"]["default_domain_resolver"],
+                         "dns_bootstrap")
+
+    def test_a_server_named_by_domain_resolves_outside_the_tunnel(self):
+        # Resolving it through the tunnel is a circle: the connection cannot be
+        # dialled until the name is resolved, and the name cannot be resolved
+        # until the connection is dialled. sing-box spins there forever.
+        config = self.generate(
+            [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}],
+            "out_1")
+        self.assertEqual(config["route"]["default_domain_resolver"],
+                         "dns_bootstrap")
+        bootstrap = config["dns"]["servers"][0]
+        self.assertEqual(bootstrap, {"type": "https", "tag": "dns_bootstrap",
+                                     "server": "1.1.1.1"})
+        # `detour: "direct"` is refused by name — "detour to an empty direct
+        # outbound makes no sense" — and leaving it out is what dials directly.
+        self.assertNotIn("detour", bootstrap)
+        # Nothing points at the direct outbound, so it stays undeclared: the
+        # bootstrap resolver does not reach the WAN through it.
+        self.assertEqual(self.tags(config), ["out_1"])
+
+    def test_a_server_given_by_address_asks_for_no_resolver(self):
+        for outbound in (OUT_ADDR, OUT_ADDR6):
+            config = self.generate(
+                [outbound], [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}],
+                "direct")
+            self.assertNotIn("default_domain_resolver", config["route"])
+            self.assertNotIn("dns", config)
+
+    def test_a_list_fetched_directly_needs_the_name_of_its_source(self):
+        # The .srs is fetched by name too, and a direct download resolves that
+        # name on the router rather than inside a tunnel.
+        rulesets = [{"tag": "rs_1", "label": "", "url": "https://example.org/a.srs",
+                     "update_interval": "1d"}]
+        rules = [{"rule_sets": ["rs_1"], "target": "block"}]
+        direct = self.generate([OUT_ADDR], rules, "direct", rulesets=rulesets)
+        self.assertEqual(direct["route"]["default_domain_resolver"], "dns_bootstrap")
+        self.assertEqual(self.dns_tags(direct), ["dns_bootstrap"])
+
+        # Through a connection the name travels inside it, and the router has
+        # nothing left to resolve.
+        detoured = self.generate([OUT_ADDR], rules, "direct", rulesets=rulesets,
+                                 ruleset_detour="out_1")
+        self.assertNotIn("default_domain_resolver", detoured["route"])
+        self.assertNotIn("dns", detoured)
 
     def test_the_dns_listener_appears_only_with_something_to_resolve(self):
         listener = {"type": "direct", "tag": "zarap-dns",
@@ -382,16 +440,19 @@ class RouteMappingTests(unittest.TestCase):
                          {"inbound": ["zarap-dns"], "action": "hijack-dns"})
 
         # A domain going direct or blocked needs no resolving through a tunnel.
+        # What stays behind is the bootstrap resolver, which is there for the
+        # address of the server rather than for anything a client asked.
         for target in ("direct", "block"):
             plain = self.generate(
                 [OUT_1], [{"domains": ["youtube.com"], "target": target}], "direct")
             self.assertNotIn(listener, plain["inbounds"])
-            self.assertNotIn("dns", plain)
+            self.assertEqual(self.dns_tags(plain), ["dns_bootstrap"])
 
-    def test_a_rule_without_domains_does_not_touch_dns(self):
+    def test_a_rule_without_domains_leaves_the_tunnel_resolvers_out(self):
         config = self.generate(
             [OUT_1], [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}], "direct")
-        self.assertNotIn("dns", config)
+        self.assertEqual(self.dns_tags(config), ["dns_bootstrap"])
+        self.assertNotIn("rules", config["dns"])
         self.assertEqual(len(config["inbounds"]), 1)
 
     def test_first_matching_rule_decides_where_a_device_goes(self):
