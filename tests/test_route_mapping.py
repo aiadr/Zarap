@@ -57,19 +57,22 @@ class RouteMappingTests(unittest.TestCase):
             if line.startswith(("const CAPTURE_PORT", "const INBOUND_TAG",
                                 "const RESERVED_TAGS", "const CACHE_FILE",
                                 "const DNS_TAG", "const DNS_PORT",
-                                "const DNS_UPSTREAM", "const BOOTSTRAP_TAG")))
+                                "const DNS_UPSTREAM", "const BOOTSTRAP_TAG",
+                                "const BOOTSTRAP_DEFAULT", "const BOOTSTRAP_SCHEMES")))
         cls.prelude = constants + "\n" + "\n".join(
             lift(source, name) for name in
-            ("valid_outbound_tag", "valid_ipv4", "is_domain", "outbound_json",
-             "dns_routes", "domain_json", "rule_jsons", "sing_box_config"))
+            ("valid_outbound_tag", "valid_ipv4", "is_domain", "result_error",
+             "input_error", "parse_bootstrap", "outbound_json", "dns_routes",
+             "domain_json", "rule_jsons", "sing_box_config"))
 
     def generate(self, outbounds, rules, final, addresses=None, rulesets=None,
-                 ruleset_detour="direct"):
-        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s, %s));\n" % (
+                 ruleset_detour="direct", bootstrap=""):
+        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s, %s, %s));\n" % (
             self.prelude,
             json.dumps(outbounds), json.dumps(rules), json.dumps(final),
             json.dumps(ADDRESSES if addresses is None else addresses),
-            json.dumps(rulesets or []), json.dumps(ruleset_detour))
+            json.dumps(rulesets or []), json.dumps(ruleset_detour),
+            json.dumps(bootstrap))
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name
@@ -404,6 +407,31 @@ class RouteMappingTests(unittest.TestCase):
         # Nothing points at the direct outbound, so it stays undeclared: the
         # bootstrap resolver does not reach the WAN through it.
         self.assertEqual(self.tags(config), ["out_1"])
+
+    def test_the_bootstrap_resolver_is_the_one_that_was_chosen(self):
+        # DoH is the default, and it is also the thing an ISP closes first: the
+        # setting is the only way left to name a resolver that gets through.
+        rules = [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}]
+        for value, expected in (
+            ("", {"type": "https", "tag": "dns_bootstrap", "server": "1.1.1.1"}),
+            ("udp://192.168.1.1", {"type": "udp", "tag": "dns_bootstrap",
+                                   "server": "192.168.1.1"}),
+            ("local", {"type": "local", "tag": "dns_bootstrap"}),
+        ):
+            config = self.generate([OUT_1], rules, "out_1", bootstrap=value)
+            self.assertEqual(config["dns"]["servers"][0], expected, value)
+            self.assertEqual(config["route"]["default_domain_resolver"],
+                             "dns_bootstrap", value)
+
+    def test_the_chosen_resolver_does_not_disturb_the_tunnel_ones(self):
+        # Свой резолвер меняет только то, чем резолвится адрес сервера: имена,
+        # отправленные правилом в подключение, по-прежнему идут через него.
+        config = self.generate(
+            [OUT_1], [{"domains": ["youtube.com"], "target": "out_1"}], "direct",
+            bootstrap="local")
+        self.assertEqual(self.dns_tags(config), ["dns_bootstrap", "dns_out_1"])
+        self.assertEqual(config["dns"]["final"], "dns_out_1")
+        self.assertEqual(config["dns"]["servers"][1]["detour"], "out_1")
 
     def test_a_server_given_by_address_asks_for_no_resolver(self):
         for outbound in (OUT_ADDR, OUT_ADDR6):

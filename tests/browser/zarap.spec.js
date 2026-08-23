@@ -24,6 +24,16 @@ async function openMaintenance(page) {
   await expect(page.locator('#zarap-tab-maintenance')).toBeVisible();
 }
 
+// Аргументы apply читаются по имени, а не по номеру: новый параметр сдвигает
+// все позиции за собой, и тест ломается там, где ничего не менялось. Порядок
+// один в один повторяет объявление rpc в overview.js.
+const APPLY_ARGS = ['enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour',
+                    'bootstrap_dns', 'clients', 'final'];
+
+function applyArgs(call) {
+  return Object.fromEntries(APPLY_ARGS.map((name, index) => [name, call.args[index]]));
+}
+
 test('renders status and enforces private MAC restriction', async ({ page }) => {
   await openZarap(page);
 
@@ -79,28 +89,28 @@ test('sends the leases of guarded devices and the connections as they stand', as
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[0]).toBe(true);
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.enabled).toBe(true);
   // Saved or added a moment ago, a connection goes out the same way: its tag,
   // its name and its link.
-  expect(apply.args[1]).toEqual([
+  expect(apply.outbounds).toEqual([
     { tag: 'out_1', label: 'Нидерланды', link: savedLink('out_1') },
     { tag: 'out_2', label: 'Германия', link: savedLink('out_2') }
   ]);
   // Every condition goes back, including the ones the page cannot edit yet:
   // what is submitted is the list held here, so anything dropped on the way in
   // would be deleted from the router on the way out.
-  expect(apply.args[2]).toEqual([
+  expect(apply.rules).toEqual([
     { clients: ['00:11:22:33:44:55'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'out_1' },
     { clients: ['10:20:30:40:50:60'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'block' }
   ]);
   // Only devices a rule names carry a lease.
-  expect(apply.args[5]).toEqual([
+  expect(apply.clients).toEqual([
     { mac: '00:11:22:33:44:55', name: 'Телевизор', ip: '192.168.1.50' },
     { mac: '10:20:30:40:50:60', name: 'Планшет ребёнка', ip: '192.168.1.62' }
   ]);
-  expect(apply.args[5].some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
-  expect(apply.args[6]).toBe('direct');
+  expect(apply.clients.some(client => client.mac === '02:AA:BB:CC:DD:EE')).toBe(false);
+  expect(apply.final).toBe('direct');
 });
 
 test('shows backend validation errors without applying configuration', async ({ page }) => {
@@ -143,11 +153,11 @@ test('adds a connection without the router and lets a rule use it', async ({ pag
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   calls = await page.evaluate(() => window.__rpcCalls);
-  const apply = calls.find(call => call.method === 'apply');
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
   // Nameless until the router reads the link, and sent alongside the saved ones
   // in exactly the same shape.
-  expect(apply.args[1]).toContainEqual({ tag: 'out_3', label: '', link: validLink });
-  expect(apply.args[2]).toContainEqual(
+  expect(apply.outbounds).toContainEqual({ tag: 'out_3', label: '', link: validLink });
+  expect(apply.rules).toContainEqual(
     { clients: ['AA:BB:CC:DD:EE:FF'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'out_3' });
 });
 
@@ -311,13 +321,13 @@ test('shows conditions by destination and hands them back untouched', async ({ p
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const sent = calls.find(call => call.method === 'apply');
-  expect(sent.args[3]).toEqual([
+  const sent = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(sent.rulesets).toEqual([
     { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
       update_interval: '1d' }
   ]);
-  expect(sent.args[4]).toEqual('direct');
-  expect(sent.args[2]).toEqual([
+  expect(sent.ruleset_detour).toEqual('direct');
+  expect(sent.rules).toEqual([
     { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
       rule_sets: ['rs_1'], ip_cidr: ['149.154.160.0/20'],
       ports: ['443', '1000:2000'], network: 'udp', target: 'out_1' },
@@ -346,7 +356,7 @@ test('edits the destination of a rule and sends what was typed', async ({ page }
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  expect(calls.find(call => call.method === 'apply').args[2][0]).toEqual({
+  expect(applyArgs(calls.find(call => call.method === 'apply')).rules[0]).toEqual({
     clients: ['00:11:22:33:44:55'],
     domains: ['youtube.com', '.googlevideo.com'],
     rule_sets: ['rs_1'],
@@ -410,13 +420,13 @@ test('adds a rule set and points a rule at it', async ({ page }) => {
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   calls = await page.evaluate(() => window.__rpcCalls);
-  const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[3]).toContainEqual({
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.rulesets).toContainEqual({
     tag: 'rs_2', label: 'Заблокированное', url: 'https://example.org/geosite-ru.srs',
     update_interval: '1d'
   });
-  expect(apply.args[4]).toEqual('out_1');
-  expect(apply.args[2][1].rule_sets).toEqual(['rs_2']);
+  expect(apply.ruleset_detour).toEqual('out_1');
+  expect(apply.rules[1].rule_sets).toEqual(['rs_2']);
 });
 
 test('picks the download connection once for every list', async ({ page }) => {
@@ -434,9 +444,45 @@ test('picks the download connection once for every list', async ({ page }) => {
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[4]).toEqual('direct');
-  expect(apply.args[3].every(ruleset => !('detour' in ruleset))).toBe(true);
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.ruleset_detour).toEqual('direct');
+  expect(apply.rulesets.every(ruleset => !('detour' in ruleset))).toBe(true);
+});
+
+test('sends the resolver chosen for the address of the server', async ({ page }) => {
+  // DoH до 1.1.1.1 закрывают ровно те провайдеры, ради которых Zarap и ставят,
+  // и тогда имя сервера не разрешается вовсе. Подставить свой резолвер — это
+  // единственный рычаг, и он должен уезжать на роутер.
+  await openZarap(page);
+
+  const field = page.locator('#zarap-bootstrap-dns');
+  await expect(field).toHaveValue('https://1.1.1.1');
+
+  await field.fill('udp://192.168.1.1');
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Конфигурация применена')).toBeVisible();
+
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.bootstrap_dns).toEqual('udp://192.168.1.1');
+});
+
+test('the router decides what a bad resolver says, not the page', async ({ page }) => {
+  // Разбирает адрес backend, и его же словами ошибка приезжает обратно:
+  // страница не должна заводить вторую проверку, расходящуюся с первой.
+  await openZarap(page);
+  await page.evaluate(() => {
+    window.__mockState.applyError = 'Bootstrap DNS: нужен IPv4-адрес, а не имя dns.example';
+  });
+
+  await page.locator('#zarap-bootstrap-dns').fill('https://dns.example');
+  await page.getByRole('button', { name: 'Сохранить и применить' }).click();
+  await expect(page.getByText('Bootstrap DNS: нужен IPv4-адрес, а не имя dns.example')).toBeVisible();
+
+  // Что бы страница ни думала об адресе, уехал он как набран: судит роутер.
+  const calls = await page.evaluate(() => window.__rpcCalls);
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.bootstrap_dns).toEqual('https://dns.example');
 });
 
 test('says so when the connection the lists download through is gone', async ({ page }) => {
@@ -634,8 +680,8 @@ test('names a device while picking it for a rule', async ({ page }) => {
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[5]).toContainEqual({
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.clients).toContainEqual({
     mac: 'AA:BB:CC:DD:EE:FF', name: 'realme', ip: '192.168.1.81'
   });
 });
@@ -661,8 +707,8 @@ test('a device with no lease is offered a free address when a rule names it', as
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[5]).toContainEqual({
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.clients).toContainEqual({
     mac: 'FC:D2:02:D3:28:63', name: 'Устройство FC:D2:02:D3:28:63', ip: '192.168.1.90'
   });
 });
@@ -711,8 +757,8 @@ test('a MAC typed by hand gets a row to carry its address', async ({ page }) => 
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[5]).toContainEqual({
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.clients).toContainEqual({
     mac: '10:34:56:78:9A:BC', name: 'Кладовка', ip: '192.168.1.99'
   });
 });
@@ -727,8 +773,8 @@ test('reorders rules and applies them in the shown order', async ({ page }) => {
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[2]).toEqual([
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.rules).toEqual([
     { clients: ['10:20:30:40:50:60'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'block' },
     { clients: ['00:11:22:33:44:55'], domains: [], rule_sets: [], ip_cidr: [], ports: [], network: '', target: 'out_1' }
   ]);
@@ -749,8 +795,8 @@ test('refuses to delete a connection a rule still points at', async ({ page }) =
 
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   const calls = await page.evaluate(() => window.__rpcCalls);
-  const apply = calls.find(call => call.method === 'apply');
-  expect(apply.args[1]).toEqual([{ tag: 'out_1', label: 'Нидерланды', link: savedLink('out_1') }]);
+  const apply = applyArgs(calls.find(call => call.method === 'apply'));
+  expect(apply.outbounds).toEqual([{ tag: 'out_1', label: 'Нидерланды', link: savedLink('out_1') }]);
 });
 
 test('a connection stops being deletable once the remainder points at it', async ({ page }) => {
@@ -782,7 +828,7 @@ test('blocking the remainder is confirmed and can be backed out of', async ({ pa
 
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   const calls = await page.evaluate(() => window.__rpcCalls);
-  expect(calls.find(call => call.method === 'apply').args[6]).toBe('block');
+  expect(applyArgs(calls.find(call => call.method === 'apply')).final).toBe('block');
 });
 
 test('deleting a rule warns what the device loses', async ({ page }) => {

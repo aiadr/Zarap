@@ -54,6 +54,14 @@ const DNS_UPSTREAM = '1.1.1.1';
 // дозванивается напрямую, а `detour: "direct"` отвергает прямым текстом
 // («detour to an empty direct outbound makes no sense»).
 const BOOTSTRAP_TAG = 'dns_bootstrap';
+// А вот здесь выбор решает всё, поэтому это настройка, а не константа: DoH до
+// 1.1.1.1 закрывают ровно те провайдеры, ради которых Zarap и ставят, и тогда
+// имя сервера не разрешается вовсе — подставить свой резолвер больше нечем.
+// Умолчание прежнее: шифрованный запрос к 1.1.1.1.
+const BOOTSTRAP_DEFAULT = 'https://' + DNS_UPSTREAM;
+// Схема выбирает не адрес, а то, что уедет в сеть: https и tls запрос
+// шифруют, udp и tcp — нет. `local` отдаёт резолв самому роутеру.
+const BOOTSTRAP_SCHEMES = { https: true, tls: true, udp: true, tcp: true };
 
 // Outbound section names double as sing-box tags, so they have to stay clear of
 // the tags sing-box gives its own meanings.
@@ -462,6 +470,74 @@ function validate_ruleset_detour(value, tags) {
 	return { ok: true, detour: detour };
 }
 
+// Bootstrap-резолвер в том виде, в каком его пишет пользователь, и в том, в
+// каком его ждёт sing-box. Схема обязательна не из педантизма: от неё зависит,
+// уедет запрос шифрованным или открытым, а угадывать это за пользователя
+// нельзя. Голый адрес читается как udp — открытый запрос, который работает
+// везде, и именно за ним сюда приходят, когда DoH закрыт.
+//
+// Имя вместо адреса не принимается: его самого пришлось бы через что-то
+// резолвить, и это ровно тот круг, ради которого bootstrap и появился.
+function parse_bootstrap(value) {
+	let text = trim('' + (value || ''));
+	if (text == '')
+		text = BOOTSTRAP_DEFAULT;
+	// Резолв отдан роутеру: /etc/resolv.conf, то есть dnsmasq и апстрим
+	// провайдера. Имени сервера это обычно хватает, а адреса не требует вовсе.
+	// Тег обязателен и здесь: на него ссылается route.default_domain_resolver,
+	// и сервер без тега этой ссылкой не находится.
+	if (lc(text) == 'local')
+		return { ok: true, value: 'local', server: { type: 'local', tag: BOOTSTRAP_TAG } };
+
+	let scheme = 'udp', rest = text;
+	let mark = index(text, '://');
+	if (mark >= 0) {
+		scheme = lc(substr(text, 0, mark));
+		rest = substr(text, mark + 3);
+	}
+	if (!BOOTSTRAP_SCHEMES[scheme])
+		return input_error('Bootstrap DNS: неизвестный протокол ' + scheme +
+			'://; допустимы https, tls, udp, tcp и local');
+
+	let path = '';
+	let slash = index(rest, '/');
+	if (slash >= 0) {
+		path = substr(rest, slash);
+		rest = substr(rest, 0, slash);
+	}
+	if (path == '/')
+		path = '';
+	// Путь есть только у DoH; у остальных схем его некуда девать, и молча
+	// выбросить его значило бы принять адрес, которым пользователь не
+	// пользуется.
+	if (path != '' && scheme != 'https')
+		return input_error('Bootstrap DNS: путь есть только у https://, а здесь ' + scheme + '://');
+
+	let host = rest, port = 0;
+	let colon = rindex(rest, ':');
+	if (colon >= 0) {
+		host = substr(rest, 0, colon);
+		let port_text = substr(rest, colon + 1);
+		if (!match(port_text, /^[0-9]+$/) || int(port_text) < 1 || int(port_text) > 65535)
+			return input_error('Bootstrap DNS: порт должен быть от 1 до 65535');
+		port = int(port_text);
+	}
+	if (index(host, ':') >= 0 || index(host, '[') >= 0)
+		return input_error('Bootstrap DNS: IPv6-адрес не поддерживается — наружу Zarap ходит по IPv4');
+	if (!valid_ipv4(host))
+		return input_error('Bootstrap DNS: нужен IPv4-адрес, а не имя ' + (host || '—') +
+			': имя пришлось бы резолвить через тот самый резолвер, который оно и задаёт');
+
+	let server = { type: scheme, tag: BOOTSTRAP_TAG, server: host };
+	if (port)
+		server.server_port = port;
+	if (path != '')
+		server.path = path;
+	return { ok: true,
+		value: scheme + '://' + host + (port ? ':' + port : '') + path,
+		server: server };
+}
+
 function valid_target(target, tags) {
 	return target == 'direct' || target == 'block' || !!tags[target];
 }
@@ -698,7 +774,7 @@ function rule_jsons(rule, address_of) {
 	return emitted;
 }
 
-function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour) {
+function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap) {
 	let emitted = [], route_rules = [], wants_direct = false;
 
 	for (let outbound in outbounds)
@@ -826,11 +902,11 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 	// потерял бы имена целиком, включая имена в самой локальной сети. Рядом с
 	// ними — bootstrap, единственный, кто резолвит мимо туннеля.
 	let servers = [], dns_rules = [];
-	// DoH, а не обычный запрос: имя сервера подменяют ровно там, где Zarap и
-	// нужен, и подменённый ответ увёл бы подключение в никуда. Адресом указан
-	// сам резолвер, поэтому резолвить для него нечего.
+	// По умолчанию DoH: имя сервера подменяют ровно там, где Zarap и нужен, и
+	// подменённый ответ увёл бы подключение в никуда. Но там же закрывают и сам
+	// DoH, поэтому резолвер выбирается настройкой, а не прибит здесь.
 	if (wants_bootstrap)
-		push(servers, { type: 'https', tag: BOOTSTRAP_TAG, server: DNS_UPSTREAM });
+		push(servers, parse_bootstrap(bootstrap).server);
 	for (let tag in dns.order) {
 		push(servers, {
 			type: 'https',
@@ -1137,12 +1213,13 @@ function configure_dnsmasq(uci, rules) {
 		uci.delete('dhcp', section, 'server');
 }
 
-function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour) {
+function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap) {
 	uci.load('zarap');
 	uci.set('zarap', 'main', 'zarap');
 	uci.set('zarap', 'main', 'enabled', enabled ? '1' : '0');
 	uci.set('zarap', 'main', 'final', final);
 	uci.set('zarap', 'main', 'ruleset_detour', ruleset_detour || 'direct');
+	uci.set('zarap', 'main', 'bootstrap_dns', bootstrap || BOOTSTRAP_DEFAULT);
 	// Leftovers from the single-connection schema and from the three options
 	// that only ever looked like settings.
 	for (let key in ['name', 'server', 'server_port', 'uuid', 'flow', 'server_name',
@@ -1253,7 +1330,7 @@ function cleanup_uci_candidate() {
 	}
 }
 
-function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulesets, ruleset_detour) {
+function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap) {
 	mkdir(UCI_CANDIDATE);
 	chmod(UCI_CANDIDATE, 0700);
 	mkdir(UCI_CANDIDATE_DELTA);
@@ -1269,7 +1346,7 @@ function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulese
 	}
 
 	let candidate = cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA);
-	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour)) {
+	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap)) {
 		cleanup_uci_candidate();
 		return result_error('Не удалось сформировать временный UCI-кандидат', '', 'startup_error');
 	}
@@ -1371,6 +1448,14 @@ function saved_ruleset_detour() {
 	let uci = cursor();
 	uci.load('zarap');
 	return uci.get('zarap', 'main', 'ruleset_detour') || 'direct';
+}
+
+// Резолвер для адреса сервера. Конфигурация, написанная до появления настройки,
+// поля не имеет — и получает прежнее поведение, а не пустоту.
+function saved_bootstrap() {
+	let uci = cursor();
+	uci.load('zarap');
+	return trim('' + (uci.get('zarap', 'main', 'bootstrap_dns') || '')) || BOOTSTRAP_DEFAULT;
 }
 
 function saved_final() {
@@ -1502,7 +1587,7 @@ function recent_connection_error() {
 	return false;
 }
 
-function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour) {
+function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour, bootstrap) {
 	let lan = lan_device();
 	// A redirect without an interface condition would capture traffic arriving
 	// from the WAN, so an unanswered ubus has to fail the apply outright.
@@ -1519,7 +1604,7 @@ function validate_candidate(outbounds, rules, final, clients, proxying, rulesets
 
 	mkdir('/etc/zarap');
 	chmod('/etc/zarap', 0700);
-	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour)) + '\n';
+	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap)) + '\n';
 	let nft = nft_config(guarded, lan, proxying);
 	let config_written = writefile(CONFIG_TMP, sing_box);
 	let nft_written = writefile(NFT_TMP, nft);
@@ -1681,6 +1766,11 @@ function validate_request(args, enabled) {
 	let detour_result = validate_ruleset_detour(args?.ruleset_detour, tags);
 	if (!detour_result.ok)
 		return detour_result;
+	// Разбирается здесь, а не в генераторе: неверный адрес должен назваться
+	// ошибкой ввода на странице, а не уехать в конфиг и упасть запуском.
+	let bootstrap_result = parse_bootstrap(args?.bootstrap_dns);
+	if (!bootstrap_result.ok)
+		return bootstrap_result;
 	let declared = {};
 	for (let ruleset in ruleset_result.rulesets)
 		declared[ruleset.tag] = true;
@@ -1718,7 +1808,7 @@ function validate_request(args, enabled) {
 
 	return { ok: true, outbounds: outbounds, rules: rules, final: final,
 		clients: client_result.clients, rulesets: ruleset_result.rulesets,
-		ruleset_detour: detour_result.detour };
+		ruleset_detour: detour_result.detour, bootstrap_dns: bootstrap_result.value };
 }
 
 // Списки скачивает sing-box, и до первой удачной загрузки старт зависит от
@@ -1748,12 +1838,13 @@ function apply_configuration(args) {
 		return conflict;
 
 	let candidate = validate_candidate(request.outbounds, request.rules, request.final,
-		request.clients, enabled, request.rulesets, request.ruleset_detour);
+		request.clients, enabled, request.rulesets, request.ruleset_detour,
+		request.bootstrap_dns);
 	if (!candidate.ok)
 		return candidate;
 	let uci_candidate = prepare_uci_candidate(request.outbounds, request.rules,
 		request.final, enabled, request.clients, request.rulesets,
-		request.ruleset_detour);
+		request.ruleset_detour, request.bootstrap_dns);
 	if (!uci_candidate.ok) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
 		return uci_candidate;
@@ -2103,6 +2194,7 @@ function status() {
 		rulesets: listed_sets,
 		ruleset_detour: ruleset_detour,
 		ruleset_detour_missing: ruleset_detour_missing,
+		bootstrap_dns: saved_bootstrap(),
 		cache: cache_state(),
 		// Сколько имён резолвится через прокси. Ноль означает, что доменные
 		// правила работают только против DPI: подменённый DNS они не обходят.
@@ -2330,7 +2422,8 @@ function update_component(name) {
 const methods = {
 	status: { call: function() { return status(); } },
 	validate: {
-		args: { outbounds: [], rules: [], rulesets: [], ruleset_detour: '', clients: [], final: '' },
+		args: { outbounds: [], rules: [], rulesets: [], ruleset_detour: '', bootstrap_dns: '',
+			clients: [], final: '' },
 		call: function(request) {
 			let checked = validate_request(request.args || {}, true);
 			if (!checked.ok) return checked;
@@ -2338,11 +2431,11 @@ const methods = {
 			if (!conflict.ok) return conflict;
 			let candidate = validate_candidate(checked.outbounds, checked.rules,
 				checked.final, checked.clients, true, checked.rulesets,
-				checked.ruleset_detour);
+				checked.ruleset_detour, checked.bootstrap_dns);
 			if (!candidate.ok) return candidate;
 			let uci_candidate = prepare_uci_candidate(checked.outbounds, checked.rules,
 				checked.final, true, checked.clients, checked.rulesets,
-				checked.ruleset_detour);
+				checked.ruleset_detour, checked.bootstrap_dns);
 			unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
 			if (!uci_candidate.ok) return uci_candidate;
 			return {
@@ -2356,7 +2449,8 @@ const methods = {
 		}
 	},
 	apply: {
-		args: { enabled: true, outbounds: [], rules: [], rulesets: [], ruleset_detour: '', clients: [], final: '' },
+		args: { enabled: true, outbounds: [], rules: [], rulesets: [], ruleset_detour: '',
+			bootstrap_dns: '', clients: [], final: '' },
 		call: function(request) {
 			let lock = acquire_lock();
 			if (!lock) return result_error('Другая операция Zarap уже выполняется');
