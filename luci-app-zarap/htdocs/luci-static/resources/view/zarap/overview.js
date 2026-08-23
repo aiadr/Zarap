@@ -5,8 +5,8 @@
 'require view';
 
 const callStatus = rpc.declare({ object: 'zarap', method: 'status' });
-const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'clients', 'final' ] });
-const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'clients', 'final' ] });
+const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'resolve_all', 'clients', 'final' ] });
+const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'resolve_all', 'clients', 'final' ] });
 const callRestart = rpc.declare({ object: 'zarap', method: 'restart' });
 const callStop = rpc.declare({ object: 'zarap', method: 'stop' });
 const callLogs = rpc.declare({ object: 'zarap', method: 'logs' });
@@ -106,6 +106,9 @@ const state = {
 	// Чем резолвится адрес сервера из ссылки. Мимо туннеля — через туннель было
 	// бы кругом, — и потому единственный запрос Zarap, который видит провайдер.
 	bootstrapDns: 'local',
+	// Резолвить ли имена всей сети через подключение. Меняет DNS дома, поэтому
+	// выключено по умолчанию: существующая установка ничего не замечает.
+	resolveAll: false,
 	cache: { size: 0, free: 0 },
 	// Сколько имён резолвится через прокси; считается роутером из применённых
 	// правил, поэтому это состояние роутера, а не страницы.
@@ -156,6 +159,7 @@ function loadState(status) {
 	});
 	state.rulesetDetour = status.ruleset_detour || 'direct';
 	state.bootstrapDns = status.bootstrap_dns || 'local';
+	state.resolveAll = !!status.resolve_all;
 	state.cache = status.cache || { size: 0, free: 0 };
 	state.dns = status.dns || { forwarded: 0 };
 	state.final = status.final || 'direct';
@@ -1226,6 +1230,11 @@ function bootstrapNote() {
 
 // Значение читается из поля, а не из state: change срабатывает по потере
 // фокуса, и набранное, но не покинутое поле иначе уехало бы прежним.
+function resolveAllValue() {
+	const box = document.querySelector('#zarap-resolve-all');
+	return box ? box.checked : state.resolveAll;
+}
+
 function bootstrapValue() {
 	const field = document.querySelector('#zarap-bootstrap-dns');
 	return field ? field.value.trim() : state.bootstrapDns;
@@ -1446,6 +1455,15 @@ return view.extend({
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-resolve-all' }, _('Резолвить имена через подключение')),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', { 'id': 'zarap-resolve-all', 'type': 'checkbox',
+								'checked': state.resolveAll ? '' : null }),
+							E('div', { 'class': 'cbi-value-description' },
+								_('Zarap забирает у dnsmasq весь DNS сети: домены из правил и списков резолвятся через подключение, а всё остальное — напрямую, тем резолвером, что указан выше. Нужно там, где имена подменяет кто-то ещё: соседний роутер с FakeIP или провайдер. Без этого списки .srs остаются без DNS вовсе — тысячи имён в dnsmasq не перечислить. Цена: пока Zarap выключен или sing-box не поднялся, внешних имён в сети нет. Прежние настройки dnsmasq запоминаются и возвращаются при выключении Zarap и при удалении пакета. Резолвер выше при этом не может быть local — получилась бы петля.'))
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-enabled' }, _('Включить Zarap')),
 						E('div', { 'class': 'cbi-value-field' }, [
 							E('input', { 'id': 'zarap-enabled', 'type': 'checkbox', 'checked': state.enabled ? '' : null })
@@ -1575,7 +1593,7 @@ return view.extend({
 									return;
 								notify(await callValidate(submittedOutbounds(), state.rules,
 									state.rulesets, state.rulesetDetour, bootstrapValue(),
-									leasedClients(), state.final),
+									resolveAllValue(), leasedClients(), state.final),
 									_('Конфигурация корректна'));
 							})
 						}, _('Проверить конфигурацию')),
@@ -1592,6 +1610,7 @@ return view.extend({
 									state.rulesets,
 									state.rulesetDetour,
 									bootstrapValue(),
+									resolveAllValue(),
 									leasedClients(),
 									state.final
 								);

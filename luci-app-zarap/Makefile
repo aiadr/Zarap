@@ -34,10 +34,24 @@ for key in ra dhcpv6 ndp; do
 		uci -q set "dhcp.lan.$$key=$$saved"
 	fi
 done
-# Пересылка названных доменов на наш DNS-слушатель: своими считаются строки,
-# указывающие на него, чужие остаются нетронутыми.
 section="$$(uci -q show dhcp | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$$/\1/p' | head -n 1)"
 if [ -n "$$section" ]; then
+	# Режим «резолвить имена через подключение» забирал у dnsmasq server,
+	# noresolv и cachesize целиком. Прежние значения лежат в zarap.main и
+	# возвращаются как есть; пустое означает, что ключа не было вовсе.
+	for key in server noresolv cachesize; do
+		if saved="$$(uci -q get "zarap.main.saved_dns_$$key")"; then
+			uci -q delete "dhcp.$$section.$$key"
+			# server — список, и `uci set` со пробелами схлопнул бы его в одну
+			# строку; поэтому запись по одной. Пустое сохранённое значение
+			# означает, что ключа не было вовсе, и удаления достаточно.
+			for value in $$saved; do
+				uci -q add_list "dhcp.$$section.$$key=$$value"
+			done
+		fi
+	done
+	# Пересылка названных доменов на наш DNS-слушатель: своими считаются строки,
+	# указывающие на него, чужие остаются нетронутыми.
 	uci -q get "dhcp.$$section.server" | tr ' ' '\n' | grep -F '127.0.0.1#5353' |
 	while read -r entry; do
 		[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"

@@ -102,12 +102,36 @@ class PackageContractTests(unittest.TestCase):
         # Проверяется каждая пара по отдельности: единым литералом это ломалось
         # от переноса строки, хотя объявление оставалось тем же.
         shared = ("outbounds: []", "rules: []", "rulesets: []", "ruleset_detour: ''",
-                  "bootstrap_dns: ''", "clients: []", "final: ''")
+                  "bootstrap_dns: ''", "resolve_all: true", "clients: []", "final: ''")
         for method, expected in (("validate", shared), ("apply", ("enabled: true",) + shared)):
             body = re.search(rf"{method}: \{{\s*args: \{{(.*?)\}},", methods_body, re.S)
             self.assertIsNotNone(body, method)
             for pair in expected:
                 self.assertIn(pair, body.group(1), method)
+
+    def test_taking_dns_over_is_reversible(self):
+        # Забрать у dnsmasq настройки допустимо ровно потому, что они
+        # возвращаются — и не только при удалении пакета, но и при выключении
+        # Zarap. Без возврата домашний DNS остаётся нашим после того, как нас
+        # выключили, и это не чинится ничем, кроме памяти пользователя.
+        self.assertIn("const DNS_TAKEOVER = ['server', 'noresolv', 'cachesize']", BACKEND)
+        self.assertIn("function dnsmasq_take_over(", BACKEND)
+        self.assertIn("function dnsmasq_hand_back(", BACKEND)
+        # Запоминается один раз: иначе второе применение запишет наши значения.
+        take_over = BACKEND.split("function dnsmasq_take_over(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("saved_dns_' + key) == null", take_over)
+        # Выключенный Zarap ничего не забирает.
+        configure = BACKEND.split("function configure_dnsmasq(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("if (enabled && resolve_all)", configure)
+        self.assertIn("dnsmasq_hand_back(uci, section)", configure)
+        # Удаление пакета возвращает те же три ключа.
+        self.assertIn("for key in server noresolv cachesize; do", MAKEFILE)
+        self.assertIn("saved_dns_", MAKEFILE)
+
+    def test_the_household_resolver_cannot_be_the_router_itself(self):
+        # dnsmasq шлёт всё нам, а local спрашивает dnsmasq — петля на весь
+        # домашний DNS сразу, поэтому это отказ ввода, а не предупреждение.
+        self.assertIn("resolve_all && bootstrap_result.value == 'local'", BACKEND)
 
     def test_every_rpc_method_is_granted_by_the_acl(self):
         # A method rpcd publishes but the ACL never names is unreachable from

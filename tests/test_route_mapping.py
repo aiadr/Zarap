@@ -66,13 +66,13 @@ class RouteMappingTests(unittest.TestCase):
              "domain_json", "rule_jsons", "sing_box_config"))
 
     def generate(self, outbounds, rules, final, addresses=None, rulesets=None,
-                 ruleset_detour="direct", bootstrap=""):
-        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s, %s, %s));\n" % (
+                 ruleset_detour="direct", bootstrap="", resolve_all=False):
+        script = "%s\nprintf('%%J', sing_box_config(%s, %s, %s, %s, %s, %s, %s, %s));\n" % (
             self.prelude,
             json.dumps(outbounds), json.dumps(rules), json.dumps(final),
             json.dumps(ADDRESSES if addresses is None else addresses),
             json.dumps(rulesets or []), json.dumps(ruleset_detour),
-            json.dumps(bootstrap))
+            json.dumps(bootstrap), "true" if resolve_all else "false")
         with tempfile.NamedTemporaryFile("w", suffix=".uc", delete=False) as handle:
             handle.write(script)
             path = handle.name
@@ -462,6 +462,42 @@ class RouteMappingTests(unittest.TestCase):
                                  ruleset_detour="out_1")
         self.assertNotIn("default_domain_resolver", detoured["route"])
         self.assertNotIn("dns", detoured)
+
+    def test_lists_drive_dns_only_when_the_whole_household_asks_us(self):
+        # Списки в dnsmasq не перечислить — тысячи имён, — поэтому адресная
+        # пересылка их покрыть не может в принципе. DNS-модуль sing-box матчит
+        # по тем же наборам, но запросы до него доходят только в этом режиме.
+        sets = [{"tag": "rs_1", "label": "", "url": "https://e.org/a.srs",
+                 "update_interval": ""}]
+        rules = [{"domains": ["youtube.com"], "rule_sets": ["rs_1"], "target": "out_1"}]
+
+        off = self.generate([OUT_1], rules, "direct", rulesets=sets)
+        self.assertEqual([rule.get("rule_set") for rule in off["dns"]["rules"]], [None])
+        # Спрашивает нас только dnsmasq и только про названные домены, значит
+        # неназванному место в первом подключении, как было.
+        self.assertEqual(off["dns"]["final"], "dns_out_1")
+
+        on = self.generate([OUT_1], rules, "direct", rulesets=sets, resolve_all=True,
+                           bootstrap="tls://77.88.8.8")
+        self.assertIn({"rule_set": ["rs_1"], "server": "dns_out_1"}, on["dns"]["rules"])
+        # А здесь через нас идёт весь DNS дома, и всё неназванное обязано
+        # резолвиться напрямую: иначе российский сайт получит адрес с чужого
+        # континента, а каждый запрос поедет в туннель.
+        self.assertEqual(on["dns"]["final"], "dns_bootstrap")
+
+    def test_the_listener_is_always_there_when_the_household_asks_us(self):
+        # Без доменных правил слушателя не было вовсе; в этом режиме его
+        # отсутствие оставило бы дом без имён целиком.
+        listener = {"type": "direct", "tag": "zarap-dns",
+                    "listen": "127.0.0.1", "listen_port": 5353}
+        rules = [{"clients": ["00:11:22:33:44:55"], "target": "out_1"}]
+        self.assertNotIn(listener, self.generate([OUT_1], rules, "direct")["inbounds"])
+
+        on = self.generate([OUT_1], rules, "direct", resolve_all=True,
+                           bootstrap="tls://77.88.8.8")
+        self.assertIn(listener, on["inbounds"])
+        self.assertEqual(on["route"]["rules"][0],
+                         {"inbound": ["zarap-dns"], "action": "hijack-dns"})
 
     def test_the_dns_listener_appears_only_with_something_to_resolve(self):
         listener = {"type": "direct", "tag": "zarap-dns",

@@ -706,18 +706,28 @@ function outbound_json(outbound) {
 // Ответ должен приходить с того же выхода, куда пойдёт трафик, иначе CDN отдаст
 // адрес другого континента — поэтому сервер свой на каждое подключение.
 function dns_routes(rules) {
-	let by_outbound = {}, order = [];
+	let by_outbound = {}, sets_by_outbound = {}, order = [];
 	for (let rule in rules) {
-		if (!length(rule.domains || []) || rule.target == 'direct' || rule.target == 'block')
+		if (rule.target == 'direct' || rule.target == 'block')
+			continue;
+		let domains = rule.domains || [], sets = rule.rule_sets || [];
+		if (!length(domains) && !length(sets))
 			continue;
 		if (!by_outbound[rule.target]) {
 			by_outbound[rule.target] = [];
+			sets_by_outbound[rule.target] = [];
 			push(order, rule.target);
 		}
-		for (let domain in rule.domains)
+		for (let domain in domains)
 			push(by_outbound[rule.target], domain);
+		// Списки в dnsmasq не перечислить, а DNS-модулю sing-box они годятся
+		// как есть: `dns.rules` матчит по `rule_set` тем же набором, что и
+		// маршрутизация. Это и есть разница между «резолвить всё через нас» и
+		// адресной пересылкой — второй списки покрыть не может в принципе.
+		for (let tag in sets)
+			push(sets_by_outbound[rule.target], tag);
 	}
-	return { by_outbound: by_outbound, order: order };
+	return { by_outbound: by_outbound, sets_by_outbound: sets_by_outbound, order: order };
 }
 
 // Домен в том виде, в каком его ждут и route, и dns: имя целиком плюс суффикс,
@@ -813,7 +823,7 @@ function rule_jsons(rule, address_of) {
 	return emitted;
 }
 
-function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap) {
+function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all) {
 	let emitted = [], route_rules = [], wants_direct = false;
 
 	for (let outbound in outbounds)
@@ -831,7 +841,10 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 	// sing-box; правило стоит первым и ловит их по своему inbound, так что с
 	// захваченным трафиком оно не пересекается.
 	let dns = dns_routes(rules);
-	if (length(dns.order))
+	// Слушатель нужен всегда, когда dnsmasq отдаёт нам весь DNS: иначе спросить
+	// будет некого, и дом останется без имён целиком.
+	let listens_dns = resolve_all || length(dns.order);
+	if (listens_dns)
 		push(route_rules, { inbound: [DNS_TAG], action: 'hijack-dns' });
 
 	let wants_sniff = false;
@@ -906,6 +919,9 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 			wants_bootstrap = true;
 	if (length(declared) && detour == 'direct')
 		wants_bootstrap = true;
+	// В этом режиме он же отвечает за всё неназванное, поэтому нужен всегда.
+	if (resolve_all)
+		wants_bootstrap = true;
 
 	let route = { auto_detect_interface: true, rules: route_rules, final: final_tag };
 	// Названный так резолвер спрашивается напрямую, минуя `dns.rules`, —
@@ -921,7 +937,7 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 		listen: '0.0.0.0',
 		listen_port: CAPTURE_PORT
 	}];
-	if (length(dns.order))
+	if (listens_dns)
 		push(inbounds, {
 			type: 'direct',
 			tag: DNS_TAG,
@@ -953,9 +969,18 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 			server: DNS_UPSTREAM,
 			detour: tag
 		});
-		let json = domain_json(dns.by_outbound[tag]);
-		json.server = 'dns_' + tag;
-		push(dns_rules, json);
+		let domains = dns.by_outbound[tag];
+		if (length(domains)) {
+			let json = domain_json(domains);
+			json.server = 'dns_' + tag;
+			push(dns_rules, json);
+		}
+		// Правило по списку — только когда весь DNS дома идёт через нас: при
+		// адресной пересылке dnsmasq такие запросы сюда не приводит вовсе, и
+		// правило стояло бы мёртвым.
+		let sets = resolve_all ? dns.sets_by_outbound[tag] : [];
+		if (length(sets))
+			push(dns_rules, { rule_set: sets, server: 'dns_' + tag });
 	}
 	if (length(servers)) {
 		config.dns = {
@@ -963,9 +988,13 @@ function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_
 			// IPv6 в LAN не раздаётся, и AAAA-ответ отправил бы клиента по
 			// адресу, до которого он не дойдёт.
 			strategy: 'ipv4_only',
-			// Без доменных правил слушателя нет и спрашивать некого; поле
-			// названо явно, чтобы умолчание не зависело от порядка серверов.
-			final: length(dns.order) ? 'dns_' + dns.order[0] : BOOTSTRAP_TAG
+			// Когда весь DNS дома идёт через нас, всё неназванное обязано
+			// резолвиться напрямую: иначе российский сайт получил бы адрес
+			// с чужого континента, а заодно каждый запрос ехал бы в туннель.
+			// Без этого режима спрашивать нас может только dnsmasq и только
+			// про названные домены, поэтому там умолчание — первое подключение.
+			final: resolve_all ? BOOTSTRAP_TAG :
+				(length(dns.order) ? 'dns_' + dns.order[0] : BOOTSTRAP_TAG)
 		};
 		if (length(dns_rules))
 			config.dns.rules = dns_rules;
@@ -1219,10 +1248,55 @@ function dnsmasq_section(uci) {
 
 // Пересылка по домену: dnsmasq отдаёт названные имена нашему слушателю, а всё
 // остальное резолвит как раньше. Перенаправлять весь DNS дома нельзя (7.3).
-function configure_dnsmasq(uci, rules) {
+// Ключи dnsmasq, которые режим «резолвить всё через подключение» забирает себе.
+// Их прежние значения ложатся в zarap.main.saved_dns_* — один раз, до первой
+// подмены, чтобы повторное применение не запомнило уже наше.
+const DNS_TAKEOVER = ['server', 'noresolv', 'cachesize'];
+
+// Запомнить чужое и поставить своё. Кэш выключается не из вредности: dnsmasq
+// отдавал бы старые ответы поверх свежих, и подкоп из чужого кэша возвращался
+// бы уже после того, как его перестали спрашивать.
+function dnsmasq_take_over(uci, section) {
+	for (let key in DNS_TAKEOVER)
+		if (uci.get('zarap', 'main', 'saved_dns_' + key) == null) {
+			let previous = uci.get('dhcp', section, key);
+			uci.set('zarap', 'main', 'saved_dns_' + key,
+				previous == null ? '' : previous);
+		}
+
+	uci.set('dhcp', section, 'server', [DNS_FORWARD]);
+	uci.set('dhcp', section, 'noresolv', '1');
+	uci.set('dhcp', section, 'cachesize', '0');
+}
+
+// Вернуть запомненное. Вызывается и при выключении Zarap, и при удалении
+// пакета: домашний DNS обязан работать так же, как до нас, а не так, как нам
+// было удобно.
+function dnsmasq_hand_back(uci, section) {
+	for (let key in DNS_TAKEOVER) {
+		let saved = uci.get('zarap', 'main', 'saved_dns_' + key);
+		if (saved == null)
+			continue;
+		if (saved == '' || (type(saved) == 'array' && !length(saved)))
+			uci.delete('dhcp', section, key);
+		else
+			uci.set('dhcp', section, key, saved);
+		uci.delete('zarap', 'main', 'saved_dns_' + key);
+	}
+}
+
+function configure_dnsmasq(uci, rules, enabled, resolve_all) {
 	let section = dnsmasq_section(uci);
 	if (!section)
 		return;
+
+	// Выключенный Zarap ничего у dnsmasq не забирает: sing-box остановлен, и
+	// пересылка на него оставила бы дом без названных имён вовсе.
+	if (enabled && resolve_all) {
+		dnsmasq_take_over(uci, section);
+		return;
+	}
+	dnsmasq_hand_back(uci, section);
 
 	let raw = uci.get('dhcp', section, 'server');
 	if (type(raw) != 'array')
@@ -1252,13 +1326,14 @@ function configure_dnsmasq(uci, rules) {
 		uci.delete('dhcp', section, 'server');
 }
 
-function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap) {
+function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap, resolve_all) {
 	uci.load('zarap');
 	uci.set('zarap', 'main', 'zarap');
 	uci.set('zarap', 'main', 'enabled', enabled ? '1' : '0');
 	uci.set('zarap', 'main', 'final', final);
 	uci.set('zarap', 'main', 'ruleset_detour', ruleset_detour || 'direct');
 	uci.set('zarap', 'main', 'bootstrap_dns', bootstrap || BOOTSTRAP_DEFAULT);
+	uci.set('zarap', 'main', 'resolve_all', resolve_all ? '1' : '0');
 	// Leftovers from the single-connection schema and from the three options
 	// that only ever looked like settings.
 	for (let key in ['name', 'server', 'server_port', 'uuid', 'flow', 'server_name',
@@ -1351,7 +1426,7 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets,
 			uci.set('zarap', 'main', 'saved_' + key, previous == null ? '' : previous);
 		uci.set('dhcp', 'lan', key, 'disabled');
 	}
-	configure_dnsmasq(uci, rules);
+	configure_dnsmasq(uci, rules, enabled, resolve_all);
 
 	uci.load('sing-box');
 	uci.set('sing-box', 'main', 'sing-box');
@@ -1369,7 +1444,7 @@ function cleanup_uci_candidate() {
 	}
 }
 
-function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap) {
+function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap, resolve_all) {
 	mkdir(UCI_CANDIDATE);
 	chmod(UCI_CANDIDATE, 0700);
 	mkdir(UCI_CANDIDATE_DELTA);
@@ -1385,7 +1460,7 @@ function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulese
 	}
 
 	let candidate = cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA);
-	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap)) {
+	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap, resolve_all)) {
 		cleanup_uci_candidate();
 		return result_error('Не удалось сформировать временный UCI-кандидат', '', 'startup_error');
 	}
@@ -1495,6 +1570,14 @@ function saved_bootstrap() {
 	let uci = cursor();
 	uci.load('zarap');
 	return trim('' + (uci.get('zarap', 'main', 'bootstrap_dns') || '')) || BOOTSTRAP_DEFAULT;
+}
+
+// Режим «резолвить имена через подключение». Конфигурация без поля — это
+// прежнее поведение: адресная пересылка названных доменов, всё остальное мимо.
+function saved_resolve_all() {
+	let uci = cursor();
+	uci.load('zarap');
+	return uci.get('zarap', 'main', 'resolve_all') == '1';
 }
 
 function saved_final() {
@@ -1634,7 +1717,7 @@ function recent_failures() {
 	return { connection: false, unresolved: '' };
 }
 
-function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour, bootstrap) {
+function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour, bootstrap, resolve_all) {
 	let lan = lan_device();
 	// A redirect without an interface condition would capture traffic arriving
 	// from the WAN, so an unanswered ubus has to fail the apply outright.
@@ -1651,7 +1734,7 @@ function validate_candidate(outbounds, rules, final, clients, proxying, rulesets
 
 	mkdir('/etc/zarap');
 	chmod('/etc/zarap', 0700);
-	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap)) + '\n';
+	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all)) + '\n';
 	let nft = nft_config(guarded, lan, proxying);
 	let config_written = writefile(CONFIG_TMP, sing_box);
 	let nft_written = writefile(NFT_TMP, nft);
@@ -1818,6 +1901,16 @@ function validate_request(args, enabled) {
 	let bootstrap_result = parse_bootstrap(args?.bootstrap_dns);
 	if (!bootstrap_result.ok)
 		return bootstrap_result;
+	let resolve_all = !!args?.resolve_all;
+	// `local` читает /etc/resolv.conf, а он указывает на dnsmasq, который в этом
+	// режиме шлёт всё нам же. Петля, и притом на весь домашний DNS сразу —
+	// поэтому она не предупреждение, а отказ ввода.
+	if (resolve_all && bootstrap_result.value == 'local')
+		return input_error('Резолвер для всей сети не может быть local: dnsmasq отправляет запросы Zarap, ' +
+			'а local спрашивает dnsmasq — получается петля. Укажите адрес резолвера, например tls://77.88.8.8');
+	// Спрашивать имена через подключение можно, только если оно есть.
+	if (resolve_all && !length(outbounds))
+		return input_error('Резолв через подключение включён, но подключений нет');
 	let declared = {};
 	for (let ruleset in ruleset_result.rulesets)
 		declared[ruleset.tag] = true;
@@ -1855,7 +1948,8 @@ function validate_request(args, enabled) {
 
 	return { ok: true, outbounds: outbounds, rules: rules, final: final,
 		clients: client_result.clients, rulesets: ruleset_result.rulesets,
-		ruleset_detour: detour_result.detour, bootstrap_dns: bootstrap_result.value };
+		ruleset_detour: detour_result.detour, bootstrap_dns: bootstrap_result.value,
+		resolve_all: resolve_all };
 }
 
 // Списки скачивает sing-box, и до первой удачной загрузки старт зависит от
@@ -1886,12 +1980,12 @@ function apply_configuration(args) {
 
 	let candidate = validate_candidate(request.outbounds, request.rules, request.final,
 		request.clients, enabled, request.rulesets, request.ruleset_detour,
-		request.bootstrap_dns);
+		request.bootstrap_dns, request.resolve_all);
 	if (!candidate.ok)
 		return candidate;
 	let uci_candidate = prepare_uci_candidate(request.outbounds, request.rules,
 		request.final, enabled, request.clients, request.rulesets,
-		request.ruleset_detour, request.bootstrap_dns);
+		request.ruleset_detour, request.bootstrap_dns, request.resolve_all);
 	if (!uci_candidate.ok) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
 		return uci_candidate;
@@ -2250,6 +2344,7 @@ function status() {
 		ruleset_detour: ruleset_detour,
 		ruleset_detour_missing: ruleset_detour_missing,
 		bootstrap_dns: saved_bootstrap(),
+		resolve_all: saved_resolve_all(),
 		cache: cache_state(),
 		// Сколько имён резолвится через прокси. Ноль означает, что доменные
 		// правила работают только против DPI: подменённый DNS они не обходят.
@@ -2484,7 +2579,7 @@ const methods = {
 	status: { call: function() { return status(); } },
 	validate: {
 		args: { outbounds: [], rules: [], rulesets: [], ruleset_detour: '', bootstrap_dns: '',
-			clients: [], final: '' },
+			resolve_all: true, clients: [], final: '' },
 		call: function(request) {
 			let checked = validate_request(request.args || {}, true);
 			if (!checked.ok) return checked;
@@ -2492,11 +2587,11 @@ const methods = {
 			if (!conflict.ok) return conflict;
 			let candidate = validate_candidate(checked.outbounds, checked.rules,
 				checked.final, checked.clients, true, checked.rulesets,
-				checked.ruleset_detour, checked.bootstrap_dns);
+				checked.ruleset_detour, checked.bootstrap_dns, checked.resolve_all);
 			if (!candidate.ok) return candidate;
 			let uci_candidate = prepare_uci_candidate(checked.outbounds, checked.rules,
 				checked.final, true, checked.clients, checked.rulesets,
-				checked.ruleset_detour, checked.bootstrap_dns);
+				checked.ruleset_detour, checked.bootstrap_dns, checked.resolve_all);
 			unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
 			if (!uci_candidate.ok) return uci_candidate;
 			return {
@@ -2511,7 +2606,7 @@ const methods = {
 	},
 	apply: {
 		args: { enabled: true, outbounds: [], rules: [], rulesets: [], ruleset_detour: '',
-			bootstrap_dns: '', clients: [], final: '' },
+			bootstrap_dns: '', resolve_all: true, clients: [], final: '' },
 		call: function(request) {
 			let lock = acquire_lock();
 			if (!lock) return result_error('Другая операция Zarap уже выполняется');
