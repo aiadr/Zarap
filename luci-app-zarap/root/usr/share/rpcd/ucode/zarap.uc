@@ -476,8 +476,15 @@ function validate_ruleset_detour(value, tags) {
 // нельзя. Голый адрес читается как udp — открытый запрос, который работает
 // везде, и именно за ним сюда приходят, когда DoH закрыт.
 //
-// Имя вместо адреса не принимается: его самого пришлось бы через что-то
-// резолвить, и это ровно тот круг, ради которого bootstrap и появился.
+// Имя вместо адреса не принимается, и это не придирка: sing-box отказывается
+// стартовать с DNS-сервером, заданным именем, — `missing domain resolver for
+// domain server address`. Резолвить это имя было бы нечем, кроме резолвера,
+// который оно и задаёт.
+//
+// Но у шифрованных схем имя всё же нужно — второе, для сертификата: DoT и DoH
+// по голому адресу проверяются только тогда, когда в сертификате есть IP SAN,
+// а он есть далеко не у всех резолверов. Форма `имя@адрес` разводит эти два
+// имени: звонок идёт по адресу, проверка — по имени.
 function parse_bootstrap(value) {
 	let text = trim('' + (value || ''));
 	if (text == '')
@@ -513,6 +520,20 @@ function parse_bootstrap(value) {
 	if (path != '' && scheme != 'https')
 		return input_error('Bootstrap DNS: путь есть только у https://, а здесь ' + scheme + '://');
 
+	// Имя для сертификата, если оно названо. Стоит перед адресом и отделено
+	// собакой — как userinfo в URL: «это имя, доступное по этому адресу».
+	let server_name = '';
+	let at = rindex(rest, '@');
+	if (at >= 0) {
+		server_name = substr(rest, 0, at);
+		rest = substr(rest, at + 1);
+		if (scheme != 'https' && scheme != 'tls')
+			return input_error('Bootstrap DNS: имя для сертификата есть только у https:// и tls://, ' +
+				'а здесь ' + scheme + '://: открытый запрос ничего не проверяет');
+		if (!match(server_name, /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/))
+			return input_error('Bootstrap DNS: некорректное имя для сертификата: ' + (server_name || '—'));
+	}
+
 	let host = rest, port = 0;
 	let colon = rindex(rest, ':');
 	if (colon >= 0) {
@@ -526,15 +547,22 @@ function parse_bootstrap(value) {
 		return input_error('Bootstrap DNS: IPv6-адрес не поддерживается — наружу Zarap ходит по IPv4');
 	if (!valid_ipv4(host))
 		return input_error('Bootstrap DNS: нужен IPv4-адрес, а не имя ' + (host || '—') +
-			': имя пришлось бы резолвить через тот самый резолвер, который оно и задаёт');
+			': sing-box не стартует с резолвером, заданным именем — резолвить это имя было бы ' +
+			'нечем. Для сертификата имя пишется отдельно: ' + scheme + '://имя@адрес');
 
 	let server = { type: scheme, tag: BOOTSTRAP_TAG, server: host };
 	if (port)
 		server.server_port = port;
 	if (path != '')
 		server.path = path;
+	// `enabled: true` обязателен, и это не формальность: без него блок tls
+	// принимается `check`, молча игнорируется на запуске, и проверка идёт по
+	// адресу — то есть ровно то, ради чего имя и указывали, не происходит.
+	if (server_name != '')
+		server.tls = { enabled: true, server_name: server_name };
 	return { ok: true,
-		value: scheme + '://' + host + (port ? ':' + port : '') + path,
+		value: scheme + '://' + (server_name != '' ? server_name + '@' : '') +
+			host + (port ? ':' + port : '') + path,
 		server: server };
 }
 
