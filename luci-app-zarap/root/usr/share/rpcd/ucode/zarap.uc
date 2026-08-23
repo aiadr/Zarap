@@ -1318,24 +1318,13 @@ function saved_rulesets() {
 }
 
 // Подключение для загрузки списков — одно на все списки, и живёт оно в main.
-// В прежней схеме оно стояло у каждого набора отдельно; конфигурация, дожившая
-// с тех пор, читается по первому набору, который его называл, иначе после
-// обновления списки молча начали бы качаться напрямую — то есть оттуда, где их
-// источник и заблокирован.
+// `option detour` из прежней схемы, где оно стояло у каждого набора, не
+// читается: конфигурация с той схемы возвращается к `direct`, а выбрать
+// подключение заново — одно действие на странице.
 function saved_ruleset_detour() {
 	let uci = cursor();
 	uci.load('zarap');
-	let detour = trim('' + (uci.get('zarap', 'main', 'ruleset_detour') || ''));
-	if (detour != '')
-		return detour;
-
-	let inherited = '';
-	uci.foreach('zarap', 'ruleset', function(section) {
-		let legacy = trim('' + (section.detour || ''));
-		if (inherited == '' && legacy != '' && legacy != 'direct')
-			inherited = legacy;
-	});
-	return inherited || 'direct';
+	return uci.get('zarap', 'main', 'ruleset_detour') || 'direct';
 }
 
 function saved_final() {
