@@ -5,8 +5,8 @@
 'require view';
 
 const callStatus = rpc.declare({ object: 'zarap', method: 'status' });
-const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'clients', 'final' ] });
-const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'clients', 'final' ] });
+const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'clients', 'final' ] });
+const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'clients', 'final' ] });
 const callRestart = rpc.declare({ object: 'zarap', method: 'restart' });
 const callStop = rpc.declare({ object: 'zarap', method: 'stop' });
 const callLogs = rpc.declare({ object: 'zarap', method: 'logs' });
@@ -103,6 +103,9 @@ const state = {
 	// Через что скачивать списки — один выбор на все списки сразу: их источники
 	// заблокированы там же, где и всё остальное, так что ответ у них общий.
 	rulesetDetour: 'direct',
+	// Чем резолвится адрес сервера из ссылки. Мимо туннеля — через туннель было
+	// бы кругом, — и потому единственный запрос Zarap, который видит провайдер.
+	bootstrapDns: 'https://1.1.1.1',
 	cache: { size: 0, free: 0 },
 	// Сколько имён резолвится через прокси; считается роутером из применённых
 	// правил, поэтому это состояние роутера, а не страницы.
@@ -152,6 +155,7 @@ function loadState(status) {
 		return Object.assign({}, ruleset);
 	});
 	state.rulesetDetour = status.ruleset_detour || 'direct';
+	state.bootstrapDns = status.bootstrap_dns || 'https://1.1.1.1';
 	state.cache = status.cache || { size: 0, free: 0 };
 	state.dns = status.dns || { forwarded: 0 };
 	state.final = status.final || 'direct';
@@ -1205,6 +1209,13 @@ function renderDevices() {
 		: E('tr', {}, E('td', { 'colspan': 5 }, _('Устройства пока не обнаружены')));
 }
 
+// Значение читается из поля, а не из state: change срабатывает по потере
+// фокуса, и набранное, но не покинутое поле иначе уехало бы прежним.
+function bootstrapValue() {
+	const field = document.querySelector('#zarap-bootstrap-dns');
+	return field ? field.value.trim() : state.bootstrapDns;
+}
+
 // Redraws everything a rule change can affect: which connection counts as used,
 // which device carries a lease, and where each device's traffic ends up.
 function refresh() {
@@ -1405,6 +1416,19 @@ return view.extend({
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-bootstrap-dns' }, _('Резолвер адреса сервера')),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('input', {
+								'id': 'zarap-bootstrap-dns', 'class': 'cbi-input-text',
+								'style': 'width:100%', 'placeholder': 'https://1.1.1.1',
+								'value': state.bootstrapDns,
+								'change': function(ev) { state.bootstrapDns = ev.target.value.trim(); }
+							}),
+							E('div', { 'class': 'cbi-value-description' },
+								_('Нужен, когда в ссылке подключения указан домен, а не адрес: имя сервера надо разрешить прежде, чем до него дозвониться, и через сам туннель это сделать нельзя. Запрос идёт мимо прокси — он единственный, который видит провайдер. Схема обязательна и решает, шифруется ли запрос: https:// (DoH, по умолчанию 1.1.1.1), tls:// (DoT), udp:// или tcp:// — открытый запрос, который проходит там, где DoH закрыт, и local — резолвер самого роутера. Адрес только IPv4: имя здесь пришлось бы разрешать через него же.'))
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title', 'for': 'zarap-enabled' }, _('Включить Zarap')),
 						E('div', { 'class': 'cbi-value-field' }, [
 							E('input', { 'id': 'zarap-enabled', 'type': 'checkbox', 'checked': state.enabled ? '' : null })
@@ -1533,8 +1557,8 @@ return view.extend({
 								if (!readyToSend())
 									return;
 								notify(await callValidate(submittedOutbounds(), state.rules,
-									state.rulesets, state.rulesetDetour, leasedClients(),
-									state.final),
+									state.rulesets, state.rulesetDetour, bootstrapValue(),
+									leasedClients(), state.final),
 									_('Конфигурация корректна'));
 							})
 						}, _('Проверить конфигурацию')),
@@ -1550,6 +1574,7 @@ return view.extend({
 									state.rules,
 									state.rulesets,
 									state.rulesetDetour,
+									bootstrapValue(),
 									leasedClients(),
 									state.final
 								);

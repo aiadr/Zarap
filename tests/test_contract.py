@@ -99,10 +99,15 @@ class PackageContractTests(unittest.TestCase):
         for type_name in ("'bool'", "'string'", "'number'", "'array'", "'boolean'"):
             self.assertNotIn(type_name, methods_body)
         self.assertIn("args: { refresh: true }", methods_body)
-        self.assertIn(
-            "args: { enabled: true, outbounds: [], rules: [], rulesets: [], "
-            "ruleset_detour: '', clients: [], final: '' }",
-            methods_body)
+        # Проверяется каждая пара по отдельности: единым литералом это ломалось
+        # от переноса строки, хотя объявление оставалось тем же.
+        shared = ("outbounds: []", "rules: []", "rulesets: []", "ruleset_detour: ''",
+                  "bootstrap_dns: ''", "clients: []", "final: ''")
+        for method, expected in (("validate", shared), ("apply", ("enabled: true",) + shared)):
+            body = re.search(rf"{method}: \{{\s*args: \{{(.*?)\}},", methods_body, re.S)
+            self.assertIsNotNone(body, method)
+            for pair in expected:
+                self.assertIn(pair, body.group(1), method)
 
     def test_every_rpc_method_is_granted_by_the_acl(self):
         # A method rpcd publishes but the ACL never names is unreachable from
