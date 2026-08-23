@@ -483,8 +483,10 @@ function validate_ruleset_detour(value, tags) {
 //
 // Но у шифрованных схем имя всё же нужно — второе, для сертификата: DoT и DoH
 // по голому адресу проверяются только тогда, когда в сертификате есть IP SAN,
-// а он есть далеко не у всех резолверов. Форма `имя@адрес` разводит эти два
-// имени: звонок идёт по адресу, проверка — по имени.
+// а он есть далеко не у всех резолверов. Хвост `#имя` разводит эти два имени:
+// звонок идёт по адресу, проверка — по имени. Форма не выдумана: так же
+// пишется резолвер в systemd-resolved (`DNS=1.1.1.1#cloudflare-dns.com`) и в
+// unbound, и адрес в ней стоит первым — тем, чем резолвер и является.
 function parse_bootstrap(value) {
 	let text = trim('' + (value || ''));
 	if (text == '')
@@ -506,6 +508,20 @@ function parse_bootstrap(value) {
 		return input_error('Bootstrap DNS: неизвестный протокол ' + scheme +
 			'://; допустимы https, tls, udp, tcp и local');
 
+	// Имя для сертификата — хвостом, как фрагмент в URL: оно и правда не часть
+	// адреса, а примечание к нему.
+	let server_name = '';
+	let hash = rindex(rest, '#');
+	if (hash >= 0) {
+		server_name = substr(rest, hash + 1);
+		rest = substr(rest, 0, hash);
+		if (scheme != 'https' && scheme != 'tls')
+			return input_error('Bootstrap DNS: имя для сертификата есть только у https:// и tls://, ' +
+				'а здесь ' + scheme + '://: открытый запрос ничего не проверяет');
+		if (!match(server_name, /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/))
+			return input_error('Bootstrap DNS: некорректное имя для сертификата: ' + (server_name || '—'));
+	}
+
 	let path = '';
 	let slash = index(rest, '/');
 	if (slash >= 0) {
@@ -519,20 +535,6 @@ function parse_bootstrap(value) {
 	// пользуется.
 	if (path != '' && scheme != 'https')
 		return input_error('Bootstrap DNS: путь есть только у https://, а здесь ' + scheme + '://');
-
-	// Имя для сертификата, если оно названо. Стоит перед адресом и отделено
-	// собакой — как userinfo в URL: «это имя, доступное по этому адресу».
-	let server_name = '';
-	let at = rindex(rest, '@');
-	if (at >= 0) {
-		server_name = substr(rest, 0, at);
-		rest = substr(rest, at + 1);
-		if (scheme != 'https' && scheme != 'tls')
-			return input_error('Bootstrap DNS: имя для сертификата есть только у https:// и tls://, ' +
-				'а здесь ' + scheme + '://: открытый запрос ничего не проверяет');
-		if (!match(server_name, /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/))
-			return input_error('Bootstrap DNS: некорректное имя для сертификата: ' + (server_name || '—'));
-	}
 
 	let host = rest, port = 0;
 	let colon = rindex(rest, ':');
@@ -548,7 +550,7 @@ function parse_bootstrap(value) {
 	if (!valid_ipv4(host))
 		return input_error('Bootstrap DNS: нужен IPv4-адрес, а не имя ' + (host || '—') +
 			': sing-box не стартует с резолвером, заданным именем — резолвить это имя было бы ' +
-			'нечем. Для сертификата имя пишется отдельно: ' + scheme + '://имя@адрес');
+			'нечем. Для сертификата имя дописывается к адресу: ' + scheme + '://адрес#имя');
 
 	let server = { type: scheme, tag: BOOTSTRAP_TAG, server: host };
 	if (port)
@@ -561,8 +563,8 @@ function parse_bootstrap(value) {
 	if (server_name != '')
 		server.tls = { enabled: true, server_name: server_name };
 	return { ok: true,
-		value: scheme + '://' + (server_name != '' ? server_name + '@' : '') +
-			host + (port ? ':' + port : '') + path,
+		value: scheme + '://' + host + (port ? ':' + port : '') + path +
+			(server_name != '' ? '#' + server_name : ''),
 		server: server };
 }
 
