@@ -52,31 +52,55 @@ if [ -n "$$section" ]; then
 	done
 	# Удаляем только точные строки пересылки, добавленные самим Zarap:
 	# после миграции (managed_dns_tracked=1) — строго по managed_dns_servers;
-	# до миграции — восстанавливаем их из сохранённых правил zarap без
-	# угадывания владельца по номеру порта, чтобы не трогать чужие записи.
-	if [ "$$(uci -q get zarap.main.managed_dns_tracked)" = "1" ]; then
-		if managed="$$(uci -q get zarap.main.managed_dns_servers)"; then
-			for entry in $$managed; do
-				[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
-			done
-		fi
-	else
+	# до миграции — используем managed_dns_servers (если уже есть) и
+	# восстанавливаем строки из сохранённых правил zarap с учётом rule_set.
+	if managed="$$(uci -q get zarap.main.managed_dns_servers)"; then
+		for entry in $$managed; do
+			[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
+		done
+	fi
+	if [ "$$(uci -q get zarap.main.managed_dns_tracked)" != "1" ]; then
 		idx=0
-		tags=""
+		order=""
+		has_domain=""
+		while target="$$(uci -q get "zarap.@rule[$$idx].target")"; do
+			domains="$$(uci -q get "zarap.@rule[$$idx].domain")"
+			rsets="$$(uci -q get "zarap.@rule[$$idx].rule_set")"
+			if [ "$$target" != "direct" ] && [ "$$target" != "block" ]; then
+				if [ -n "$$domains" ] || [ -n "$$rsets" ]; then
+					case " $$order " in
+						*" $$target "*) ;;
+						*) order="$$order $$target" ;;
+					esac
+				fi
+				if [ -n "$$domains" ]; then
+					case " $$has_domain " in
+						*" $$target "*) ;;
+						*) has_domain="$$has_domain $$target" ;;
+					esac
+				fi
+			fi
+			idx=$$((idx + 1))
+		done
+		domain_tags=""
+		for t in $$order; do
+			case " $$has_domain " in
+				*" $$t "*) domain_tags="$$domain_tags $$t" ;;
+			esac
+		done
+		idx=0
 		while target="$$(uci -q get "zarap.@rule[$$idx].target")"; do
 			domains="$$(uci -q get "zarap.@rule[$$idx].domain")"
 			if [ -n "$$domains" ] && [ "$$target" != "direct" ] && [ "$$target" != "block" ]; then
 				pos=0
-				found=""
-				for t in $$tags; do
-					[ "$$t" = "$$target" ] && { found="$$pos"; break; }
+				port=5353
+				for t in $$domain_tags; do
+					if [ "$$t" = "$$target" ]; then
+						port=$$((5353 + pos))
+						break
+					fi
 					pos=$$((pos + 1))
 				done
-				if [ -z "$$found" ]; then
-					found="$$pos"
-					tags="$$tags $$target"
-				fi
-				port=$$((5353 + found))
 				for d in $$domains; do
 					d="$${d#.}"
 					uci -q del_list "dhcp.$$section.server=/$$d/127.0.0.1#5353"

@@ -212,4 +212,38 @@ function dnsmasq_section() { return 'cfg01'; }
 		assert.deepEqual(cleaned['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5353']);
 		assert.equal(cleaned['zarap.main.managed_dns_tracked'], '1');
 	});
+
+	test('migrates multi-port entries when a rule_set-only rule precedes manual domains', () => {
+		// Exact reviewer regression: rule 0 has geosite on out_2, rule 1 has
+		// one.test on out_1, rule 2 has two.test on out_2 -> out_2 owns 5353,
+		// out_1 owns 5354 (and rule_set-only out_3 consumes no port).
+		const before = {
+			'dhcp.cfg01.server': [
+				'8.8.8.8',
+				'/corp.test/127.0.0.1#5353',
+				'/two.test/127.0.0.1#5353',
+				'/one.test/127.0.0.1#5354'
+			]
+		};
+		const savedRules = [
+			{ rule_set: ['rs_0'], target: 'out_3' },
+			{ rule_set: ['rs_1'], target: 'out_2' },
+			{ domain: ['one.test'], target: 'out_1' },
+			{ domain: ['two.test'], target: 'out_2' }
+		];
+		const cleaned = runUci({ ...before }, [], false, false, { savedRules });
+		assert.deepEqual(cleaned['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5353']);
+		assert.equal(cleaned['zarap.main.managed_dns_tracked'], '1');
+	});
+
+	test('honors existing managed_dns_servers when upgrading from a build without managed_dns_tracked', () => {
+		const before = {
+			'dhcp.cfg01.server': ['8.8.8.8', '/corp.test/127.0.0.1#5353', '/custom.test/127.0.0.1#5354'],
+			'zarap.main.managed_dns_servers': ['/custom.test/127.0.0.1#5354']
+		};
+		const cleaned = runUci({ ...before }, [], false, false);
+		assert.deepEqual(cleaned['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5353']);
+		assert.equal(cleaned['zarap.main.managed_dns_tracked'], '1');
+		assert.equal('zarap.main.managed_dns_servers' in cleaned, false);
+	});
 });

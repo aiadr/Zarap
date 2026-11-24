@@ -1465,10 +1465,13 @@ function dns_forward_entries(rules, single_port) {
 function uci_dns_rules(uci) {
 	let rules = [];
 	uci.foreach('zarap', 'rule', function(section) {
-		if (!section || !section.target || !section.domain)
+		if (!section || !section.target || (!section.domain && !section.rule_set))
 			return;
-		let domains = type(section.domain) == 'array' ? section.domain : [section.domain];
-		push(rules, { domains: domains, target: '' + section.target });
+		let domains = !section.domain ? [] :
+			(type(section.domain) == 'array' ? section.domain : [section.domain]);
+		let rule_sets = !section.rule_set ? [] :
+			(type(section.rule_set) == 'array' ? section.rule_set : [section.rule_set]);
+		push(rules, { domains: domains, rule_sets: rule_sets, target: '' + section.target });
 	});
 	return rules;
 }
@@ -1483,18 +1486,16 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all, previous_rules) {
 
 	let tracked = uci.get('zarap', 'main', 'managed_dns_tracked') == '1';
 	let owned = {};
-	if (tracked) {
-		let prev_raw = uci.get('zarap', 'main', 'managed_dns_servers');
-		if (type(prev_raw) != 'array')
-			prev_raw = prev_raw ? [prev_raw] : [];
-		for (let entry in prev_raw)
-			owned['' + entry] = true;
-	}
-	else {
+	let prev_raw = uci.get('zarap', 'main', 'managed_dns_servers');
+	if (type(prev_raw) != 'array')
+		prev_raw = prev_raw ? [prev_raw] : [];
+	for (let entry in prev_raw)
+		owned['' + entry] = true;
+	if (!tracked) {
 		// Однократная миграция со старой схемы (до появления managed_dns_tracked):
 		// восстанавливаем точные строки из сохранённых до применения правил
-		// (и для формата 5353+i, и для прежнего общего порта 5353), не угадывая
-		// принадлежность по номеру порта и не трогая чужие записи.
+		// (включая rule_set для сохранения порядка портов 5353+i, а также
+		// прежний общий порт 5353), не угадывая принадлежность по номеру порта.
 		let legacy_rules = previous_rules != null ? previous_rules : uci_dns_rules(uci);
 		if (previous_rules == null && !length(legacy_rules))
 			legacy_rules = rules || [];
