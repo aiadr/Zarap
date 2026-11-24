@@ -13,7 +13,7 @@ const CONFIG = '/etc/zarap/xray.json';
 // через встроенный блок geodata и горячо перечитывает их без рестарта.
 const ASSETS_DIR = '/etc/zarap/assets';
 const ASSETS_BACKUP_DIR = '/etc/zarap/.assets.bak';
-const CONFIG_TMP = '/etc/zarap/.xray.json.tmp';
+const CONFIG_TMP = '/etc/zarap/.xray.tmp.json';
 const FETCH_CONFIG_TMP = '/tmp/zarap-fetch-xray.json';
 const FETCH_SOCKS_PORT = 17893;
 const NFT_CONFIG = '/etc/nftables.d/90-zarap.nft';
@@ -801,6 +801,21 @@ function geodata_cron(used_rulesets) {
 	return '0 4 */' + days + ' * *';
 }
 
+// Детерминированное имя .dat-файла по URL источника (64-битный хэш FNV-1a).
+// Привязка к URL, а не к переиспользуемому тегу rs_N, гарантирует, что новый
+// список на том же теге никогда не получит кэш от прежнего URL, а прежний файл
+// сохранится на диске до успешной проверки запуска для безопасного отката.
+function asset_filename(url) {
+	let s = '' + (url || '');
+	let h1 = 0x811c9dc5, h2 = 0x050c5d1f;
+	for (let i = 0; i < length(s); i++) {
+		let c = ord(s, i);
+		h1 = ((h1 ^ c) * 0x01000193) & 0xffffffff;
+		h2 = ((h2 ^ (c + i)) * 0x01000193) & 0xffffffff;
+	}
+	return sprintf('dat_%08x%08x.dat', h1, h2);
+}
+
 // Выбирает используемые правилами списки .dat и дедуплицирует файлы по URL:
 // два списка с разными категориями из одного geosite.dat скачивают один файл.
 function ruleset_plan(rules, rulesets) {
@@ -815,7 +830,7 @@ function ruleset_plan(rules, rulesets) {
 			continue;
 		let file = file_by_url[rs.url];
 		if (!file) {
-			file = rs.tag + '.dat';
+			file = asset_filename(rs.url);
 			file_by_url[rs.url] = file;
 			push(assets, { url: rs.url, file: file });
 		}
@@ -931,8 +946,20 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 
 	let listens_dns = !!(resolve_all || length(tunnel_dns_order));
 
+	let auto_rulesets = [], auto_files = {};
+	for (let rs in plan.used_rulesets) {
+		if (rs.update_interval && !(skip_assets && skip_assets[rs.file])) {
+			push(auto_rulesets, rs);
+			auto_files[rs.file] = true;
+		}
+	}
+	let auto_assets = [];
+	for (let asset in plan.assets)
+		if (auto_files[asset.file])
+			push(auto_assets, asset);
+
 	// Собственные имена роутера: домены серверов из ссылок и хост источника
-	// .dat-файлов, если они скачиваются напрямую.
+	// автообновляемых .dat-файлов, если они скачиваются напрямую.
 	let server_domains = [], seen_server = {};
 	for (let outbound in outbounds) {
 		if (is_domain(outbound.server) && !seen_server[outbound.server]) {
@@ -940,8 +967,8 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 			push(server_domains, 'full:' + outbound.server);
 		}
 	}
-	if (length(plan.assets) && detour == 'direct') {
-		for (let asset in plan.assets) {
+	if (length(auto_assets) && detour == 'direct') {
+		for (let asset in auto_assets) {
 			let host = url_hostname(asset.url);
 			if (is_domain(host) && !seen_server[host]) {
 				seen_server[host] = true;
@@ -954,7 +981,7 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 	let uses_udp_bootstrap = wants_bootstrap && parsed_bootstrap.scheme == 'udp';
 	if (uses_udp_bootstrap)
 		wants_direct = true;
-	if (length(plan.assets) && detour == 'direct')
+	if (length(auto_assets) && detour == 'direct')
 		wants_direct = true;
 
 	// Внутренние правила DNS стоят в самом начале routing.rules, до трафика
@@ -997,8 +1024,47 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 		push(emitted, { tag: 'direct', protocol: 'freedom' });
 	if (wants_block)
 		push(emitted, { tag: 'block', protocol: 'blackhole', settings: { response: { type: 'none' } } });
-	if (listens_dns)
-		push(emitted, { tag: DNS_OUT_TAG, protocol: 'dns', settings: { nonIPQuery: 'drop' } });
+	if (listens_dns) {
+		let dns_out = { tag: DNS_OUT_TAG, protocol: 'dns' };
+		let all_tunnel_domains = [];
+		for (let tag in tunnel_dns_order)
+			for (let item in tunnel_dns_domains[tag])
+				push(all_tunnel_domains, item);
+
+		// A/AAAA (qType 1,28) всегда перехватываются во встроенный DNS xray-core.
+		// Для остальных типов (TXT, MX, SRV, HTTPS/SVCB):
+		// - при resolve_all=1: туннельные домены возвращают NOERROR без утечки
+		//   наружу и без таймаута, а остальные домены дома идут напрямую в
+		//   выбранный bootstrap-резолвер;
+		// - при resolve_all=0: сюда приходят только туннельные домены, и их
+		//   не-IP запросы уходят через туннель (dialerProxy) в tunnel_dns.
+		if (resolve_all) {
+			let non_ip_rules = [{ action: 'hijack', qType: '1,28' }];
+			if (length(all_tunnel_domains))
+				push(non_ip_rules, { action: 'return', domain: all_tunnel_domains, rCode: 0 });
+			push(non_ip_rules, { action: 'direct' });
+			dns_out.settings = {
+				rewriteNetwork: parsed_bootstrap.scheme == 'tcp' ? 'tcp' : 'udp',
+				rewriteAddress: parsed_bootstrap.host || DNS_UPSTREAM,
+				rewritePort: parsed_bootstrap.scheme == 'https' ? 53 : (parsed_bootstrap.port || 53),
+				rules: non_ip_rules
+			};
+		}
+		else {
+			dns_out.settings = {
+				rewriteNetwork: parsed_tunnel.scheme == 'udp' ? 'udp' : 'tcp',
+				rewriteAddress: parsed_tunnel.host || DNS_UPSTREAM,
+				rewritePort: parsed_tunnel.scheme == 'https' ? 53 : (parsed_tunnel.port || 53),
+				rules: [
+					{ action: 'hijack', qType: '1,28' },
+					{ action: 'direct' }
+				]
+			};
+			if (length(tunnel_dns_order))
+				dns_out.streamSettings = { sockopt: { dialerProxy: tunnel_dns_order[0] } };
+		}
+		push(emitted, dns_out);
+	}
 
 	let tproxy = {
 		tag: INBOUND_TAG,
@@ -1067,16 +1133,15 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 		};
 	}
 
-	if (length(plan.assets)) {
-		let geodata = { assets: plan.assets };
-		let cron = geodata_cron(plan.used_rulesets);
-		if (cron)
-			geodata.cron = cron;
-		if (detour != 'direct')
-			geodata.outbound = detour;
-		else
-			geodata.outbound = 'direct';
-		config.geodata = geodata;
+	if (length(auto_assets)) {
+		let cron = geodata_cron(auto_rulesets);
+		if (cron) {
+			config.geodata = {
+				cron: cron,
+				outbound: detour != 'direct' ? detour : 'direct',
+				assets: auto_assets
+			};
+		}
 	}
 
 	return config;
@@ -2079,6 +2144,24 @@ function live_clients_match(guarded_ips) {
 	return true;
 }
 
+// Распознаёт прежний экземпляр Zarap на sing-box по точному пути конфига
+// /etc/zarap/sing-box.json, чтобы обновление работающего роутера освободило
+// порт 7893 и могло откатиться назад, не затрагивая чужой sing-box (например Podkop).
+function legacy_zarap_sing_box() {
+	let uci = cursor();
+	uci.load('sing-box');
+	return uci.get('sing-box', 'main', 'conffile') == '/etc/zarap/sing-box.json' &&
+		uci.get('sing-box', 'main', 'enabled') == '1';
+}
+
+function stop_legacy_sing_box() {
+	let uci = cursor();
+	uci.load('sing-box');
+	uci.set('sing-box', 'main', 'enabled', '0');
+	uci.commit('sing-box');
+	system(['/etc/init.d/sing-box', 'stop']);
+}
+
 function rollback(backups) {
 	let ok = true;
 	for (let path, content in backups) {
@@ -2102,7 +2185,13 @@ function rollback(backups) {
 	}
 	if (system(['/etc/init.d/dnsmasq', 'restart']) != 0) ok = false;
 	if (system(['/etc/init.d/zarap', 'restart']) != 0) ok = false;
-	if (system(['/etc/init.d/xray', 'restart']) != 0) ok = false;
+	if (backups['/etc/config/sing-box'] != null && legacy_zarap_sing_box()) {
+		system(['/etc/init.d/xray', 'stop']);
+		if (system(['/etc/init.d/sing-box', 'restart']) != 0) ok = false;
+	}
+	else if (system(['/etc/init.d/xray', 'restart']) != 0) {
+		ok = false;
+	}
 	return ok;
 }
 
@@ -2128,8 +2217,13 @@ function restore_update_files(backups, restart_proxy) {
 
 function resource_conflict() {
 	let listeners = capture('/usr/sbin/ss -H -lntup sport = :7893').output;
-	if (listeners && (!length(saved_outbounds()) || index(lc(listeners), 'xray') < 0))
-		return result_error('Порт 7893 уже занят другим процессом');
+	if (listeners) {
+		let lower = lc(listeners);
+		let own_xray = length(saved_outbounds()) > 0 && index(lower, 'xray') >= 0;
+		let own_legacy = index(lower, 'sing-box') >= 0 && legacy_zarap_sing_box();
+		if (!own_xray && !own_legacy)
+			return result_error('Порт 7893 уже занят другим процессом');
+	}
 
 	let routes = capture('/sbin/ip -4 route show table 2022').output;
 	for (let line in split(routes, '\n'))
@@ -2279,9 +2373,12 @@ function apply_configuration(args) {
 		return uci_candidate;
 	}
 
+	let had_legacy = legacy_zarap_sing_box();
 	let backups = {};
 	for (let path in ['/etc/config/zarap', '/etc/config/dhcp', '/etc/config/xray', CONFIG, NFT_CONFIG])
 		backups[path] = readfile(path);
+	if (had_legacy)
+		backups['/etc/config/sing-box'] = readfile('/etc/config/sing-box');
 	if (backups[CONFIG] != null) {
 		writefile(CONFIG + '.bak', backups[CONFIG]);
 		chmod(CONFIG + '.bak', 0600);
@@ -2305,10 +2402,6 @@ function apply_configuration(args) {
 	}
 	chmod(CONFIG, 0600);
 	unlink(NFT_CHECK);
-	// Лишние .dat-файлы от удалённых или неиспользуемых наборов убираются, чтобы
-	// не занимать место на flash.
-	cleanup_stale_assets(plan.assets);
-	clear_assets_backup();
 
 	if (system(['/etc/init.d/firewall', 'reload']) != 0) {
 		let restored = rollback(backups);
@@ -2327,6 +2420,11 @@ function apply_configuration(args) {
 			'Критическая ошибка синхронизации правил и rollback; kill switch оставлен активным',
 			synced.output, 'startup_error');
 	}
+
+	// При переходе со старой версии Zarap (на sing-box) освобождаем порт 7893
+	// перед запуском xray; при отказе rollback() вернёт прежний sing-box обратно.
+	if (had_legacy)
+		stop_legacy_sing_box();
 
 	let service_code;
 	if (enabled) {
@@ -2354,6 +2452,11 @@ function apply_configuration(args) {
 			'Критическая ошибка проверки и rollback; kill switch оставлен активным',
 			hint ? (hint + '\n' + details) : details, 'startup_error');
 	}
+
+	// Лишние .dat-файлы от удалённых или заменённых наборов убираются только
+	// после успешного check_runtime(), чтобы rollback() всегда находил прежние файлы.
+	cleanup_stale_assets(plan.assets);
+	clear_assets_backup();
 
 	return { ok: true, enabled: enabled, clients: request.clients, health: health };
 }

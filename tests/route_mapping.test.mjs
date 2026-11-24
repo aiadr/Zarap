@@ -38,9 +38,13 @@ describe('route_mapping', { skip: !ucode && 'no ucode interpreter available' }, 
 		'valid_outbound_tag', 'valid_ipv4', 'is_domain', 'result_error',
 		'input_error', 'parse_resolver', 'xray_dns_server', 'parse_bootstrap',
 		'parse_tunnel_dns', 'outbound_json', 'dns_routes', 'xray_domains',
-		'url_hostname', 'geodata_cron', 'ruleset_plan', 'rule_jsons',
-		'xray_config'
+		'url_hostname', 'geodata_cron', 'asset_filename', 'ruleset_plan',
+		'rule_jsons', 'xray_config'
 	])}`;
+
+	function assetFile(url) {
+		return runUcodeJson(ucode, `${prelude}\nprintf('%J', asset_filename(${JSON.stringify(url)}));\n`);
+	}
 
 	function generate(outbounds, rules, final, {
 		addresses = ADDRESSES,
@@ -242,7 +246,12 @@ describe('route_mapping', { skip: !ucode && 'no ucode interpreter available' }, 
 		assert.equal('source' in emitted, false);
 	});
 
-	test('rulesets deduplicate .dat by URL and emit geodata block', () => {
+	test('rulesets key .dat by URL hash, deduplicate by URL, and exclude non-auto-updated files from geodata', () => {
+		const geositeFile = assetFile('https://example.org/geosite.dat');
+		const geoipFile = assetFile('https://example.org/geoip.dat');
+		assert.match(geositeFile, /^dat_[0-9a-f]{16}\.dat$/);
+		assert.notEqual(geositeFile, geoipFile);
+
 		const rulesets = [
 			{ tag: 'rs_1', label: 'YouTube', url: 'https://example.org/geosite.dat', kind: 'geosite', category: 'youtube', update_interval: '1d' },
 			{ tag: 'rs_2', label: 'OpenAI', url: 'https://example.org/geosite.dat', kind: 'geosite', category: 'openai', update_interval: '12h' },
@@ -251,30 +260,42 @@ describe('route_mapping', { skip: !ucode && 'no ucode interpreter available' }, 
 		const config = generate([OUT_1], [{ rule_sets: ['rs_1', 'rs_2', 'rs_3'], target: 'out_1' }], 'direct', {
 			rulesets, rulesetDetour: 'out_1'
 		});
+		// rs_3 has update_interval: '' so geoip.dat is NOT auto-updated in geodata.assets
 		assert.deepEqual(config.geodata, {
 			assets: [
-				{ url: 'https://example.org/geosite.dat', file: 'rs_1.dat' },
-				{ url: 'https://example.org/geoip.dat', file: 'rs_3.dat' }
+				{ url: 'https://example.org/geosite.dat', file: geositeFile }
 			],
 			cron: '0 */12 * * *',
 			outbound: 'out_1'
 		});
 		const group = tproxyRules(config).slice(0, -1);
 		assert.equal(group.length, 2);
-		assert.deepEqual(group[0].domain, ['ext:rs_1.dat:youtube', 'ext:rs_1.dat:openai']);
-		assert.deepEqual(group[1].ip, ['ext:rs_3.dat:telegram']);
+		assert.deepEqual(group[0].domain, [`ext:${geositeFile}:youtube`, `ext:${geositeFile}:openai`]);
+		assert.deepEqual(group[1].ip, [`ext:${geoipFile}:telegram`]);
 	});
 
-	test('skip_assets omits not-yet-downloaded ext: references during dry-run validation', () => {
+	test('reusing tag rs_1 with a new URL produces a distinct .dat filename', () => {
+		const first = generate([OUT_1], [{ rule_sets: ['rs_1'], target: 'out_1' }], 'direct', {
+			rulesets: [{ tag: 'rs_1', url: 'https://a.example/geosite.dat', kind: 'geosite', category: 'youtube', update_interval: '1d' }]
+		});
+		const second = generate([OUT_1], [{ rule_sets: ['rs_1'], target: 'out_1' }], 'direct', {
+			rulesets: [{ tag: 'rs_1', url: 'https://b.example/geosite.dat', kind: 'geosite', category: 'youtube', update_interval: '1d' }]
+		});
+		assert.notEqual(first.geodata.assets[0].file, second.geodata.assets[0].file);
+	});
+
+	test('skip_assets omits not-yet-downloaded ext: references and geodata entries during dry-run validation', () => {
+		const geositeFile = assetFile('https://example.org/geosite.dat');
 		const rulesets = [
 			{ tag: 'rs_1', url: 'https://example.org/geosite.dat', kind: 'geosite', category: 'youtube', update_interval: '1d' }
 		];
 		const config = generate([OUT_1], [{ domains: ['example.com'], rule_sets: ['rs_1'], target: 'out_1' }], 'direct', {
-			rulesets, resolveAll: true, bootstrap: 'https://1.1.1.1/dns-query', skipAssets: { 'rs_1.dat': true }
+			rulesets, resolveAll: true, bootstrap: 'https://1.1.1.1/dns-query', skipAssets: { [geositeFile]: true }
 		});
 		assert.deepEqual(tproxyRules(config)[0].domain, ['domain:example.com']);
 		const tunnelDns = config.dns.servers.find((s) => s.tag === 'dns_out_1');
 		assert.deepEqual(tunnelDns.domains, ['domain:example.com']);
+		assert.equal('geodata' in config, false);
 	});
 
 	test('an unused rule set emits no geodata block', () => {
@@ -321,13 +342,26 @@ describe('route_mapping', { skip: !ucode && 'no ucode interpreter available' }, 
 			{ type: 'field', inboundTag: ['dns_out_1'], outboundTag: 'out_1' },
 			{ type: 'field', inboundTag: ['dns_out_2'], outboundTag: 'out_2' }
 		]);
+		// dns-out routes non-IP queries through tunnel via dialerProxy (zero ISP leak)
 		assert.deepEqual(config.outbounds.find((o) => o.tag === 'dns-out'), {
-			tag: 'dns-out', protocol: 'dns', settings: { nonIPQuery: 'drop' }
+			tag: 'dns-out',
+			protocol: 'dns',
+			settings: {
+				rewriteNetwork: 'tcp',
+				rewriteAddress: '1.1.1.1',
+				rewritePort: 53,
+				rules: [
+					{ action: 'hijack', qType: '1,28' },
+					{ action: 'direct' }
+				]
+			},
+			streamSettings: { sockopt: { dialerProxy: 'out_1' } }
 		});
 	});
 
-	test('resolve_all marks every tunnel DNS strict and puts bootstrap fallback last', () => {
-		const rulesets = [{ tag: 'rs_1', url: 'https://e.org/geosite.dat', kind: 'geosite', category: 'youtube', update_interval: '' }];
+	test('resolve_all marks every tunnel DNS strict, forwards non-IP direct queries, and blocks non-IP leaks for tunnel domains', () => {
+		const geositeFile = assetFile('https://e.org/geosite.dat');
+		const rulesets = [{ tag: 'rs_1', url: 'https://e.org/geosite.dat', kind: 'geosite', category: 'youtube', update_interval: '1d' }];
 		const rules = [{ domains: ['example.com'], rule_sets: ['rs_1'], target: 'out_1' }];
 
 		const off = generate([OUT_1], rules, 'direct', { rulesets });
@@ -346,7 +380,7 @@ describe('route_mapping', { skip: !ucode && 'no ucode interpreter available' }, 
 			{
 				address: 'https://1.1.1.1/dns-query',
 				tag: 'dns_out_1',
-				domains: ['domain:example.com', 'ext:rs_1.dat:youtube'],
+				domains: ['domain:example.com', `ext:${geositeFile}:youtube`],
 				skipFallback: true,
 				finalQuery: true
 			},
@@ -354,6 +388,20 @@ describe('route_mapping', { skip: !ucode && 'no ucode interpreter available' }, 
 				address: 'https+local://77.88.8.8/dns-query'
 			}
 		]);
+		assert.deepEqual(on.outbounds.find((o) => o.tag === 'dns-out'), {
+			tag: 'dns-out',
+			protocol: 'dns',
+			settings: {
+				rewriteNetwork: 'udp',
+				rewriteAddress: '77.88.8.8',
+				rewritePort: 53,
+				rules: [
+					{ action: 'hijack', qType: '1,28' },
+					{ action: 'return', domain: ['domain:example.com', `ext:${geositeFile}:youtube`], rCode: 0 },
+					{ action: 'direct' }
+				]
+			}
+		});
 	});
 
 	test('udp bootstrap adds direct routing rule and freedom outbound', () => {

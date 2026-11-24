@@ -32,9 +32,9 @@ describe('package_contract', () => {
 			assert.ok(BACKEND.includes(path), path);
 	});
 
-	test('install parks only the default xray', () => {
-		assert.ok(UCI_DEFAULTS.includes("uci -q set xray.enabled.enabled='0'"));
-		assert.ok(UCI_DEFAULTS.includes('/etc/xray'));
+	test('install does not stop a user-enabled xray service', () => {
+		assert.equal(UCI_DEFAULTS.includes("uci -q set xray.enabled.enabled='0'"), false);
+		assert.equal(UCI_DEFAULTS.includes('/etc/init.d/xray stop'), false);
 		assert.ok(UCI_DEFAULTS.includes('/etc/zarap/assets'));
 		assert.equal(UCI_DEFAULTS.includes('xray disable'), false);
 		assert.ok(BACKEND.includes("uci.set('xray', 'enabled', 'enabled', enabled ? '1' : '0')"));
@@ -137,21 +137,27 @@ describe('package_contract', () => {
 		assert.ok(acl.write.ubus.zarap.includes('refresh_rulesets'));
 	});
 
-	test('forced refresh can put the previous assets back', () => {
+	test('forced refresh can put the previous assets back and stale cleanup waits for check_runtime', () => {
 		assert.ok(BACKEND.includes("const ASSETS_DIR = '/etc/zarap/assets'"));
 		assert.ok(BACKEND.includes("const ASSETS_BACKUP_DIR = '/etc/zarap/.assets.bak'"));
-		const body = BACKEND.split('function refresh_rulesets(')[1].split('\nfunction ')[0];
-		assert.ok(body.includes('backup_assets()'));
-		assert.ok(body.includes('restore_assets(backed.files)'));
-		assert.ok(body.includes('xray_test(CONFIG)'));
-		assert.ok(body.includes('check_runtime(true, LISTENER_WAIT)'));
-		assert.ok(body.includes('startup_hint(rulesets)'));
-		assert.ok(body.includes('if (!enabled) {'));
-		assert.ok(BACKEND.includes('cleanup_stale_assets(plan.assets);'));
+		const refreshBody = BACKEND.split('function refresh_rulesets(')[1].split('\nfunction ')[0];
+		assert.ok(refreshBody.includes('backup_assets()'));
+		assert.ok(refreshBody.includes('restore_assets(backed.files)'));
+		assert.ok(refreshBody.includes('xray_test(CONFIG)'));
+		assert.ok(refreshBody.includes('check_runtime(true, LISTENER_WAIT)'));
+		assert.ok(refreshBody.includes('startup_hint(rulesets)'));
+		assert.ok(refreshBody.includes('if (!enabled) {'));
+
+		const applyBody = BACKEND.split('function apply_configuration(')[1].split('\nfunction ')[0];
+		const checkPos = applyBody.indexOf('check_runtime(enabled, LISTENER_WAIT)');
+		const cleanupPos = applyBody.indexOf('cleanup_stale_assets(plan.assets)');
+		assert.ok(checkPos > 0 && cleanupPos > checkPos, 'stale .dat cleanup must happen after check_runtime');
+		assert.ok(applyBody.includes('legacy_zarap_sing_box()'));
+		assert.ok(applyBody.includes('stop_legacy_sing_box()'));
 	});
 
-	test('atomic temporary files share target directories', () => {
-		assert.ok(BACKEND.includes("const CONFIG_TMP = '/etc/zarap/.xray.json.tmp'"));
+	test('atomic temporary files share target directories and xray temp keeps .json extension', () => {
+		assert.ok(BACKEND.includes("const CONFIG_TMP = '/etc/zarap/.xray.tmp.json'"));
 		assert.ok(BACKEND.includes("const NFT_TMP = '/etc/nftables.d/.90-zarap.nft.tmp'"));
 		assert.ok(BACKEND.includes("const UCI_CANDIDATE = '/etc/config/.zarap-candidate'"));
 		assert.ok(BACKEND.includes('cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA)'));

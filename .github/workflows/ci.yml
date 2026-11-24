@@ -85,11 +85,21 @@ jobs:
       - name: Check nftables syntax
         run: sudo nft -c -f tests/nftables.conf
 
-      # Needs the interpreter built above, so it runs after the syntax check
+      - name: Install Xray-core 26.11.9 for config validation
+        run: |
+          mkdir -p /tmp/xray
+          curl -fsSL -o /tmp/xray/Xray-linux-64.zip \
+            https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip
+          unzip -o /tmp/xray/Xray-linux-64.zip xray -d /tmp/xray
+          chmod +x /tmp/xray/xray
+          /tmp/xray/xray version
+
+      # Needs the interpreter and xray binary above, so it runs after the syntax check
       # rather than with the other contract tests.
-      - name: Check what needs a ucode interpreter
+      - name: Check what needs ucode and xray
         env:
           UCODE_BIN: /tmp/ucode/build/ucode
+          XRAY_BIN: /tmp/xray/xray
         run: node --test tests/*.test.mjs
 
   package:
