@@ -28,7 +28,8 @@ async function openMaintenance(page) {
 // все позиции за собой, и тест ломается там, где ничего не менялось. Порядок
 // один в один повторяет объявление rpc в overview.js.
 const APPLY_ARGS = ['enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour',
-                    'bootstrap_dns', 'resolve_all', 'tunnel_dns', 'clients', 'final'];
+                    'ruleset_interval', 'bootstrap_dns', 'resolve_all', 'tunnel_dns',
+                    'clients', 'final'];
 
 function applyArgs(call) {
   return Object.fromEntries(APPLY_ARGS.map((name, index) => [name, call.args[index]]));
@@ -38,7 +39,7 @@ test('renders status and enforces private MAC restriction', async ({ page }) => 
   await openZarap(page);
 
   await expect(page.getByRole('heading', { name: 'Zarap' })).toBeVisible();
-  await expect(page.getByText('sing-box работает')).toBeVisible();
+  await expect(page.getByText('xray работает')).toBeVisible();
   await expect(page.getByText('TProxy слушает')).toBeVisible();
   await expect(page.getByText('kill switch активен')).toBeVisible();
   await expect(page.getByText('маршрутизация активна')).toBeVisible();
@@ -225,7 +226,7 @@ test('copies the scrubbed log to the clipboard', async ({ page, context }) => {
   await expect(page.getByText('Журнал скопирован в буфер обмена')).toBeVisible();
 
   const clipboard = await page.evaluate(() => navigator.clipboard.readText());
-  expect(clipboard).toContain('sing-box запущен');
+  expect(clipboard).toContain('xray запущен');
   expect(clipboard).toContain('[скрыто]');
 });
 
@@ -291,10 +292,12 @@ test('shows conditions by destination and hands them back untouched', async ({ p
   await page.addInitScript(() => {
     window.__statusOverride = {
       rulesets: [
-        { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
-          update_interval: '1d', in_use: true }
+        { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/geosite.dat',
+          kind: 'geosite', category: 'category-ads-all',
+          in_use: true }
       ],
       ruleset_detour: 'direct',
+      ruleset_interval: '1d',
       rules: [
         { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
           rule_sets: ['rs_1'], ip_cidr: ['149.154.160.0/20'],
@@ -323,10 +326,11 @@ test('shows conditions by destination and hands them back untouched', async ({ p
   const calls = await page.evaluate(() => window.__rpcCalls);
   const sent = applyArgs(calls.find(call => call.method === 'apply'));
   expect(sent.rulesets).toEqual([
-    { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
-      update_interval: '1d' }
+    { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/geosite.dat',
+      kind: 'geosite', category: 'category-ads-all' }
   ]);
   expect(sent.ruleset_detour).toEqual('direct');
+  expect(sent.ruleset_interval).toEqual('1d');
   expect(sent.rules).toEqual([
     { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
       rule_sets: ['rs_1'], ip_cidr: ['149.154.160.0/20'],
@@ -395,16 +399,19 @@ test('refuses a domain that is not one, in the words the router would use', asyn
 test('adds a rule set and points a rule at it', async ({ page }) => {
   await openZarap(page);
 
-  await page.locator('#zarap-ruleset-url').fill('https://example.org/geosite-ru.srs');
+  await page.locator('#zarap-ruleset-url').fill('https://example.org/geosite.dat');
+  await page.locator('#zarap-ruleset-kind').selectOption('geosite');
+  await page.locator('#zarap-ruleset-category').fill('ru-blocked');
   await page.locator('#zarap-ruleset-label').fill('Заблокированное');
   await page.locator('#zarap-add-ruleset').click();
 
   const added = page.locator('tr[data-ruleset="rs_2"]');
   await expect(added).toContainText('Заблокированное');
-  // Подключение выбирается один раз на все списки, а не в строке списка: в
-  // фикстуре оно уже выбрано, и добавленный список едет через него же.
+  await expect(added).toContainText('geosite:ru-blocked');
+  // Подключение и расписание выбираются один раз на все списки, а не в строке списка.
   await expect(added).not.toContainText('Нидерланды');
   await expect(page.locator('#zarap-ruleset-detour')).toHaveValue('out_1');
+  await expect(page.locator('#zarap-ruleset-interval')).toHaveValue('1d');
 
   // Ничего не ушло на роутер: список уезжает вместе с применением.
   let calls = await page.evaluate(() => window.__rpcCalls);
@@ -422,31 +429,36 @@ test('adds a rule set and points a rule at it', async ({ page }) => {
   calls = await page.evaluate(() => window.__rpcCalls);
   const apply = applyArgs(calls.find(call => call.method === 'apply'));
   expect(apply.rulesets).toContainEqual({
-    tag: 'rs_2', label: 'Заблокированное', url: 'https://example.org/geosite-ru.srs',
-    update_interval: '1d'
+    tag: 'rs_2', label: 'Заблокированное', url: 'https://example.org/geosite.dat',
+    kind: 'geosite', category: 'ru-blocked'
   });
   expect(apply.ruleset_detour).toEqual('out_1');
+  expect(apply.ruleset_interval).toEqual('1d');
   expect(apply.rules[1].rule_sets).toEqual(['rs_2']);
 });
 
-test('picks the download connection once for every list', async ({ page }) => {
-  // Раньше подключение стояло у каждого списка, и десять списков означали
-  // десять раз один и тот же ответ. Теперь выбор один, и уезжает он один.
+test('picks the download connection and schedule once for every list', async ({ page }) => {
+  // Подключение и расписание автообновления у geodata в xray-core общие на все
+  // списки: в таблице списков этих колонок нет, оба выбора лежат под таблицей.
   await openZarap(page);
 
   const detour = page.locator('#zarap-ruleset-detour');
+  const interval = page.locator('#zarap-ruleset-interval');
   await expect(detour).toHaveValue('out_1');
-  // В строке списка подключения больше нет: колонки с ним не осталось.
+  await expect(interval).toHaveValue('1d');
   await expect(page.locator('#zarap-rulesets thead')).not.toContainText('Скачивать через');
+  await expect(page.locator('#zarap-rulesets thead')).not.toContainText('Обновлять');
 
   await detour.selectOption('direct');
+  await interval.selectOption('12h');
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = applyArgs(calls.find(call => call.method === 'apply'));
   expect(apply.ruleset_detour).toEqual('direct');
-  expect(apply.rulesets.every(ruleset => !('detour' in ruleset))).toBe(true);
+  expect(apply.ruleset_interval).toEqual('12h');
+  expect(apply.rulesets.every(ruleset => !('detour' in ruleset) && !('update_interval' in ruleset))).toBe(true);
 });
 
 test('names the host that would not resolve, next to the field that fixes it', async ({ page }) => {
@@ -455,8 +467,8 @@ test('names the host that would not resolve, next to the field that fixes it', a
   // об этом молчала, догадаться до причины можно было только вручную.
   await page.addInitScript(() => {
     window.__statusOverride = {
-      bootstrap_dns: 'https://1.1.1.1',
-      dns: { forwarded: 0, unresolved: 'cdn1.aidar.one', bootstrap: 'https://1.1.1.1' }
+      bootstrap_dns: 'https://1.1.1.1/dns-query',
+      dns: { forwarded: 0, unresolved: 'cdn1.aidar.one', bootstrap: 'https://1.1.1.1/dns-query' }
     };
   });
   await openZarap(page);
@@ -465,7 +477,7 @@ test('names the host that would not resolve, next to the field that fixes it', a
   await expect(note).toContainText('cdn1.aidar.one');
   // Резолвер назван вместе с именем: без него сообщение отправляет искать
   // поломку в подключении, а чинится она полем на этой же странице.
-  await expect(note).toContainText('https://1.1.1.1');
+  await expect(note).toContainText('https://1.1.1.1/dns-query');
 });
 
 test('says nothing about the resolver while names resolve', async ({ page }) => {
@@ -498,15 +510,15 @@ test('sends the resolver used inside the tunnel', async ({ page }) => {
   // утверждением о чужой сети.
   await openZarap(page);
   const field = page.locator('#zarap-tunnel-dns');
-  await expect(field).toHaveValue('https://1.1.1.1');
+  await expect(field).toHaveValue('https://1.1.1.1/dns-query');
 
-  await field.fill('tls://9.9.9.9');
+  await field.fill('tcp://9.9.9.9');
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   expect(applyArgs(calls.find(call => call.method === 'apply')).tunnel_dns)
-    .toEqual('tls://9.9.9.9');
+    .toEqual('tcp://9.9.9.9');
 });
 
 test('sends the resolver chosen for the address of the server', async ({ page }) => {
@@ -631,7 +643,7 @@ test('forces every list to be downloaded again', async ({ page }) => {
   await expect(button).toHaveText('Обновить списки сейчас');
 });
 
-test('says the lists will be fetched at the next start when Zarap is off', async ({ page }) => {
+test('says the lists will be updated without starting xray when Zarap is off', async ({ page }) => {
   await page.addInitScript(() => { window.__statusOverride = { enabled: false }; });
   await openZarap(page);
   // runtime.js пересоздаёт __mockState при загрузке, поэтому ответ мока
@@ -640,19 +652,19 @@ test('says the lists will be fetched at the next start when Zarap is off', async
 
   await expect(page.locator('#zarap-ruleset-refresh')).toContainText('Zarap выключен');
   await page.locator('#zarap-refresh-rulesets').click();
-  await expect(page.getByText('Кэш списков очищен')).toBeVisible();
+  await expect(page.getByText('Файлы списков (.dat) обновлены')).toBeVisible();
 });
 
 test('keeps the old lists when the refresh cannot reach their source', async ({ page }) => {
   // Обновление списка не должно стоить дому интернета: роутер возвращает
-  // прежний кэш, а страница обязана сказать, что нового списка нет.
+  // прежние файлы, а страница обязана сказать, что нового списка нет.
   await openZarap(page);
   await page.evaluate(() => {
-    window.__mockState.refreshError = 'Списки не обновились: без кэша sing-box не поднялся. Прежний кэш возвращён, служба работает на нём';
+    window.__mockState.refreshError = 'Списки не обновились: xray не поднялся с новыми файлами. Прежние файлы возвращены, служба работает на них';
   });
 
   await page.locator('#zarap-refresh-rulesets').click();
-  await expect(page.getByText('Прежний кэш возвращён')).toBeVisible();
+  await expect(page.getByText('Прежние файлы возвращены')).toBeVisible();
   await expect(page.getByText('Проверьте наборы правил')).toBeVisible();
   // Кнопка вернулась: попробовать ещё раз можно, ничего не перезагружая.
   await expect(page.locator('#zarap-refresh-rulesets')).toBeEnabled();
@@ -661,7 +673,8 @@ test('keeps the old lists when the refresh cannot reach their source', async ({ 
 test('refreshing goes after the lists the router has, not the ones on the page', async ({ page }) => {
   await openZarap(page);
 
-  await page.locator('#zarap-ruleset-url').fill('https://example.org/geosite-ru.srs');
+  await page.locator('#zarap-ruleset-url').fill('https://example.org/geosite.dat');
+  await page.locator('#zarap-ruleset-category').fill('ru-blocked');
   await page.locator('#zarap-add-ruleset').click();
   await expect(page.locator('[data-field="ruleset-refresh-pending"]'))
     .toContainText('обновится то, что уже применено');

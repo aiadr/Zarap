@@ -37,15 +37,17 @@ const fixtures = {
     ],
     rulesets: [
       {
-        tag: 'rs_1', label: 'Реклама', url: 'https://example.org/ads.srs',
-        update_interval: '1d', in_use: false
+        tag: 'rs_1', label: 'Реклама', url: 'https://example.org/geosite.dat',
+        kind: 'geosite', category: 'category-ads-all',
+        in_use: false
       }
     ],
     ruleset_detour: 'out_1',
     ruleset_detour_missing: false,
+    ruleset_interval: '1d',
     bootstrap_dns: 'local',
     resolve_all: false,
-    tunnel_dns: 'https://1.1.1.1',
+    tunnel_dns: 'https://1.1.1.1/dns-query',
     cache: { size: 1258291, free: 20971520 },
     dns: { forwarded: 0, unresolved: '', bootstrap: 'local' },
     final: 'direct',
@@ -88,7 +90,7 @@ const fixtures = {
   },
   components: {
 	'luci-app-zarap': { installed: '0.1.0-r1', checked: false, update_available: false, candidate: '' },
-	'sing-box': { installed: '1.12.22-r1', checked: false, update_available: false, candidate: '' }
+	'xray-core': { installed: '26.10.0-r1', checked: false, update_available: false, candidate: '' }
   },
   refreshedComponents: {
     'luci-app-zarap': {
@@ -96,10 +98,10 @@ const fixtures = {
       checked: true,
       candidate: '0.2.0-r1'
     },
-    'sing-box': {
-      installed: '1.12.22-r1', update_available: true,
+    'xray-core': {
+      installed: '26.10.0-r1', update_available: true,
       checked: true,
-      candidate: '1.12.23-r1'
+      candidate: '26.10.1-r1'
     }
   }
 };
@@ -110,7 +112,7 @@ function clone(value) {
 
 const handlers = {
   status: () => Object.assign(clone(fixtures.status), window.__statusOverride || {}),
-  logs: () => ({ ok: true, logs: 'sing-box запущен\nUUID: [скрыто]\nReality key: [скрыто]' }),
+  logs: () => ({ ok: true, logs: 'xray запущен\nUUID: [скрыто]\nReality key: [скрыто]' }),
   updates: refresh => (refresh && window.__mockState.updatesRpcStatus != null
     ? window.__mockState.updatesRpcStatus
     : refresh && window.__mockState.updatesError

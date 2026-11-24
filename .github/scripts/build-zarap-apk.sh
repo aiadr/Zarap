@@ -32,7 +32,7 @@ apk_target="${PWD}/bin/packages/${package_arch}/action/luci-app-zarap-${pkg_vers
 
 # The top-level package target adds runtime packages to the build graph. Call
 # the package sub-make's APK target instead: it builds and packages Zarap while
-# preserving its dependency metadata, without compiling sing-box or a kernel.
+# preserving its dependency metadata, without compiling xray-core or a kernel.
 make -r -C package/feeds/action/luci-app-zarap \
 	TOPDIR="${PWD}" DEVELOPER=1 "${apk_target}" V=s
 
