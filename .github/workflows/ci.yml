@@ -57,11 +57,12 @@ jobs:
       - name: Check JavaScript, JSON, shell and contracts
         run: |
           node tests/check_luci_js.mjs
-          python3 -m json.tool luci-app-zarap/root/usr/share/luci/menu.d/luci-app-zarap.json >/dev/null
-          python3 -m json.tool luci-app-zarap/root/usr/share/rpcd/acl.d/luci-app-zarap.json >/dev/null
+          node -e 'for (const f of process.argv.slice(1)) JSON.parse(require("node:fs").readFileSync(f, "utf8"));' \
+            luci-app-zarap/root/usr/share/luci/menu.d/luci-app-zarap.json \
+            luci-app-zarap/root/usr/share/rpcd/acl.d/luci-app-zarap.json
           bash -n .github/scripts/build-zarap-apk.sh
           sh -n luci-app-zarap/root/etc/init.d/zarap luci-app-zarap/root/etc/uci-defaults/90-zarap
-          python3 -m unittest discover -s tests -v
+          node --test tests/*.test.mjs
 
       - name: Build ucode syntax checker
         run: |
@@ -85,14 +86,11 @@ jobs:
         run: sudo nft -c -f tests/nftables.conf
 
       # Needs the interpreter built above, so it runs after the syntax check
-      # rather than with the other contract tests. Discovery rather than a list
-      # of files: the list silently stopped covering whatever was added after
-      # it, and a test that needs the interpreter skips itself without one, so
-      # the miss was invisible.
+      # rather than with the other contract tests.
       - name: Check what needs a ucode interpreter
         env:
           UCODE_BIN: /tmp/ucode/build/ucode
-        run: python3 -m unittest discover -s tests -v
+        run: node --test tests/*.test.mjs
 
   package:
     runs-on: ubuntu-latest
