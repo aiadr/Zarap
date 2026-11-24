@@ -98,7 +98,7 @@ const state = {
 	rules: [],
 	rulesets: [],
 	// Списки, которые уже лежат на роутере. Обновление идёт за ними, а не за
-	// тем, что набрано на странице: sing-box качает то, что ему применили.
+	// тем, что набрано на странице: xray-core использует то, что ему применили.
 	appliedRulesets: [],
 	// Через что скачивать списки — один выбор на все списки сразу: их источники
 	// заблокированы там же, где и всё остальное, так что ответ у них общий.
@@ -110,7 +110,7 @@ const state = {
 	// выключено по умолчанию: существующая установка ничего не замечает.
 	resolveAll: false,
 	// Чем резолвятся имена, уезжающие в подключение.
-	tunnelDns: 'https://1.1.1.1',
+	tunnelDns: 'https://1.1.1.1/dns-query',
 	cache: { size: 0, free: 0 },
 	// Сколько имён резолвится через прокси; считается роутером из применённых
 	// правил, поэтому это состояние роутера, а не страницы.
@@ -153,6 +153,8 @@ function loadState(status) {
 			tag: ruleset.tag,
 			label: ruleset.label || '',
 			url: ruleset.url || '',
+			kind: ruleset.kind || 'geosite',
+			category: ruleset.category || '',
 			update_interval: ruleset.update_interval || ''
 		};
 	});
@@ -162,7 +164,7 @@ function loadState(status) {
 	state.rulesetDetour = status.ruleset_detour || 'direct';
 	state.bootstrapDns = status.bootstrap_dns || 'local';
 	state.resolveAll = !!status.resolve_all;
-	state.tunnelDns = status.tunnel_dns || 'https://1.1.1.1';
+	state.tunnelDns = status.tunnel_dns || 'https://1.1.1.1/dns-query';
 	state.cache = status.cache || { size: 0, free: 0 };
 	state.dns = status.dns || { forwarded: 0 };
 	state.final = status.final || 'direct';
@@ -767,7 +769,7 @@ function destinationSummary(rule) {
 	return parts.length ? parts.join(' · ') : _('любой адрес');
 }
 
-// Тег вроде rs_1 в журнале sing-box узнаваем, а в таблице правил — нет.
+// Тег вроде rs_1 в конфиге xray узнаваем, а в таблице правил — нет.
 function rulesetLabel(tag) {
 	const known = state.rulesets.filter(function(ruleset) {
 		return ruleset.tag === tag;
@@ -889,8 +891,9 @@ function destinationPicker(rule, owner, onDone) {
 			else
 				delete chosen[ruleset.tag];
 		});
+		const meta = (ruleset.kind || 'geosite') + ':' + (ruleset.category || '');
 		return E('div', {}, [ E('label', {}, [ box, ' ',
-			ruleset.label || ruleset.tag, E('small', {}, ' ' + ruleset.url) ]) ]);
+			ruleset.label || ruleset.tag, E('small', {}, ' [' + meta + '] ' + ruleset.url) ]) ]);
 	});
 
 	const error = E('div', { 'class': 'error', 'style': 'display:none' });
@@ -999,8 +1002,10 @@ function ruleRow(rule, index, owner) {
 
 function rulesetRow(ruleset, owner) {
 	const used = rulesetReferrers(ruleset.tag);
+	const spec = (ruleset.kind || 'geosite') + ':' + (ruleset.category || '');
 	return E('tr', { 'class': 'tr', 'data-ruleset': ruleset.tag }, [
 		E('td', { 'class': 'td' }, ruleset.label || ruleset.tag),
+		E('td', { 'class': 'td' }, E('code', {}, spec)),
 		E('td', { 'class': 'td' }, E('code', { 'style': 'word-break:break-all' }, ruleset.url)),
 		E('td', { 'class': 'td' }, ruleset.update_interval || _('не обновлять')),
 		E('td', { 'class': 'td' }, used.length
@@ -1031,12 +1036,12 @@ function renderRulesets(owner) {
 	const context = renderRulesets.owner;
 	return state.rulesets.length
 		? state.rulesets.map(function(ruleset) { return rulesetRow(ruleset, context); })
-		: E('tr', {}, E('td', { 'colspan': 5 }, _('Списков пока нет')));
+		: E('tr', {}, E('td', { 'colspan': 6 }, _('Списков пока нет')));
 }
 
 // Одна строка на все списки: подключение выбирается здесь, а не в каждом
-// списке. Скачивает sing-box, и повторять один и тот же ответ построчно —
-// работа, которую страница не должна просить.
+// списке. Скачивает и обновляет xray-core (и curl при первичном запуске),
+// и повторять один и тот же ответ построчно — лишняя работа.
 function rulesetDetourRow() {
 	// Подключение могли удалить, а выбор остался на него ссылаться: тогда ни
 	// один список не обновится, и молчать об этом нельзя. Оставшийся выбор
@@ -1069,8 +1074,8 @@ function rulesetDetourRow() {
 	]);
 }
 
-// Строка про место. Размер отдельного списка сказать нечем — файл принадлежит
-// sing-box, — поэтому здесь размер кэша целиком и остаток на разделе.
+// Строка про место: суммарный размер .dat-файлов в /etc/zarap/assets и остаток
+// на разделе /overlay.
 function renderCache() {
 	const cache = state.cache || { size: 0, free: 0 };
 	const tight = cache.free && cache.free < CACHE_WARNING;
@@ -1078,27 +1083,26 @@ function renderCache() {
 		E('span', {}, _('Кэш списков: %s, свободно на /overlay: %s')
 			.format(formatBytes(cache.size), formatBytes(cache.free))),
 		tight ? E('div', { 'class': 'error', 'data-field': 'cache-warning' },
-			_('Места мало: список может не поместиться, а sing-box качает их сам при каждом запуске без кэша.')) : ''
+			_('Места мало: .dat-файлы списков могут не поместиться на /overlay.')) : ''
 	]);
 }
 
-// «Обновить сейчас». Обычно списки обновляет sing-box сам, по интервалу, и
-// кнопка нужна там, где ждать интервал нечего: список поправили на источнике,
-// или он не скачался, пока роутер был без интернета. Обновляются все списки
-// сразу — кэш у sing-box общий, и вынуть из него один набор нечем.
+// «Обновить сейчас». По расписанию .dat-файлы обновляет xray-core через блок
+// geodata с горячей перезагрузкой; кнопка принудительно перекачивает их прямо
+// сейчас с откатом на прежние файлы при ошибке.
 function rulesetRefreshRow(owner) {
 	if (owner)
 		rulesetRefreshRow.owner = owner;
 	const context = rulesetRefreshRow.owner;
 	// Роутер обновит то, что ему применили, поэтому и кнопка смотрит на
-	// применённое: набранный, но не сохранённый список sing-box ещё не видел.
+	// применённое: набранный, но не сохранённый список xray ещё не видел.
 	const applied = state.appliedRulesets.length;
 	const pending = JSON.stringify(state.rulesets) !== JSON.stringify(state.appliedRulesets);
 	const note = !applied
 		? _('Списки появятся здесь после применения.')
 		: state.enabled
-		? _('Кэш очищается, sing-box перезапускается и скачивает все списки заново: связь прервётся на несколько секунд. Не скачался — прежний кэш вернётся на место.')
-		: _('Zarap выключен: кэш очистится, а списки скачаются при следующем запуске.');
+		? _('Файлы .dat скачиваются заново и проверяются перед перезапуском xray. При ошибке прежние файлы возвращаются на место.')
+		: _('Zarap выключен: файлы .dat скачаются заново и сохранятся на роутере без запуска xray.');
 	return E('span', {}, [
 		E('button', {
 			'id': 'zarap-refresh-rulesets',
@@ -1113,8 +1117,8 @@ function rulesetRefreshRow(owner) {
 				if (result && result.ok)
 					state.cache = result.cache || state.cache;
 				notify(result, result && result.restarted
-					? _('Списки скачаны заново: кэш очищен, sing-box перезапущен')
-					: _('Кэш списков очищен: sing-box скачает их заново при следующем запуске'));
+					? _('Списки скачаны заново и применены в xray')
+					: _('Файлы списков (.dat) обновлены на роутере'));
 				// Перерисовка возвращает кнопку в исходное состояние и заодно
 				// показывает новый размер кэша.
 				refresh();
@@ -1302,7 +1306,7 @@ function tabPane(id, sections) {
 }
 
 function updateRow(name, data, owner, runtimeStatus) {
-	const title = name === 'luci-app-zarap' ? 'Zarap' : 'sing-box';
+	const title = name === 'luci-app-zarap' ? 'Zarap' : 'xray-core';
 	const installed = data.installed || _('не установлен');
 	const action = (!data.installed || (data.checked && data.update_available))
 		? E('button', {
@@ -1333,7 +1337,7 @@ function updateRow(name, data, owner, runtimeStatus) {
 		E('td', { 'class': 'td' }, title),
 		E('td', { 'class': 'td' }, [
 			installed,
-			name === 'sing-box' ? E('div', {}, statusPill(runtimeStatus && runtimeStatus.running,
+			name === 'xray-core' ? E('div', {}, statusPill(runtimeStatus && runtimeStatus.running,
 				_('процесс работает'), _('процесс остановлен'))) : ''
 		]),
 		E('td', { 'class': 'td' }, data.candidate || '—'),
@@ -1365,7 +1369,7 @@ return view.extend({
 					E('h3', {}, _('Состояние')),
 					E('p', { 'class': status.state && status.state.endsWith('_error') ? 'error' : '' }, status.message || _('Состояние неизвестно')),
 					E('p', {}, [
-						statusPill(status.running, _('sing-box работает'), _('sing-box остановлен')),
+						statusPill(status.running, _('xray работает'), _('xray остановлен')),
 						statusPill(status.listener, _('TProxy слушает'), _('нет TProxy-порта')),
 						statusPill(status.firewall, _('kill switch активен'), _('нет правил firewall')),
 						statusPill(status.routing, _('маршрутизация активна'), _('нет policy routing'))
@@ -1459,7 +1463,7 @@ return view.extend({
 							}),
 							E('div', { 'id': 'zarap-bootstrap-note' }, bootstrapNote()),
 							E('div', { 'class': 'cbi-value-description' },
-								_('Нужен, когда в ссылке подключения указан домен, а не адрес: имя сервера надо разрешить прежде, чем до него дозвониться, и через сам туннель это сделать нельзя. По умолчанию local — резолвер самого роутера, тот же, которым пользуются устройства сети. Остальные формы шифруют запрос и прячут имя сервера от провайдера, но требуют, чтобы указанный адрес был доступен: https:// (DoH), tls:// (DoT), udp:// и tcp:// — открытый запрос. Адрес только IPv4: sing-box не стартует с резолвером, заданным именем. Если шифрованный резолвер отвечает ошибкой сертификата (нет IP SAN), имя для проверки дописывается через решётку, как в systemd-resolved: tls://77.88.8.8#common.dot.dns.yandex.net.'))
+								_('Нужен, когда в ссылке подключения указан домен, а не адрес: имя сервера надо разрешить прежде, чем до него дозвониться, и через сам туннель это сделать нельзя. По умолчанию local — резолвер самого роутера, тот же, которым пользуются устройства сети. Остальные формы: https:// (DoH, например https://1.1.1.1/dns-query), tcp:// и udp:// — открытый запрос. Адрес только IPv4: резолвер, заданный именем, создаёт петлю. DoT (tls://) встроенный DNS xray-core не поддерживает.'))
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
@@ -1467,12 +1471,12 @@ return view.extend({
 						E('div', { 'class': 'cbi-value-field' }, [
 							E('input', {
 								'id': 'zarap-tunnel-dns', 'class': 'cbi-input-text',
-								'style': 'width:100%', 'placeholder': 'https://1.1.1.1',
+								'style': 'width:100%', 'placeholder': 'https://1.1.1.1/dns-query',
 								'value': state.tunnelDns,
 								'change': function(ev) { state.tunnelDns = ev.target.value.trim(); }
 							}),
 							E('div', { 'class': 'cbi-value-description' },
-								_('Чем резолвятся имена, которые правило отправляет в подключение. Запрос уходит внутри туннеля, поэтому провайдер и соседние роутеры его не видят, а ответ приходит с того выхода, куда пойдёт трафик. Формы те же, что у резолвера адреса сервера, кроме local: он читает /etc/resolv.conf роутера, а спрашивают отсюда через туннель. По умолчанию https://1.1.1.1.'))
+								_('Чем резолвятся имена, которые правило отправляет в подключение. Запрос уходит внутри туннеля, поэтому провайдер и соседние роутеры его не видят, а ответ приходит с того выхода, куда пойдёт трафик. Поддерживаются https:// (DoH), tcp:// и udp:// по IPv4, кроме local. По умолчанию https://1.1.1.1/dns-query.'))
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
@@ -1481,7 +1485,7 @@ return view.extend({
 							E('input', { 'id': 'zarap-resolve-all', 'type': 'checkbox',
 								'checked': state.resolveAll ? '' : null }),
 							E('div', { 'class': 'cbi-value-description' },
-								_('Zarap забирает у dnsmasq весь DNS сети: домены из правил и списков резолвятся через подключение, а всё остальное — напрямую, тем резолвером, что указан выше. Нужно там, где имена подменяет кто-то ещё: соседний роутер с FakeIP или провайдер. Без этого списки .srs остаются без DNS вовсе — тысячи имён в dnsmasq не перечислить. Цена: пока Zarap выключен или sing-box не поднялся, внешних имён в сети нет. Прежние настройки dnsmasq запоминаются и возвращаются при выключении Zarap и при удалении пакета. Резолвер выше при этом не может быть local — получилась бы петля.'))
+								_('Zarap забирает у dnsmasq весь DNS сети: домены из правил и geosite-списков резолвятся через подключение, а всё остальное — напрямую, тем резолвером, что указан выше. Нужно там, где имена подменяет кто-то ещё: соседний роутер с FakeIP или провайдер. Без этого списки .dat остаются без DNS вовсе — тысячи имён в dnsmasq не перечислить. Цена: пока Zarap выключен или xray не поднялся, внешних имён в сети нет. Прежние настройки dnsmasq запоминаются и возвращаются при выключении Zarap и при удалении пакета. Резолвер выше при этом не может быть local — получилась бы петля.'))
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
@@ -1525,10 +1529,11 @@ return view.extend({
 
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('Списки правил')),
-					E('p', {}, _('Готовые наборы доменов и подсетей в формате .srs. Скачивает и обновляет их сам sing-box через выбранное подключение — одно на все списки: их источники заблокированы там же, где и всё остальное. У Zarap своей копии нет, и проверить адрес заранее он не может: недоступный список выяснится на запуске и откатит применение.')),
+					E('p', {}, _('Готовые наборы доменов (geosite) и IP-подсетей (geoip) в формате .dat (V2Ray/Xray). По расписанию файлы обновляет сам xray-core (geodata) с горячей перезагрузкой без разрыва соединений; при первом применении недостающие .dat скачиваются заранее через выбранное подключение. Одинаковый URL файла с разными категориями скачивается один раз.')),
 					E('table', { 'class': 'table', 'id': 'zarap-rulesets' }, [
 						E('thead', {}, E('tr', { 'class': 'tr table-titles' }, [
 							E('th', { 'class': 'th' }, _('Название')),
+							E('th', { 'class': 'th' }, _('Категория')),
 							E('th', { 'class': 'th' }, _('Адрес')),
 							E('th', { 'class': 'th' }, _('Обновлять')),
 							E('th', { 'class': 'th' }, _('Состояние')),
@@ -1544,9 +1549,12 @@ return view.extend({
 						E('div', { 'class': 'cbi-value-field' }, [
 							E('input', {
 								'id': 'zarap-ruleset-url', 'class': 'cbi-input-text',
-								'style': 'width:100%', 'placeholder': 'https://example.org/geosite-ads.srs'
+								'style': 'width:100%', 'placeholder': 'https://example.org/geosite.dat'
 							}),
 							E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:.5em;margin-top:.5em' }, [
+								E('select', { 'id': 'zarap-ruleset-kind', 'class': 'cbi-input-select' }),
+								E('input', { 'id': 'zarap-ruleset-category', 'class': 'cbi-input-text',
+									'placeholder': _('Категория (напр. youtube)') }),
 								E('input', { 'id': 'zarap-ruleset-label', 'class': 'cbi-input-text',
 									'placeholder': _('Название') }),
 								E('select', { 'id': 'zarap-ruleset-interval', 'class': 'cbi-input-select' })
@@ -1557,12 +1565,20 @@ return view.extend({
 									'class': 'btn cbi-button-add',
 									'click': ui.createHandlerFn(this, function() {
 										const url = document.querySelector('#zarap-ruleset-url');
+										const kind = document.querySelector('#zarap-ruleset-kind');
+										const category = document.querySelector('#zarap-ruleset-category');
 										const label = document.querySelector('#zarap-ruleset-label');
 										const interval = document.querySelector('#zarap-ruleset-interval');
 										const address = url.value.trim();
-										if (!/^https?:\/\/[!-~]+$/.test(address)) {
-											ui.addNotification(null, E('p', {}, _('Адрес списка должен начинаться с http:// или https://')), 'error');
+										if (!/^https:\/\/[!-~]+$/.test(address)) {
+											ui.addNotification(null, E('p', {}, _('Адрес списка должен начинаться с https://')), 'error');
 											url.focus();
+											return;
+										}
+										const cat = category.value.trim().toLowerCase();
+										if (!/^[a-z0-9_!@.-]{1,64}$/.test(cat)) {
+											ui.addNotification(null, E('p', {}, _('Укажите категорию (тег) внутри .dat-файла, например youtube или ru-blocked')), 'error');
+											category.focus();
 											return;
 										}
 										const tag = allocateRulesetTag();
@@ -1580,11 +1596,14 @@ return view.extend({
 											state.rulesetDetour = state.outbounds[0].tag;
 										state.rulesets.push({
 											tag: tag, label: label.value.trim(), url: address,
+											kind: (kind && kind.value === 'geoip') ? 'geoip' : 'geosite',
+											category: cat,
 											update_interval: interval.value || ''
 										});
 										url.value = '';
+										category.value = '';
 										label.value = '';
-										ui.addNotification(null, E('p', {}, _('Список добавлен: его уже можно выбрать в правиле. Скачает его sing-box при применении')), 'info');
+										ui.addNotification(null, E('p', {}, _('Список добавлен: его уже можно выбрать в правиле. Файл .dat скачается при применении')), 'info');
 										refresh();
 									})
 								}, _('Добавить'))
@@ -1651,7 +1670,7 @@ return view.extend({
 			tabPane('maintenance', [
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('Компоненты и обновления')),
-					E('p', {}, _('Проверка выполняется одновременно для Zarap и sing-box через настроенные APK-репозитории.')),
+					E('p', {}, _('Проверка выполняется одновременно для Zarap и xray-core через настроенные APK-репозитории.')),
 					E('table', { 'class': 'table' }, [
 						E('tr', { 'class': 'tr table-titles' }, [
 							E('th', { 'class': 'th' }, _('Компонент')),
@@ -1661,7 +1680,7 @@ return view.extend({
 						]),
 						E('tbody', { 'id': 'zarap-components-body' }, [
 							updateRow('luci-app-zarap', updates['luci-app-zarap'] || {}, this, status),
-							updateRow('sing-box', updates['sing-box'] || {}, this, status)
+							updateRow('xray-core', updates['xray-core'] || {}, this, status)
 						])
 					]),
 					E('div', { 'class': 'right', 'style': ACTION_ROW }, E('button', {
@@ -1674,7 +1693,7 @@ return view.extend({
 								const components = result.components || {};
 								dom.content(document.querySelector('#zarap-components-body'), [
 									updateRow('luci-app-zarap', components['luci-app-zarap'] || {}, this, status),
-									updateRow('sing-box', components['sing-box'] || {}, this, status)
+									updateRow('xray-core', components['xray-core'] || {}, this, status)
 								]);
 							}
 							dom.content(ev.currentTarget, _('Проверить обновления'));
@@ -1714,6 +1733,12 @@ return view.extend({
 		// selection has to wait for the page to be in the document.
 		window.setTimeout(function() {
 			selectTab('setup');
+			const kind = document.querySelector('#zarap-ruleset-kind');
+			if (kind)
+				dom.content(kind, [
+					E('option', { 'value': 'geosite' }, _('geosite (домены)')),
+					E('option', { 'value': 'geoip' }, _('geoip (IP)'))
+				]);
 			const interval = document.querySelector('#zarap-ruleset-interval');
 			if (interval)
 				dom.content(interval, [
