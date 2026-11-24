@@ -5,8 +5,8 @@
 'require view';
 
 const callStatus = rpc.declare({ object: 'zarap', method: 'status' });
-const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'resolve_all', 'tunnel_dns', 'clients', 'final' ] });
-const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'bootstrap_dns', 'resolve_all', 'tunnel_dns', 'clients', 'final' ] });
+const callValidate = rpc.declare({ object: 'zarap', method: 'validate', params: [ 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'ruleset_interval', 'bootstrap_dns', 'resolve_all', 'tunnel_dns', 'clients', 'final' ] });
+const callApply = rpc.declare({ object: 'zarap', method: 'apply', params: [ 'enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour', 'ruleset_interval', 'bootstrap_dns', 'resolve_all', 'tunnel_dns', 'clients', 'final' ] });
 const callRestart = rpc.declare({ object: 'zarap', method: 'restart' });
 const callStop = rpc.declare({ object: 'zarap', method: 'stop' });
 const callLogs = rpc.declare({ object: 'zarap', method: 'logs' });
@@ -103,6 +103,8 @@ const state = {
 	// Через что скачивать списки — один выбор на все списки сразу: их источники
 	// заблокированы там же, где и всё остальное, так что ответ у них общий.
 	rulesetDetour: 'direct',
+	// Общее расписание автообновления .dat-файлов в блоке geodata xray-core.
+	rulesetInterval: '1d',
 	// Чем резолвится адрес сервера из ссылки. Мимо туннеля — через туннель было
 	// бы кругом, — и потому единственный запрос Zarap, который видит провайдер.
 	bootstrapDns: 'local',
@@ -154,14 +156,14 @@ function loadState(status) {
 			label: ruleset.label || '',
 			url: ruleset.url || '',
 			kind: ruleset.kind || 'geosite',
-			category: ruleset.category || '',
-			update_interval: ruleset.update_interval || ''
+			category: ruleset.category || ''
 		};
 	});
 	state.appliedRulesets = state.rulesets.map(function(ruleset) {
 		return Object.assign({}, ruleset);
 	});
 	state.rulesetDetour = status.ruleset_detour || 'direct';
+	state.rulesetInterval = status.ruleset_interval != null ? status.ruleset_interval : '1d';
 	state.bootstrapDns = status.bootstrap_dns || 'local';
 	state.resolveAll = !!status.resolve_all;
 	state.tunnelDns = status.tunnel_dns || 'https://1.1.1.1/dns-query';
@@ -1007,7 +1009,6 @@ function rulesetRow(ruleset, owner) {
 		E('td', { 'class': 'td' }, ruleset.label || ruleset.tag),
 		E('td', { 'class': 'td' }, E('code', {}, spec)),
 		E('td', { 'class': 'td' }, E('code', { 'style': 'word-break:break-all' }, ruleset.url)),
-		E('td', { 'class': 'td' }, ruleset.update_interval || _('не обновлять')),
 		E('td', { 'class': 'td' }, used.length
 			? statusPill(true, _('используется'), '')
 			: statusPill(false, '', _('не используется'))),
@@ -1036,12 +1037,11 @@ function renderRulesets(owner) {
 	const context = renderRulesets.owner;
 	return state.rulesets.length
 		? state.rulesets.map(function(ruleset) { return rulesetRow(ruleset, context); })
-		: E('tr', {}, E('td', { 'colspan': 6 }, _('Списков пока нет')));
+		: E('tr', {}, E('td', { 'colspan': 5 }, _('Списков пока нет')));
 }
 
-// Одна строка на все списки: подключение выбирается здесь, а не в каждом
-// списке. Скачивает и обновляет xray-core (и curl при первичном запуске),
-// и повторять один и тот же ответ построчно — лишняя работа.
+// Одна строка на все списки: подключение и расписание автообновления у блока
+// geodata в xray-core общие на все .dat-файлы.
 function rulesetDetourRow() {
 	// Подключение могли удалить, а выбор остался на него ссылаться: тогда ни
 	// один список не обновится, и молчать об этом нельзя. Оставшийся выбор
@@ -1066,10 +1066,31 @@ function rulesetDetourRow() {
 		state.rulesetDetour = select.value;
 		refresh();
 	});
-	return E('span', {}, [
-		E('span', {}, _('Скачивать списки через: ')),
-		select,
-		missing ? E('div', { 'class': 'error', 'data-field': 'ruleset-detour-missing' },
+
+	const intervalPresets = [
+		[ '1d', _('раз в день') ],
+		[ '12h', _('дважды в день') ],
+		[ '168h', _('раз в неделю') ],
+		[ '', _('не обновлять') ]
+	];
+	const intervalOptions = intervalPresets.map(function(pair) {
+		return E('option', { 'value': pair[0] }, pair[1]);
+	});
+	if (!intervalPresets.some(function(pair) { return pair[0] === state.rulesetInterval; }))
+		intervalOptions.push(E('option', { 'value': state.rulesetInterval }, state.rulesetInterval));
+	const intervalSelect = E('select', {
+		'id': 'zarap-ruleset-interval', 'class': 'cbi-input-select'
+	}, intervalOptions);
+	intervalSelect.value = state.rulesetInterval;
+	intervalSelect.addEventListener('change', function() {
+		state.rulesetInterval = intervalSelect.value;
+		refresh();
+	});
+
+	return E('span', { 'style': 'display:inline-flex;flex-wrap:wrap;gap:.5em 1.25em;align-items:center' }, [
+		E('span', {}, [ _('Скачивать списки через: '), select ]),
+		E('span', {}, [ _('Обновлять списки: '), intervalSelect ]),
+		missing ? E('div', { 'class': 'error', 'data-field': 'ruleset-detour-missing', 'style': 'flex-basis:100%' },
 			_('подключение удалено — списки не обновятся')) : ''
 	]);
 }
@@ -1535,7 +1556,6 @@ return view.extend({
 							E('th', { 'class': 'th' }, _('Название')),
 							E('th', { 'class': 'th' }, _('Категория')),
 							E('th', { 'class': 'th' }, _('Адрес')),
-							E('th', { 'class': 'th' }, _('Обновлять')),
 							E('th', { 'class': 'th' }, _('Состояние')),
 							E('th', { 'class': 'th' }, '')
 						])),
@@ -1556,8 +1576,7 @@ return view.extend({
 								E('input', { 'id': 'zarap-ruleset-category', 'class': 'cbi-input-text',
 									'placeholder': _('Категория (напр. youtube)') }),
 								E('input', { 'id': 'zarap-ruleset-label', 'class': 'cbi-input-text',
-									'placeholder': _('Название') }),
-								E('select', { 'id': 'zarap-ruleset-interval', 'class': 'cbi-input-select' })
+									'placeholder': _('Название') })
 							]),
 							E('div', { 'style': ACTION_ROW }, [
 								E('button', {
@@ -1568,7 +1587,6 @@ return view.extend({
 										const kind = document.querySelector('#zarap-ruleset-kind');
 										const category = document.querySelector('#zarap-ruleset-category');
 										const label = document.querySelector('#zarap-ruleset-label');
-										const interval = document.querySelector('#zarap-ruleset-interval');
 										const address = url.value.trim();
 										if (!/^https:\/\/[!-~]+$/.test(address)) {
 											ui.addNotification(null, E('p', {}, _('Адрес списка должен начинаться с https://')), 'error');
@@ -1597,8 +1615,7 @@ return view.extend({
 										state.rulesets.push({
 											tag: tag, label: label.value.trim(), url: address,
 											kind: (kind && kind.value === 'geoip') ? 'geoip' : 'geosite',
-											category: cat,
-											update_interval: interval.value || ''
+											category: cat
 										});
 										url.value = '';
 										category.value = '';
@@ -1632,8 +1649,9 @@ return view.extend({
 								if (!readyToSend())
 									return;
 								notify(await callValidate(submittedOutbounds(), state.rules,
-									state.rulesets, state.rulesetDetour, bootstrapValue(),
-									resolveAllValue(), tunnelValue(), leasedClients(), state.final),
+									state.rulesets, state.rulesetDetour, state.rulesetInterval,
+									bootstrapValue(), resolveAllValue(), tunnelValue(),
+									leasedClients(), state.final),
 									_('Конфигурация корректна'));
 							})
 						}, _('Проверить конфигурацию')),
@@ -1649,6 +1667,7 @@ return view.extend({
 									state.rules,
 									state.rulesets,
 									state.rulesetDetour,
+									state.rulesetInterval,
 									bootstrapValue(),
 									resolveAllValue(),
 									tunnelValue(),
@@ -1738,14 +1757,6 @@ return view.extend({
 				dom.content(kind, [
 					E('option', { 'value': 'geosite' }, _('geosite (домены)')),
 					E('option', { 'value': 'geoip' }, _('geoip (IP)'))
-				]);
-			const interval = document.querySelector('#zarap-ruleset-interval');
-			if (interval)
-				dom.content(interval, [
-					E('option', { 'value': '1d' }, _('раз в день')),
-					E('option', { 'value': '12h' }, _('дважды в день')),
-					E('option', { 'value': '168h' }, _('раз в неделю')),
-					E('option', { 'value': '' }, _('не обновлять'))
 				]);
 		}, 0);
 		return page;

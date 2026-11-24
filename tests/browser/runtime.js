@@ -39,11 +39,12 @@ const fixtures = {
       {
         tag: 'rs_1', label: 'Реклама', url: 'https://example.org/geosite.dat',
         kind: 'geosite', category: 'category-ads-all',
-        update_interval: '1d', in_use: false
+        in_use: false
       }
     ],
     ruleset_detour: 'out_1',
     ruleset_detour_missing: false,
+    ruleset_interval: '1d',
     bootstrap_dns: 'local',
     resolve_all: false,
     tunnel_dns: 'https://1.1.1.1/dns-query',

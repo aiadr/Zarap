@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { findUcode, liftMany, readBackend, runUcode, runUcodeJson } from './ucode_helper.mjs';
+import { findUcode, liftConstants, liftMany, readBackend, runUcode, runUcodeJson } from './ucode_helper.mjs';
 
 const TV = '00:11:22:33:44:55';
 const TABLET = '10:20:30:40:50:60';
@@ -8,13 +8,15 @@ const TABLET = '10:20:30:40:50:60';
 const ucode = findUcode();
 
 describe('rule_conditions', { skip: !ucode && 'no ucode interpreter available' }, () => {
-	const prelude = liftMany(readBackend(), [
+	const source = readBackend();
+	const constants = liftConstants(source, ['const RULESET_INTERVAL_DEFAULT']);
+	const prelude = `${constants}\n${liftMany(source, [
 		'result_error', 'input_error', 'normalize_mac', 'is_private_mac',
 		'valid_ipv4', 'normalize_domain', 'normalize_cidr', 'normalize_port',
 		'valid_target', 'valid_ruleset_tag', 'validate_rulesets',
-		'validate_ruleset_detour', 'validate_rule_list', 'validate_rules',
-		'startup_hint'
-	]);
+		'validate_ruleset_detour', 'validate_ruleset_interval', 'validate_rule_list',
+		'validate_rules', 'startup_hint'
+	])}`;
 
 	function evalJson(expr) {
 		return runUcodeJson(ucode, `${prelude}\nprintf('%J', ${expr});\n`);
@@ -43,6 +45,10 @@ describe('rule_conditions', { skip: !ucode && 'no ucode interpreter available' }
 
 	function detour(value, tags = { out_1: true }) {
 		return evalJson(`validate_ruleset_detour(${JSON.stringify(value)}, ${JSON.stringify(tags)})`);
+	}
+
+	function interval(value) {
+		return evalJson(`validate_ruleset_interval(${JSON.stringify(value)})`);
 	}
 
 	function hint(entries) {
@@ -166,20 +172,19 @@ describe('rule_conditions', { skip: !ucode && 'no ucode interpreter available' }
 			assert.equal(validate([{ clients: [TABLET], target }]).ok, true);
 	});
 
-	test('a ruleset needs a name, https address, kind, category and a schedule', () => {
+	test('a ruleset needs a name, https address, kind and category', () => {
 		const good = rulesets([{
 			tag: 'rs_1', label: 'YouTube',
 			url: 'https://example.org/geosite.dat',
-			kind: 'geosite', category: 'youtube',
-			update_interval: '1d'
+			kind: 'geosite', category: 'youtube'
 		}, {
 			tag: 'rs_2', label: 'Telegram IP',
 			url: 'https://example.org/geoip.dat',
-			kind: 'geoip', category: 'telegram',
-			update_interval: ''
+			kind: 'geoip', category: 'telegram'
 		}]);
 		assert.equal(good.ok, true, JSON.stringify(good));
 		assert.equal('detour' in good.rulesets[0], false);
+		assert.equal('update_interval' in good.rulesets[0], false);
 		assert.equal(good.rulesets[0].kind, 'geosite');
 		assert.equal(good.rulesets[0].category, 'youtube');
 		assert.equal(good.rulesets[1].kind, 'geoip');
@@ -191,7 +196,16 @@ describe('rule_conditions', { skip: !ucode && 'no ucode interpreter available' }
 		assert.ok(rulesets([{ tag: 'rs_1', url: 'https://example.org/a.dat', kind: 'domain', category: 'ads' }]).error.includes('geosite'));
 		assert.ok(rulesets([{ tag: 'rs_1', url: 'https://example.org/a.dat', kind: 'geosite', category: '' }]).error.includes('категорию'));
 		assert.ok(rulesets([{ tag: 'rs_1', url: 'https://example.org/a.dat', kind: 'geosite', category: 'bad cat!' }]).error.includes('категорию'));
-		assert.ok(rulesets([{ tag: 'rs_1', url: 'https://example.org/a.dat', category: 'ads', update_interval: 'каждый день' }]).error.includes('12h'));
+	});
+
+	test('one schedule answers for every list', () => {
+		assert.equal(interval('12h').interval, '12h');
+		assert.equal(interval('1d').interval, '1d');
+		assert.equal(interval('168h').interval, '168h');
+		assert.equal(interval('').interval, '');
+		assert.equal(interval('off').interval, '');
+		assert.equal(interval(null).interval, '1d');
+		assert.ok(interval('каждый день').error.includes('12h'));
 	});
 
 	test('one detour answers for every list', () => {

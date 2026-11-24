@@ -96,7 +96,7 @@ describe('package_contract', () => {
 
 		const shared = [
 			'outbounds: []', 'rules: []', 'rulesets: []', "ruleset_detour: ''",
-			"bootstrap_dns: ''", 'resolve_all: true', 'clients: []', "final: ''"
+			"ruleset_interval: ''", "bootstrap_dns: ''", 'resolve_all: true', 'clients: []', "final: ''"
 		];
 		for (const [method, expected] of [
 			['validate', shared],
@@ -107,6 +107,12 @@ describe('package_contract', () => {
 			for (const pair of expected)
 				assert.ok(body[1].includes(pair), `${method}: missing ${pair}`);
 		}
+	});
+
+	test('init script keeps policy routing alive when rolling back to legacy sing-box', () => {
+		const initScript = readFileSync(join(PACKAGE_ROOT, 'root/etc/init.d/zarap'), 'utf8');
+		assert.ok(initScript.includes('LEGACY_CONFIG=/etc/zarap/sing-box.json'));
+		assert.ok(initScript.includes('[ -s "$CONFIG" ] || [ -s "$LEGACY_CONFIG" ]'));
 	});
 
 	test('taking dns over is reversible', () => {

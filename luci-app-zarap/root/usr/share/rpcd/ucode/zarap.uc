@@ -49,6 +49,7 @@ const BOOTSTRAP_DEFAULT = 'local';
 // плюс local (localhost). DoT (tls://) встроенный DNS xray не поддерживает.
 const BOOTSTRAP_SCHEMES = { https: true, udp: true, tcp: true };
 const TUNNEL_DEFAULT = 'https://' + DNS_UPSTREAM + '/dns-query';
+const RULESET_INTERVAL_DEFAULT = '1d';
 
 // Outbound section names double as xray tags, so they have to stay clear of
 // the tags Zarap and xray give their own meanings.
@@ -438,18 +439,13 @@ function validate_rulesets(input) {
 		if (!match(category, /^[a-z0-9_!@.-]{1,64}$/))
 			return input_error('Укажите категорию (тег) внутри .dat-файла для набора ' + tag + ', например youtube или ru-blocked');
 
-		let interval = lc(trim('' + (entry?.update_interval || '')));
-		if (interval != '' && !match(interval, /^[0-9]{1,4}[hd]$/))
-			return input_error('Интервал обновления набора ' + tag + ' пишется как 12h или 1d');
-
 		let label = trim(replace('' + (entry?.label || ''), /[[:cntrl:]]/g, ''));
 		if (length(label) > 64)
 			label = trim(substr(label, 0, 64));
 
 		push(result, {
 			tag: tag, label: label, url: url,
-			kind: kind, category: category,
-			update_interval: interval
+			kind: kind, category: category
 		});
 	}
 	return { ok: true, rulesets: result };
@@ -464,6 +460,19 @@ function validate_ruleset_detour(value, tags) {
 	if (detour != 'direct' && !tags[detour])
 		return input_error('Списки правил скачиваются через несуществующее подключение: ' + detour);
 	return { ok: true, detour: detour };
+}
+
+// Расписание автообновления — одно на все списки сразу, потому что у блока
+// geodata в xray-core ровно одно поле cron на все assets.
+function validate_ruleset_interval(value) {
+	if (value == null)
+		return { ok: true, interval: RULESET_INTERVAL_DEFAULT };
+	let interval = lc(trim('' + value));
+	if (interval == '' || interval == 'off')
+		return { ok: true, interval: '' };
+	if (!match(interval, /^[0-9]{1,4}[hd]$/))
+		return input_error('Интервал обновления списков пишется как 12h или 1d');
+	return { ok: true, interval: interval };
 }
 
 // Разбор DNS-резолвера в форму, понятную генератору xray-core.
@@ -740,6 +749,18 @@ function dns_routes(rules) {
 	return { by_outbound: by_outbound, sets_by_outbound: sets_by_outbound, order: order };
 }
 
+// Выходы, для которых есть ручные доменные правила (в порядке первого появления).
+// Каждый такой выход получает свой локальный DNS-порт (5353 + idx) и dns-out с
+// dialerProxy на этот выход, чтобы не-IP запросы (TXT/MX/SRV/HTTPS) шли строго
+// через выбранное подключение без утечек, ложных NOERROR и подмены выхода.
+function dns_domain_tags(rules) {
+	let dns = dns_routes(rules), tags = [];
+	for (let tag in dns.order)
+		if (length(dns.by_outbound[tag]))
+			push(tags, tag);
+	return tags;
+}
+
 // Преобразование доменов Zarap в формат xray-core:
 // - `youtube.com` -> `domain:youtube.com` (само имя и все поддомены);
 // - `.googlevideo.com` -> `regexp:\.googlevideo\.com$` (только поддомены).
@@ -771,31 +792,24 @@ function url_hostname(url) {
 	return lc(trim(rest));
 }
 
-// Переводит самый частый update_interval среди используемых списков в
-// 5-польное cron-выражение для блока geodata в xray-core.
-function geodata_cron(used_rulesets) {
-	let min_hours = 0;
-	for (let rs in (used_rulesets || [])) {
-		let iv = rs.update_interval || '';
-		if (!iv)
-			continue;
-		let unit = substr(iv, length(iv) - 1);
-		let num = int(substr(iv, 0, length(iv) - 1));
-		if (num < 1)
-			continue;
-		let hours = unit == 'd' ? num * 24 : num;
-		if (min_hours == 0 || hours < min_hours)
-			min_hours = hours;
-	}
-	if (min_hours == 0)
+// Переводит общий интервал обновления списков (12h, 1d, 168h) в 5-польное
+// cron-выражение для блока geodata в xray-core. Пустая строка отключает автообновление.
+function geodata_cron(interval) {
+	let iv = lc(trim('' + (interval || '')));
+	if (!iv || iv == 'off')
 		return '';
-	if (min_hours < 24)
-		return '0 */' + min_hours + ' * * *';
-	if (min_hours == 24)
+	let unit = substr(iv, length(iv) - 1);
+	let num = int(substr(iv, 0, length(iv) - 1));
+	if (num < 1)
+		return '';
+	let hours = unit == 'd' ? num * 24 : num;
+	if (hours < 24)
+		return '0 */' + hours + ' * * *';
+	if (hours == 24)
 		return '0 4 * * *';
-	if (min_hours == 168)
+	if (hours == 168)
 		return '0 4 * * 0';
-	let days = int(min_hours / 24);
+	let days = int(hours / 24);
 	if (days > 31)
 		days = 31;
 	return '0 4 */' + days + ' * *';
@@ -843,8 +857,7 @@ function ruleset_plan(rules, rulesets) {
 			kind: kind,
 			category: category,
 			file: file,
-			expr: 'ext:' + file + ':' + category,
-			update_interval: rs.update_interval || ''
+			expr: 'ext:' + file + ':' + category
 		};
 		by_tag[rs.tag] = entry;
 		push(used_rulesets, entry);
@@ -913,7 +926,7 @@ function rule_jsons(rule, address_of, ruleset_map, skip_assets) {
 	return emitted;
 }
 
-function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns, skip_assets) {
+function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns, skip_assets, ruleset_interval) {
 	let emitted = [], route_rules = [];
 	let wants_direct = false, wants_block = false;
 
@@ -928,6 +941,7 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 	// Доменные списки и имена, уезжающие в туннель: для каждого подключения
 	// свой DNS-сервер с индивидуальным tag и правилом маршрутизации в этот outbound.
 	let dns = dns_routes(rules);
+	let domain_tags = dns_domain_tags(rules);
 	let tunnel_dns_domains = {}, tunnel_dns_order = [];
 	for (let tag in dns.order) {
 		let list = xray_domains(dns.by_outbound[tag]);
@@ -946,17 +960,13 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 
 	let listens_dns = !!(resolve_all || length(tunnel_dns_order));
 
-	let auto_rulesets = [], auto_files = {};
-	for (let rs in plan.used_rulesets) {
-		if (rs.update_interval && !(skip_assets && skip_assets[rs.file])) {
-			push(auto_rulesets, rs);
-			auto_files[rs.file] = true;
-		}
-	}
+	let cron = geodata_cron(ruleset_interval);
 	let auto_assets = [];
-	for (let asset in plan.assets)
-		if (auto_files[asset.file])
-			push(auto_assets, asset);
+	if (cron) {
+		for (let asset in plan.assets)
+			if (!(skip_assets && skip_assets[asset.file]))
+				push(auto_assets, asset);
+	}
 
 	// Собственные имена роутера: домены серверов из ссылок и хост источника
 	// автообновляемых .dat-файлов, если они скачиваются напрямую.
@@ -984,11 +994,38 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 	if (length(auto_assets) && detour == 'direct')
 		wants_direct = true;
 
+	// Локальные DNS-слушатели: основной на 5353 (zarap-dns -> dns-out) и по
+	// дополнительному на 5354+ для каждого второго и последующего outbound с
+	// ручными доменами, чтобы не-IP запросы (TXT/MX/SRV/HTTPS) шли строго через
+	// нужный выход внутри туннеля и никогда не превращали DoH в открытый UDP/53.
+	let dns_listeners = [];
+	if (listens_dns) {
+		let primary_proxy = length(domain_tags)
+			? domain_tags[0]
+			: (length(tunnel_dns_order) ? tunnel_dns_order[0]
+				: (length(outbounds) ? outbounds[0].tag : ''));
+		push(dns_listeners, {
+			inbound_tag: DNS_TAG,
+			outbound_tag: DNS_OUT_TAG,
+			port: DNS_PORT,
+			proxy_tag: primary_proxy
+		});
+		for (let i = 1; i < length(domain_tags); i++) {
+			let tag = domain_tags[i];
+			push(dns_listeners, {
+				inbound_tag: DNS_TAG + '-' + tag,
+				outbound_tag: DNS_OUT_TAG + '-' + tag,
+				port: DNS_PORT + i,
+				proxy_tag: tag
+			});
+		}
+	}
+
 	// Внутренние правила DNS стоят в самом начале routing.rules, до трафика
 	// с zarap-tproxy: иначе DNS-запросы попали бы под клиентские правила или
 	// дефолтный первый outbound.
-	if (listens_dns)
-		push(route_rules, { type: 'field', inboundTag: [DNS_TAG], outboundTag: DNS_OUT_TAG });
+	for (let listener in dns_listeners)
+		push(route_rules, { type: 'field', inboundTag: [listener.inbound_tag], outboundTag: listener.outbound_tag });
 	if (uses_udp_bootstrap)
 		push(route_rules, { type: 'field', inboundTag: [BOOTSTRAP_TAG], outboundTag: 'direct' });
 	for (let tag in tunnel_dns_order)
@@ -1024,34 +1061,15 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 		push(emitted, { tag: 'direct', protocol: 'freedom' });
 	if (wants_block)
 		push(emitted, { tag: 'block', protocol: 'blackhole', settings: { response: { type: 'none' } } });
-	if (listens_dns) {
-		let dns_out = { tag: DNS_OUT_TAG, protocol: 'dns' };
-		let all_tunnel_domains = [];
-		for (let tag in tunnel_dns_order)
-			for (let item in tunnel_dns_domains[tag])
-				push(all_tunnel_domains, item);
 
-		// A/AAAA (qType 1,28) всегда перехватываются во встроенный DNS xray-core.
-		// Для остальных типов (TXT, MX, SRV, HTTPS/SVCB):
-		// - при resolve_all=1: туннельные домены возвращают NOERROR без утечки
-		//   наружу и без таймаута, а остальные домены дома идут напрямую в
-		//   выбранный bootstrap-резолвер;
-		// - при resolve_all=0: сюда приходят только туннельные домены, и их
-		//   не-IP запросы уходят через туннель (dialerProxy) в tunnel_dns.
-		if (resolve_all) {
-			let non_ip_rules = [{ action: 'hijack', qType: '1,28' }];
-			if (length(all_tunnel_domains))
-				push(non_ip_rules, { action: 'return', domain: all_tunnel_domains, rCode: 0 });
-			push(non_ip_rules, { action: 'direct' });
-			dns_out.settings = {
-				rewriteNetwork: parsed_bootstrap.scheme == 'tcp' ? 'tcp' : 'udp',
-				rewriteAddress: parsed_bootstrap.host || DNS_UPSTREAM,
-				rewritePort: parsed_bootstrap.scheme == 'https' ? 53 : (parsed_bootstrap.port || 53),
-				rules: non_ip_rules
-			};
-		}
-		else {
-			dns_out.settings = {
+	// A/AAAA (qType 1,28) всегда перехватываются во встроенный DNS xray-core;
+	// остальные типы (TXT, MX, SRV, HTTPS/SVCB) уходят через dialerProxy внутрь
+	// выбранного туннеля к tunnel_dns — без ложных NOERROR и без утечки открытого UDP/53.
+	for (let listener in dns_listeners) {
+		let dns_out = {
+			tag: listener.outbound_tag,
+			protocol: 'dns',
+			settings: {
 				rewriteNetwork: parsed_tunnel.scheme == 'udp' ? 'udp' : 'tcp',
 				rewriteAddress: parsed_tunnel.host || DNS_UPSTREAM,
 				rewritePort: parsed_tunnel.scheme == 'https' ? 53 : (parsed_tunnel.port || 53),
@@ -1059,10 +1077,10 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 					{ action: 'hijack', qType: '1,28' },
 					{ action: 'direct' }
 				]
-			};
-			if (length(tunnel_dns_order))
-				dns_out.streamSettings = { sockopt: { dialerProxy: tunnel_dns_order[0] } };
-		}
+			}
+		};
+		if (listener.proxy_tag)
+			dns_out.streamSettings = { sockopt: { dialerProxy: listener.proxy_tag } };
 		push(emitted, dns_out);
 	}
 
@@ -1078,11 +1096,11 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 		tproxy.sniffing = { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true };
 
 	let inbounds = [tproxy];
-	if (listens_dns)
+	for (let listener in dns_listeners)
 		push(inbounds, {
-			tag: DNS_TAG,
+			tag: listener.inbound_tag,
 			listen: '127.0.0.1',
-			port: DNS_PORT,
+			port: listener.port,
 			protocol: 'dokodemo-door',
 			settings: { address: DNS_UPSTREAM, port: 53, network: 'tcp,udp' }
 		});
@@ -1133,15 +1151,12 @@ function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_deto
 		};
 	}
 
-	if (length(auto_assets)) {
-		let cron = geodata_cron(auto_rulesets);
-		if (cron) {
-			config.geodata = {
-				cron: cron,
-				outbound: detour != 'direct' ? detour : 'direct',
-				assets: auto_assets
-			};
-		}
+	if (length(auto_assets) && cron) {
+		config.geodata = {
+			cron: cron,
+			outbound: detour != 'direct' ? detour : 'direct',
+			assets: auto_assets
+		};
 	}
 
 	return config;
@@ -1396,7 +1411,7 @@ const DNS_TAKEOVER = ['server', 'noresolv', 'cachesize'];
 // Запомнить чужое и поставить своё. Кэш выключается не из вредности: dnsmasq
 // отдавал бы старые ответы поверх свежих, и подкоп из чужого кэша возвращался
 // бы уже после того, как его перестали спрашивать.
-function dnsmasq_take_over(uci, section) {
+function dnsmasq_take_over(uci, section, extra_servers) {
 	for (let key in DNS_TAKEOVER)
 		if (uci.get('zarap', 'main', 'saved_dns_' + key) == null) {
 			let previous = uci.get('dhcp', section, key);
@@ -1404,7 +1419,10 @@ function dnsmasq_take_over(uci, section) {
 				previous == null ? '' : previous);
 		}
 
-	uci.set('dhcp', section, 'server', [DNS_FORWARD]);
+	let servers = [DNS_FORWARD];
+	for (let entry in (extra_servers || []))
+		push(servers, entry);
+	uci.set('dhcp', section, 'server', servers);
 	uci.set('dhcp', section, 'noresolv', '1');
 	uci.set('dhcp', section, 'cachesize', '0');
 }
@@ -1430,10 +1448,31 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all) {
 	if (!section)
 		return;
 
+	let dns = dns_routes(rules), domain_tags = dns_domain_tags(rules);
+	let port_of = {};
+	for (let i = 0; i < length(domain_tags); i++)
+		port_of[domain_tags[i]] = DNS_PORT + i;
+
+	let forwarded = [], seen = {};
+	if (enabled) {
+		for (let tag in domain_tags) {
+			let forward = '127.0.0.1#' + port_of[tag];
+			for (let domain in dns.by_outbound[tag]) {
+				// dnsmasq сопоставляет по суффиксу, поэтому ведущая точка ему не
+				// нужна: /example.com/ покрывает и имя, и поддомены.
+				let name = substr(domain, 0, 1) == '.' ? substr(domain, 1) : domain;
+				if (seen[name])
+					continue;
+				seen[name] = true;
+				push(forwarded, '/' + name + '/' + forward);
+			}
+		}
+	}
+
 	// Выключенный Zarap ничего у dnsmasq не забирает: xray остановлен, и
 	// пересылка на него оставила бы дом без названных имён вовсе.
 	if (enabled && resolve_all) {
-		dnsmasq_take_over(uci, section);
+		dnsmasq_take_over(uci, section, length(domain_tags) > 1 ? forwarded : []);
 		return;
 	}
 	dnsmasq_hand_back(uci, section);
@@ -1445,20 +1484,11 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all) {
 	// выводятся из правил, и сверять их по одной незачем.
 	let kept = [];
 	for (let entry in raw)
-		if (index('' + entry, DNS_FORWARD) < 0)
+		if (!match('' + entry, /127\.0\.0\.1#53(5[3-9]|[6-9][0-9])$/))
 			push(kept, '' + entry);
 
-	let dns = dns_routes(rules), seen = {};
-	for (let tag in dns.order)
-		for (let domain in dns.by_outbound[tag]) {
-			// dnsmasq сопоставляет по суффиксу, поэтому ведущая точка ему не
-			// нужна: /example.com/ покрывает и имя, и поддомены.
-			let name = substr(domain, 0, 1) == '.' ? substr(domain, 1) : domain;
-			if (seen[name])
-				continue;
-			seen[name] = true;
-			push(kept, '/' + name + '/' + DNS_FORWARD);
-		}
+	for (let entry in forwarded)
+		push(kept, entry);
 
 	if (length(kept))
 		uci.set('dhcp', section, 'server', kept);
@@ -1466,12 +1496,13 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all) {
 		uci.delete('dhcp', section, 'server');
 }
 
-function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns) {
+function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, ruleset_interval, bootstrap, resolve_all, tunnel_dns) {
 	uci.load('zarap');
 	uci.set('zarap', 'main', 'zarap');
 	uci.set('zarap', 'main', 'enabled', enabled ? '1' : '0');
 	uci.set('zarap', 'main', 'final', final);
 	uci.set('zarap', 'main', 'ruleset_detour', ruleset_detour || 'direct');
+	uci.set('zarap', 'main', 'ruleset_interval', ruleset_interval || 'off');
 	uci.set('zarap', 'main', 'bootstrap_dns', bootstrap || BOOTSTRAP_DEFAULT);
 	uci.set('zarap', 'main', 'resolve_all', resolve_all ? '1' : '0');
 	uci.set('zarap', 'main', 'tunnel_dns', tunnel_dns || TUNNEL_DEFAULT);
@@ -1498,11 +1529,11 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets,
 		                 'public_key', 'short_id', 'fingerprint'])
 			uci.set('zarap', outbound.tag, key, '' + outbound[key]);
 	}
-	// Секции переписываются целиком, поэтому `option detour` из старой схемы,
-	// где подключение стояло у каждого списка, исчезает вместе с секцией.
+	// Секции переписываются целиком, поэтому старые опции вроде detour или
+	// индивидуального update_interval исчезают вместе с секцией.
 	for (let ruleset in rulesets) {
 		uci.set('zarap', ruleset.tag, 'ruleset');
-		for (let key in ['label', 'url', 'kind', 'category', 'update_interval'])
+		for (let key in ['label', 'url', 'kind', 'category'])
 			uci.set('zarap', ruleset.tag, key, '' + ruleset[key]);
 	}
 	for (let rule in rules) {
@@ -1587,7 +1618,7 @@ function cleanup_uci_candidate() {
 	}
 }
 
-function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns) {
+function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, ruleset_interval, bootstrap, resolve_all, tunnel_dns) {
 	mkdir(UCI_CANDIDATE);
 	chmod(UCI_CANDIDATE, 0700);
 	mkdir(UCI_CANDIDATE_DELTA);
@@ -1603,7 +1634,7 @@ function prepare_uci_candidate(outbounds, rules, final, enabled, clients, rulese
 	}
 
 	let candidate = cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA);
-	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns)) {
+	if (!configure_uci(candidate, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, ruleset_interval, bootstrap, resolve_all, tunnel_dns)) {
 		cleanup_uci_candidate();
 		return result_error('Не удалось сформировать временный UCI-кандидат', '', 'startup_error');
 	}
@@ -1695,8 +1726,7 @@ function saved_rulesets() {
 			label: section.label || '',
 			url: section.url || '',
 			kind: kind,
-			category: lc(trim('' + (section.category || ''))),
-			update_interval: section.update_interval || ''
+			category: lc(trim('' + (section.category || '')))
 		});
 	});
 	return rulesets;
@@ -1710,6 +1740,19 @@ function saved_ruleset_detour() {
 	let uci = cursor();
 	uci.load('zarap');
 	return uci.get('zarap', 'main', 'ruleset_detour') || 'direct';
+}
+
+// Расписание автообновления .dat-файлов — общее для блока geodata xray-core.
+// Значение 'off' в UCI обозначает явно выключенное автообновление, отсутствие
+// опции в старом конфиге даёт значение по умолчанию (1d).
+function saved_ruleset_interval() {
+	let uci = cursor();
+	uci.load('zarap');
+	let raw = uci.get('zarap', 'main', 'ruleset_interval');
+	if (raw == null)
+		return RULESET_INTERVAL_DEFAULT;
+	let value = lc(trim('' + raw));
+	return (value == '' || value == 'off') ? '' : value;
 }
 
 // Резолвер для адреса сервера. Конфигурация, написанная до появления настройки,
@@ -2048,7 +2091,7 @@ function fetch_assets(assets, outbounds, detour, bootstrap, force) {
 	return { ok: true, downloaded: length(pending) };
 }
 
-function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns, dry_run) {
+function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour, ruleset_interval, bootstrap, resolve_all, tunnel_dns, dry_run) {
 	let lan = lan_device();
 	// A redirect without an interface condition would capture traffic arriving
 	// from the WAN, so an unanswered ubus has to fail the apply outright.
@@ -2077,7 +2120,7 @@ function validate_candidate(outbounds, rules, final, clients, proxying, rulesets
 
 	mkdir('/etc/zarap');
 	chmod('/etc/zarap', 0700);
-	let xray = sprintf('%J', xray_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns, skip_assets)) + '\n';
+	let xray = sprintf('%J', xray_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns, skip_assets, ruleset_interval)) + '\n';
 	let nft = nft_config(guarded, lan, proxying);
 	let config_written = writefile(CONFIG_TMP, xray);
 	let nft_written = writefile(NFT_TMP, nft);
@@ -2268,6 +2311,9 @@ function validate_request(args, enabled) {
 	let detour_result = validate_ruleset_detour(args?.ruleset_detour, tags);
 	if (!detour_result.ok)
 		return detour_result;
+	let interval_result = validate_ruleset_interval(args?.ruleset_interval);
+	if (!interval_result.ok)
+		return interval_result;
 	// Разбирается здесь, а не в генераторе: неверный адрес должен назваться
 	// ошибкой ввода на странице, а не уехать в конфиг и упасть запуском.
 	let bootstrap_result = parse_bootstrap(args?.bootstrap_dns);
@@ -2323,7 +2369,8 @@ function validate_request(args, enabled) {
 
 	return { ok: true, outbounds: outbounds, rules: rules, final: final,
 		clients: client_result.clients, rulesets: ruleset_result.rulesets,
-		ruleset_detour: detour_result.detour, bootstrap_dns: bootstrap_result.value,
+		ruleset_detour: detour_result.detour, ruleset_interval: interval_result.interval,
+		bootstrap_dns: bootstrap_result.value,
 		resolve_all: resolve_all, tunnel_dns: tunnel_result.value };
 }
 
@@ -2361,13 +2408,14 @@ function apply_configuration(args) {
 
 	let candidate = validate_candidate(request.outbounds, request.rules, request.final,
 		request.clients, enabled, request.rulesets, request.ruleset_detour,
-		request.bootstrap_dns, request.resolve_all, request.tunnel_dns, !enabled);
+		request.ruleset_interval, request.bootstrap_dns, request.resolve_all,
+		request.tunnel_dns, !enabled);
 	if (!candidate.ok)
 		return candidate;
 	let uci_candidate = prepare_uci_candidate(request.outbounds, request.rules,
 		request.final, enabled, request.clients, request.rulesets,
-		request.ruleset_detour, request.bootstrap_dns, request.resolve_all,
-		request.tunnel_dns);
+		request.ruleset_detour, request.ruleset_interval, request.bootstrap_dns,
+		request.resolve_all, request.tunnel_dns);
 	if (!uci_candidate.ok) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
 		return uci_candidate;
@@ -2704,7 +2752,6 @@ function status() {
 			url: ruleset.url,
 			kind: ruleset.kind,
 			category: ruleset.category,
-			update_interval: ruleset.update_interval,
 			in_use: !!sets_in_use[ruleset.tag]
 		});
 
@@ -2738,6 +2785,7 @@ function status() {
 		rulesets: listed_sets,
 		ruleset_detour: ruleset_detour,
 		ruleset_detour_missing: ruleset_detour_missing,
+		ruleset_interval: saved_ruleset_interval(),
 		bootstrap_dns: saved_bootstrap(),
 		resolve_all: saved_resolve_all(),
 		tunnel_dns: saved_tunnel_dns(),
@@ -2973,8 +3021,8 @@ function update_component(name) {
 const methods = {
 	status: { call: function() { return status(); } },
 	validate: {
-		args: { outbounds: [], rules: [], rulesets: [], ruleset_detour: '', bootstrap_dns: '',
-			resolve_all: true, tunnel_dns: '', clients: [], final: '' },
+		args: { outbounds: [], rules: [], rulesets: [], ruleset_detour: '', ruleset_interval: '',
+			bootstrap_dns: '', resolve_all: true, tunnel_dns: '', clients: [], final: '' },
 		call: function(request) {
 			let checked = validate_request(request.args || {}, true);
 			if (!checked.ok) return checked;
@@ -2982,13 +3030,13 @@ const methods = {
 			if (!conflict.ok) return conflict;
 			let candidate = validate_candidate(checked.outbounds, checked.rules,
 				checked.final, checked.clients, true, checked.rulesets,
-				checked.ruleset_detour, checked.bootstrap_dns, checked.resolve_all,
-				checked.tunnel_dns, true);
+				checked.ruleset_detour, checked.ruleset_interval, checked.bootstrap_dns,
+				checked.resolve_all, checked.tunnel_dns, true);
 			if (!candidate.ok) return candidate;
 			let uci_candidate = prepare_uci_candidate(checked.outbounds, checked.rules,
 				checked.final, true, checked.clients, checked.rulesets,
-				checked.ruleset_detour, checked.bootstrap_dns, checked.resolve_all,
-				checked.tunnel_dns);
+				checked.ruleset_detour, checked.ruleset_interval, checked.bootstrap_dns,
+				checked.resolve_all, checked.tunnel_dns);
 			unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK); cleanup_uci_candidate();
 			if (!uci_candidate.ok) return uci_candidate;
 			return {
@@ -3003,7 +3051,8 @@ const methods = {
 	},
 	apply: {
 		args: { enabled: true, outbounds: [], rules: [], rulesets: [], ruleset_detour: '',
-			bootstrap_dns: '', resolve_all: true, tunnel_dns: '', clients: [], final: '' },
+			ruleset_interval: '', bootstrap_dns: '', resolve_all: true, tunnel_dns: '',
+			clients: [], final: '' },
 		call: function(request) {
 			let lock = acquire_lock();
 			if (!lock) return result_error('Другая операция Zarap уже выполняется');

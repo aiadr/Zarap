@@ -28,7 +28,8 @@ async function openMaintenance(page) {
 // все позиции за собой, и тест ломается там, где ничего не менялось. Порядок
 // один в один повторяет объявление rpc в overview.js.
 const APPLY_ARGS = ['enabled', 'outbounds', 'rules', 'rulesets', 'ruleset_detour',
-                    'bootstrap_dns', 'resolve_all', 'tunnel_dns', 'clients', 'final'];
+                    'ruleset_interval', 'bootstrap_dns', 'resolve_all', 'tunnel_dns',
+                    'clients', 'final'];
 
 function applyArgs(call) {
   return Object.fromEntries(APPLY_ARGS.map((name, index) => [name, call.args[index]]));
@@ -293,9 +294,10 @@ test('shows conditions by destination and hands them back untouched', async ({ p
       rulesets: [
         { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/geosite.dat',
           kind: 'geosite', category: 'category-ads-all',
-          update_interval: '1d', in_use: true }
+          in_use: true }
       ],
       ruleset_detour: 'direct',
+      ruleset_interval: '1d',
       rules: [
         { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
           rule_sets: ['rs_1'], ip_cidr: ['149.154.160.0/20'],
@@ -325,10 +327,10 @@ test('shows conditions by destination and hands them back untouched', async ({ p
   const sent = applyArgs(calls.find(call => call.method === 'apply'));
   expect(sent.rulesets).toEqual([
     { tag: 'rs_1', label: 'Реклама', url: 'https://example.org/geosite.dat',
-      kind: 'geosite', category: 'category-ads-all',
-      update_interval: '1d' }
+      kind: 'geosite', category: 'category-ads-all' }
   ]);
   expect(sent.ruleset_detour).toEqual('direct');
+  expect(sent.ruleset_interval).toEqual('1d');
   expect(sent.rules).toEqual([
     { clients: ['00:11:22:33:44:55'], domains: ['youtube.com'],
       rule_sets: ['rs_1'], ip_cidr: ['149.154.160.0/20'],
@@ -406,10 +408,10 @@ test('adds a rule set and points a rule at it', async ({ page }) => {
   const added = page.locator('tr[data-ruleset="rs_2"]');
   await expect(added).toContainText('Заблокированное');
   await expect(added).toContainText('geosite:ru-blocked');
-  // Подключение выбирается один раз на все списки, а не в строке списка: в
-  // фикстуре оно уже выбрано, и добавленный список едет через него же.
+  // Подключение и расписание выбираются один раз на все списки, а не в строке списка.
   await expect(added).not.toContainText('Нидерланды');
   await expect(page.locator('#zarap-ruleset-detour')).toHaveValue('out_1');
+  await expect(page.locator('#zarap-ruleset-interval')).toHaveValue('1d');
 
   // Ничего не ушло на роутер: список уезжает вместе с применением.
   let calls = await page.evaluate(() => window.__rpcCalls);
@@ -428,31 +430,35 @@ test('adds a rule set and points a rule at it', async ({ page }) => {
   const apply = applyArgs(calls.find(call => call.method === 'apply'));
   expect(apply.rulesets).toContainEqual({
     tag: 'rs_2', label: 'Заблокированное', url: 'https://example.org/geosite.dat',
-    kind: 'geosite', category: 'ru-blocked',
-    update_interval: '1d'
+    kind: 'geosite', category: 'ru-blocked'
   });
   expect(apply.ruleset_detour).toEqual('out_1');
+  expect(apply.ruleset_interval).toEqual('1d');
   expect(apply.rules[1].rule_sets).toEqual(['rs_2']);
 });
 
-test('picks the download connection once for every list', async ({ page }) => {
-  // Раньше подключение стояло у каждого списка, и десять списков означали
-  // десять раз один и тот же ответ. Теперь выбор один, и уезжает он один.
+test('picks the download connection and schedule once for every list', async ({ page }) => {
+  // Подключение и расписание автообновления у geodata в xray-core общие на все
+  // списки: в таблице списков этих колонок нет, оба выбора лежат под таблицей.
   await openZarap(page);
 
   const detour = page.locator('#zarap-ruleset-detour');
+  const interval = page.locator('#zarap-ruleset-interval');
   await expect(detour).toHaveValue('out_1');
-  // В строке списка подключения больше нет: колонки с ним не осталось.
+  await expect(interval).toHaveValue('1d');
   await expect(page.locator('#zarap-rulesets thead')).not.toContainText('Скачивать через');
+  await expect(page.locator('#zarap-rulesets thead')).not.toContainText('Обновлять');
 
   await detour.selectOption('direct');
+  await interval.selectOption('12h');
   await page.getByRole('button', { name: 'Сохранить и применить' }).click();
   await expect(page.getByText('Конфигурация применена')).toBeVisible();
 
   const calls = await page.evaluate(() => window.__rpcCalls);
   const apply = applyArgs(calls.find(call => call.method === 'apply'));
   expect(apply.ruleset_detour).toEqual('direct');
-  expect(apply.rulesets.every(ruleset => !('detour' in ruleset))).toBe(true);
+  expect(apply.ruleset_interval).toEqual('12h');
+  expect(apply.rulesets.every(ruleset => !('detour' in ruleset) && !('update_interval' in ruleset))).toBe(true);
 });
 
 test('names the host that would not resolve, next to the field that fixes it', async ({ page }) => {

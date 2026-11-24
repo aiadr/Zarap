@@ -10,7 +10,7 @@ describe('dnsmasq_takeover', { skip: !ucode && 'no ucode interpreter available' 
 		'const DNS_PORT', 'const DNS_FORWARD', 'const DNS_TAKEOVER'
 	]);
 	const prelude = `${constants}\n${liftMany(source, [
-		'dns_routes', 'dnsmasq_take_over', 'dnsmasq_hand_back', 'configure_dnsmasq'
+		'dns_routes', 'dns_domain_tags', 'dnsmasq_take_over', 'dnsmasq_hand_back', 'configure_dnsmasq'
 	])}`;
 
 	function runUci(store, rules, enabled, resolveAll) {
@@ -61,16 +61,41 @@ function dnsmasq_section() { return 'cfg01'; }
 		assert.deepEqual(twice['zarap.main.saved_dns_server'], ['8.8.8.8']);
 	});
 
-	test('switching zarap off hands dns back', () => {
-		const taken = runUci({ 'dhcp.cfg01.server': ['8.8.8.8'] }, [], true, true);
-		const off = runUci({ ...taken }, [], false, true);
+	test('switching zarap off hands dns back and clears domain forwarding', () => {
+		const rules = [
+			{ domains: ['youtube.com'], target: 'out_1' },
+			{ domains: ['example.com'], target: 'out_2' }
+		];
+		const taken = runUci({ 'dhcp.cfg01.server': ['8.8.8.8'] }, rules, true, true);
+		assert.deepEqual(taken['dhcp.cfg01.server'], [
+			'127.0.0.1#5353',
+			'/youtube.com/127.0.0.1#5353',
+			'/example.com/127.0.0.1#5354'
+		]);
+		const off = runUci({ ...taken }, rules, false, true);
 		assert.deepEqual(off['dhcp.cfg01.server'], ['8.8.8.8']);
+
+		const scoped = runUci({ 'dhcp.cfg01.server': ['8.8.8.8'] }, rules, true, false);
+		assert.deepEqual(scoped['dhcp.cfg01.server'], [
+			'8.8.8.8',
+			'/youtube.com/127.0.0.1#5353',
+			'/example.com/127.0.0.1#5354'
+		]);
+		const scopedOff = runUci({ ...scoped }, rules, false, false);
+		assert.deepEqual(scopedOff['dhcp.cfg01.server'], ['8.8.8.8']);
 	});
 
-	test('without the mode only the named domains are forwarded', () => {
-		const rules = [{ domains: ['youtube.com'], target: 'out_1' }];
+	test('without the mode only the named domains are forwarded per outbound port', () => {
+		const rules = [
+			{ domains: ['youtube.com'], target: 'out_1' },
+			{ domains: ['.example.com'], target: 'out_2' }
+		];
 		const result = runUci({ 'dhcp.cfg01.server': ['8.8.8.8'] }, rules, true, false);
-		assert.deepEqual(result['dhcp.cfg01.server'], ['8.8.8.8', '/youtube.com/127.0.0.1#5353']);
+		assert.deepEqual(result['dhcp.cfg01.server'], [
+			'8.8.8.8',
+			'/youtube.com/127.0.0.1#5353',
+			'/example.com/127.0.0.1#5354'
+		]);
 		assert.equal('dhcp.cfg01.noresolv' in result, false);
 	});
 });
