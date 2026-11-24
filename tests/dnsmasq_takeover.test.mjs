@@ -96,6 +96,52 @@ function dnsmasq_section() { return 'cfg01'; }
 			'/youtube.com/127.0.0.1#5353',
 			'/example.com/127.0.0.1#5354'
 		]);
+		assert.deepEqual(result['zarap.main.managed_dns_servers'], [
+			'/youtube.com/127.0.0.1#5353',
+			'/example.com/127.0.0.1#5354'
+		]);
 		assert.equal('dhcp.cfg01.noresolv' in result, false);
+	});
+
+	test('preserves foreign dnsmasq entries on ports 5354-5399 across enable, takeover, and disable', () => {
+		const initial = {
+			'dhcp.cfg01.server': ['8.8.8.8', '/corp.test/127.0.0.1#5355', '/lab.test/127.0.0.1#5354']
+		};
+		// Disabled with empty rules must never touch foreign 127.0.0.1#5355 or #5354
+		const idle = runUci({ ...initial }, [], false, false);
+		assert.deepEqual(idle['dhcp.cfg01.server'], initial['dhcp.cfg01.server']);
+		assert.equal('zarap.main.managed_dns_servers' in idle, false);
+
+		// Scoped apply with two outbounds adds exact Zarap entries and remembers them
+		const rules = [
+			{ domains: ['youtube.com'], target: 'out_1' },
+			{ domains: ['example.com'], target: 'out_2' }
+		];
+		const scoped = runUci({ ...idle }, rules, true, false);
+		assert.deepEqual(scoped['dhcp.cfg01.server'], [
+			'8.8.8.8',
+			'/corp.test/127.0.0.1#5355',
+			'/lab.test/127.0.0.1#5354',
+			'/youtube.com/127.0.0.1#5353',
+			'/example.com/127.0.0.1#5354'
+		]);
+		assert.deepEqual(scoped['zarap.main.managed_dns_servers'], [
+			'/youtube.com/127.0.0.1#5353',
+			'/example.com/127.0.0.1#5354'
+		]);
+
+		// Switching to resolve_all then disabling removes only Zarap's exact entries
+		const taken = runUci({ ...scoped }, rules, true, true);
+		const disabled = runUci({ ...taken }, rules, false, true);
+		assert.deepEqual(disabled['dhcp.cfg01.server'], initial['dhcp.cfg01.server']);
+		assert.equal('zarap.main.managed_dns_servers' in disabled, false);
+	});
+
+	test('legacy cleanup without managed_dns_servers only removes port 5353', () => {
+		const before = {
+			'dhcp.cfg01.server': ['8.8.8.8', '/old.example/127.0.0.1#5353', '/corp.test/127.0.0.1#5355']
+		};
+		const cleaned = runUci({ ...before }, [], false, false);
+		assert.deepEqual(cleaned['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5355']);
 	});
 });

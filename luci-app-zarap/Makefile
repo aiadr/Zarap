@@ -50,12 +50,19 @@ if [ -n "$$section" ]; then
 			done
 		fi
 	done
-	# Пересылка названных доменов на наши DNS-слушатели (5353..5399): своими
-	# считаются строки, указывающие на них, чужие остаются нетронутыми.
-	uci -q get "dhcp.$$section.server" | tr ' ' '\n' | grep -E '127\.0\.0\.1#53(5[3-9]|[6-9][0-9])$$' |
-	while read -r entry; do
-		[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
-	done
+	# Удаляем только точные строки пересылки, добавленные самим Zarap
+	# (записанные в zarap.main.managed_dns_servers); для установок без этого
+	# поля чистится только базовый порт 127.0.0.1#5353, чужие порты не трогаются.
+	if managed="$$(uci -q get zarap.main.managed_dns_servers)"; then
+		for entry in $$managed; do
+			[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
+		done
+	else
+		uci -q get "dhcp.$$section.server" | tr ' ' '\n' | grep -E '(^|/)127\.0\.0\.1#5353$$' |
+		while read -r entry; do
+			[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
+		done
+	fi
 fi
 uci -q commit dhcp
 /etc/init.d/dnsmasq reload 2>/dev/null

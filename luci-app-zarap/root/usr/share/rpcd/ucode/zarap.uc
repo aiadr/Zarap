@@ -1477,15 +1477,28 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all) {
 	}
 	dnsmasq_hand_back(uci, section);
 
+	let prev_raw = uci.get('zarap', 'main', 'managed_dns_servers');
+	let legacy_cleanup = (prev_raw == null);
+	if (type(prev_raw) != 'array')
+		prev_raw = prev_raw ? [prev_raw] : [];
+	let owned = {};
+	for (let entry in prev_raw)
+		owned['' + entry] = true;
+
 	let raw = uci.get('dhcp', section, 'server');
 	if (type(raw) != 'array')
 		raw = raw ? [raw] : [];
-	// Чужие строки остаются как есть, свои переписываются целиком: они целиком
-	// выводятся из правил, и сверять их по одной незачем.
+	// Чужие строки (включая сторонние локальные DNS на соседних портах) остаются
+	// нетронутыми: удаляются только точные записи, ранее добавленные самим Zarap.
 	let kept = [];
-	for (let entry in raw)
-		if (!match('' + entry, /127\.0\.0\.1#53(5[3-9]|[6-9][0-9])$/))
-			push(kept, '' + entry);
+	for (let entry in raw) {
+		let text = '' + entry;
+		if (owned[text])
+			continue;
+		if (legacy_cleanup && (text == DNS_FORWARD || match(text, /^\/[^\/]+\/127\.0\.0\.1#5353$/)))
+			continue;
+		push(kept, text);
+	}
 
 	for (let entry in forwarded)
 		push(kept, entry);
@@ -1494,6 +1507,11 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all) {
 		uci.set('dhcp', section, 'server', kept);
 	else
 		uci.delete('dhcp', section, 'server');
+
+	if (length(forwarded))
+		uci.set('zarap', 'main', 'managed_dns_servers', forwarded);
+	else
+		uci.delete('zarap', 'main', 'managed_dns_servers');
 }
 
 function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, ruleset_interval, bootstrap, resolve_all, tunnel_dns) {
