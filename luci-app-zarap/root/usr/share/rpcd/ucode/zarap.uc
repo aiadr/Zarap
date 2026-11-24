@@ -2,32 +2,30 @@
 
 'use strict';
 
-import { access, chmod, mkdir, open, popen, readfile, rename, stat, unlink, writefile } from 'fs';
+import { access, chmod, lsdir, mkdir, open, popen, readfile, rename, stat, unlink, writefile } from 'fs';
 import { urldecode, urldecode_params } from 'luci.http';
 import { connect } from 'ubus';
 import { cursor } from 'uci';
 
-const CONFIG = '/etc/zarap/sing-box.json';
-// Where sing-box keeps the rule sets it downloads. On a persistent partition on
-// purpose: in /tmp every reboot would send it back to the network for lists
-// that had already been fetched.
-const CACHE_FILE = '/etc/zarap/cache.db';
-// Куда кэш отодвигается на время принудительного обновления. Переименование, а
-// не копия: лишнего места на flash оно не просит, а вернуть кэш на место —
-// единственный способ пережить обновление, при котором источник оказался
-// недоступен и без кэша служба уже не поднимается.
-const CACHE_BACKUP = '/etc/zarap/cache.db.bak';
-const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp';
+const CONFIG = '/etc/zarap/xray.json';
+// Каталог, в котором лежат .dat-файлы списков (XRAY_LOCATION_ASSET). На
+// постоянном разделе, чтобы переживать перезагрузку; xray обновляет файлы
+// через встроенный блок geodata и горячо перечитывает их без рестарта.
+const ASSETS_DIR = '/etc/zarap/assets';
+const ASSETS_BACKUP_DIR = '/etc/zarap/.assets.bak';
+const CONFIG_TMP = '/etc/zarap/.xray.json.tmp';
+const FETCH_CONFIG_TMP = '/tmp/zarap-fetch-xray.json';
+const FETCH_SOCKS_PORT = 17893;
 const NFT_CONFIG = '/etc/nftables.d/90-zarap.nft';
 const NFT_TMP = '/etc/nftables.d/.90-zarap.nft.tmp';
 const NFT_CHECK = '/tmp/zarap-nft-check.conf';
 const NFT_SYNC = '/tmp/zarap-nft-sync.conf';
 const UCI_CANDIDATE = '/etc/config/.zarap-candidate';
 const UCI_CANDIDATE_DELTA = '/tmp/.zarap-uci';
-const UCI_CONFIGS = ['zarap', 'dhcp', 'sing-box'];
-const COMPONENTS = { 'luci-app-zarap': true, 'sing-box': true };
+const UCI_CONFIGS = ['zarap', 'dhcp', 'xray'];
+const COMPONENTS = { 'luci-app-zarap': true, 'xray-core': true };
 const LOCK_FILE = '/var/lock/zarap.lock';
-// Seconds a freshly started sing-box gets to open its TProxy port. Kept well
+// Seconds a freshly started xray gets to open its TProxy port. Kept well
 // inside the LuCI RPC deadline.
 const LISTENER_WAIT = 5;
 
@@ -40,47 +38,24 @@ const MARK = '0x5a52';
 const ROUTE_TABLE = 2022;
 const INBOUND_TAG = 'zarap-tproxy';
 // DNS-слушатель для доменов, названных правилами: dnsmasq пересылает их сюда,
-// sing-box резолвит их через то же подключение, куда отправляет трафик.
+// xray резолвит их через то же подключение, куда отправляет трафик.
 const DNS_TAG = 'zarap-dns';
 const DNS_PORT = 5353;
-// Резолвер, к которому sing-box идёт через подключение. Константа, а не
-// настройка: выбор здесь ничего не решает, потому что запрос всё равно уходит
-// внутри туннеля, а лишняя ручка требует объяснения, чем один адрес лучше.
+const DNS_OUT_TAG = 'dns-out';
 const DNS_UPSTREAM = '1.1.1.1';
-// Резолвер для имён, которые роутер набирает сам: адрес сервера из ссылки и
-// хост, откуда качается список. Он не может ходить через подключение — чтобы
-// поднять подключение, пришлось бы сперва резолвить его же адрес через него.
-// Поэтому bootstrap идёт мимо туннеля, и detour у него не указан: sing-box
-// дозванивается напрямую, а `detour: "direct"` отвергает прямым текстом
-// («detour to an empty direct outbound makes no sense»).
 const BOOTSTRAP_TAG = 'dns_bootstrap';
-// А вот здесь выбор решает всё, поэтому это настройка, а не константа: DoH до
-// 1.1.1.1 закрывают ровно те провайдеры, ради которых Zarap и ставят, и тогда
-// имя сервера не разрешается вовсе — подставить свой резолвер больше нечем.
-//
-// Умолчанием стоит `local` — резолвер самого роутера. DoH к 1.1.1.1, стоявший
-// здесь до того, оказался умолчанием, которое не работает ровно там, ради чего
-// пакет и написан: на живой установке имя сервера не разрешалось, и выглядело
-// это как тишина. `local` не требует, чтобы наружу был доступен чей-то
-// конкретный адрес: он работает везде, где у роутера вообще есть DNS.
-//
-// Цена названа честно и в 7.6: `local` — это ответ провайдера, открытый и
-// подменяемый, тогда как DoH прятал имя сервера от него же. Кому важнее второе,
-// ставит `https://…` руками; умолчание выбирает работоспособность.
 const BOOTSTRAP_DEFAULT = 'local';
-// Схема выбирает не адрес, а то, что уедет в сеть: https и tls запрос
-// шифруют, udp и tcp — нет. `local` отдаёт резолв самому роутеру.
-const BOOTSTRAP_SCHEMES = { https: true, tls: true, udp: true, tcp: true };
-// Резолвер, к которому sing-box идёт через подключение. Тоже настройка, и по
-// той же причине, по которой ею стал bootstrap: «этот адрес работает всегда» —
-// утверждение о чужой сети, а не о своей. Запрос отсюда выходит с того конца
-// туннеля, так что риск другой, но не нулевой: у чужого провайдера Cloudflare
-// точно так же может быть закрыт или подменён.
-const TUNNEL_DEFAULT = 'https://' + DNS_UPSTREAM;
+// Встроенный DNS xray-core поддерживает DoH (https://), TCP (tcp://) и UDP (udp://),
+// плюс local (localhost). DoT (tls://) встроенный DNS xray не поддерживает.
+const BOOTSTRAP_SCHEMES = { https: true, udp: true, tcp: true };
+const TUNNEL_DEFAULT = 'https://' + DNS_UPSTREAM + '/dns-query';
 
-// Outbound section names double as sing-box tags, so they have to stay clear of
-// the tags sing-box gives its own meanings.
-const RESERVED_TAGS = { direct: true, block: true, dns: true, main: true, [INBOUND_TAG]: true, [DNS_TAG]: true };
+// Outbound section names double as xray tags, so they have to stay clear of
+// the tags Zarap and xray give their own meanings.
+const RESERVED_TAGS = {
+	direct: true, block: true, dns: true, [DNS_OUT_TAG]: true, main: true,
+	[INBOUND_TAG]: true, [DNS_TAG]: true, [BOOTSTRAP_TAG]: true
+};
 
 function result_error(message, details, kind) {
 	return { ok: false, error: message, details: details || '', kind: kind || 'operation_error' };
@@ -142,7 +117,7 @@ function is_domain(value) {
 	return text != '' && !valid_ipv4(text) && index(text, ':') < 0;
 }
 
-// A destination range as sing-box wants it: a bare address is its own /32, and
+// A destination range as xray-core wants it: a bare address is its own /32, and
 // a prefix keeps whatever mask it came with. IPv6 is refused by name rather than
 // by the generic "некорректный": it is not routed and not handed out, so an
 // entry for it would sit in the configuration doing nothing.
@@ -164,7 +139,7 @@ function normalize_cidr(value) {
 
 // A domain as the user writes it. `example.com` means the name and everything
 // under it, `.example.com` means the subdomains alone; the generator turns one
-// entry into the two fields sing-box wants. Keyword and regex matching are not
+// entry into `domain:` or `regexp:` as xray-core wants. Keyword matching is not
 // offered: half the internet lives inside a substring of the other half.
 function normalize_domain(value) {
 	let text = lc(trim('' + (value || '')));
@@ -430,10 +405,10 @@ function valid_ruleset_tag(tag) {
 	return !!match(tag || '', /^rs_[0-9]+$/);
 }
 
-// A ruleset section describes what sing-box should fetch: where from and how
-// often. Through what is not here — that is one choice for every list, kept in
-// main.ruleset_detour. Zarap keeps no copy of the file and knows nothing about
-// its contents, so what can be checked here is exactly these two things.
+// Секция ruleset описывает .dat-файл и категорию (тег) внутри него, которые
+// использует xray-core (geosite для доменов, geoip для IP). Автообновление
+// делает встроенный модуль geodata самого xray (требует HTTPS и расширение .dat),
+// а через какое подключение качать — выбирается один раз в main.ruleset_detour.
 function validate_rulesets(input) {
 	if (input == null)
 		input = [];
@@ -450,13 +425,18 @@ function validate_rulesets(input) {
 		taken[tag] = true;
 
 		let url = trim('' + (entry?.url || ''));
-		// Скачивает sing-box, а не Zarap, поэтому доступность адреса здесь не
-		// проверить: она выяснится на запуске службы, где уже есть откат.
-		// Печатаемый ASCII без пробелов — всё, что здесь можно проверить, не
-		// переписывая разбор URL. POSIX-класс со скобками внутри писать нельзя:
-		// `]` закрывает класс, и выражение молча перестаёт совпадать с чем-либо.
-		if (!match(url, /^https?:\/\/[!-~]+$/))
-			return input_error('Адрес набора ' + tag + ' должен начинаться с http:// или https://');
+		// Модуль geodata в xray-core принимает только https:// (http://
+		// отклоняется на сборке конфигурации).
+		if (!match(url, /^https:\/\/[!-~]+$/))
+			return input_error('Адрес набора ' + tag + ' должен начинаться с https://');
+
+		let kind = lc(trim('' + (entry?.kind || 'geosite')));
+		if (kind != 'geosite' && kind != 'geoip')
+			return input_error('Тип набора ' + tag + ' должен быть geosite (домены) или geoip (IP)');
+
+		let category = lc(trim('' + (entry?.category || '')));
+		if (!match(category, /^[a-z0-9_!@.-]{1,64}$/))
+			return input_error('Укажите категорию (тег) внутри .dat-файла для набора ' + tag + ', например youtube или ru-blocked');
 
 		let interval = lc(trim('' + (entry?.update_interval || '')));
 		if (interval != '' && !match(interval, /^[0-9]{1,4}[hd]$/))
@@ -466,16 +446,17 @@ function validate_rulesets(input) {
 		if (length(label) > 64)
 			label = trim(substr(label, 0, 64));
 
-		push(result, { tag: tag, label: label, url: url,
-			update_interval: interval });
+		push(result, {
+			tag: tag, label: label, url: url,
+			kind: kind, category: category,
+			update_interval: interval
+		});
 	}
 	return { ok: true, rulesets: result };
 }
 
-// Через что качать — один выбор на все списки сразу. Источники .srs
-// заблокированы там же, где и всё остальное, поэтому ответ у них общий, и
-// спрашивать его на каждый список значило бы повторять одно и то же решение
-// столько раз, сколько списков заведено.
+// Через что качать — один выбор на все списки сразу. В xray-core у блока
+// geodata ровно одно поле outbound на все assets.
 function validate_ruleset_detour(value, tags) {
 	let detour = trim('' + (value || ''));
 	if (detour == '')
@@ -485,36 +466,19 @@ function validate_ruleset_detour(value, tags) {
 	return { ok: true, detour: detour };
 }
 
-// Bootstrap-резолвер в том виде, в каком его пишет пользователь, и в том, в
-// каком его ждёт sing-box. Схема обязательна не из педантизма: от неё зависит,
-// уедет запрос шифрованным или открытым, а угадывать это за пользователя
-// нельзя. Голый адрес читается как udp — открытый запрос, который работает
-// везде, и именно за ним сюда приходят, когда DoH закрыт.
-//
-// Имя вместо адреса не принимается, и это не придирка: sing-box отказывается
-// стартовать с DNS-сервером, заданным именем, — `missing domain resolver for
-// domain server address`. Резолвить это имя было бы нечем, кроме резолвера,
-// который оно и задаёт.
-//
-// Но у шифрованных схем имя всё же нужно — второе, для сертификата: DoT и DoH
-// по голому адресу проверяются только тогда, когда в сертификате есть IP SAN,
-// а он есть далеко не у всех резолверов. Хвост `#имя` разводит эти два имени:
-// звонок идёт по адресу, проверка — по имени. Форма не выдумана: так же
-// пишется резолвер в systemd-resolved (`DNS=1.1.1.1#cloudflare-dns.com`) и в
-// unbound, и адрес в ней стоит первым — тем, чем резолвер и является.
+// Разбор DNS-резолвера в форму, понятную генератору xray-core.
+// Поддерживаются https:// (DoH), tcp://, udp:// (голый IPv4 читается как udp://)
+// и local (только для bootstrap). DoT (tls://) и #server_name встроенный DNS
+// xray-core не поддерживает, а домен вместо IPv4 создал бы петлю резолва.
 function parse_resolver(value, fallback, allow_local, label) {
 	let text = trim('' + (value || ''));
 	if (text == '')
 		text = fallback;
-	// Резолв отдан роутеру: /etc/resolv.conf, то есть dnsmasq и апстрим
-	// провайдера. Имени сервера это обычно хватает, а адреса не требует вовсе.
-	// Тег обязателен и здесь: на него ссылается route.default_domain_resolver,
-	// и сервер без тега этой ссылкой не находится.
 	if (lc(text) == 'local') {
 		if (!allow_local)
 			return input_error(label + ': local здесь не имеет смысла — резолвер спрашивается ' +
 				'через подключение, а local читает /etc/resolv.conf роутера');
-		return { ok: true, value: 'local', server: { type: 'local' } };
+		return { ok: true, value: 'local', scheme: 'local', host: '', port: 0, path: '' };
 	}
 
 	let scheme = 'udp', rest = text;
@@ -523,23 +487,14 @@ function parse_resolver(value, fallback, allow_local, label) {
 		scheme = lc(substr(text, 0, mark));
 		rest = substr(text, mark + 3);
 	}
+	if (scheme == 'tls')
+		return input_error(label + ': DoT (tls://) не поддерживается встроенным DNS xray-core; используйте https:// (DoH), tcp:// или udp://');
 	if (!BOOTSTRAP_SCHEMES[scheme])
 		return input_error(label + ': неизвестный протокол ' + scheme +
-			'://; допустимы https, tls, udp, tcp и local');
+			'://; допустимы https, udp, tcp и local');
 
-	// Имя для сертификата — хвостом, как фрагмент в URL: оно и правда не часть
-	// адреса, а примечание к нему.
-	let server_name = '';
-	let hash = rindex(rest, '#');
-	if (hash >= 0) {
-		server_name = substr(rest, hash + 1);
-		rest = substr(rest, 0, hash);
-		if (scheme != 'https' && scheme != 'tls')
-			return input_error(label + ': имя для сертификата есть только у https:// и tls://, ' +
-				'а здесь ' + scheme + '://: открытый запрос ничего не проверяет');
-		if (!match(server_name, /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/))
-			return input_error(label + ': некорректное имя для сертификата: ' + (server_name || '—'));
-	}
+	if (index(rest, '#') >= 0)
+		return input_error(label + ': хвост #имя не поддерживается встроенным DNS xray-core; укажите IPv4-адрес резолвера с поддержкой IP SAN (например https://1.1.1.1/dns-query)');
 
 	let path = '';
 	let slash = index(rest, '/');
@@ -549,11 +504,11 @@ function parse_resolver(value, fallback, allow_local, label) {
 	}
 	if (path == '/')
 		path = '';
-	// Путь есть только у DoH; у остальных схем его некуда девать, и молча
-	// выбросить его значило бы принять адрес, которым пользователь не
-	// пользуется.
 	if (path != '' && scheme != 'https')
 		return input_error(label + ': путь есть только у https://, а здесь ' + scheme + '://');
+	// xray-core требует явный путь для DoH (например /dns-query).
+	if (scheme == 'https' && path == '')
+		path = '/dns-query';
 
 	let host = rest, port = 0;
 	let colon = rindex(rest, ':');
@@ -568,37 +523,55 @@ function parse_resolver(value, fallback, allow_local, label) {
 		return input_error(label + ': IPv6-адрес не поддерживается — наружу Zarap ходит по IPv4');
 	if (!valid_ipv4(host))
 		return input_error(label + ': нужен IPv4-адрес, а не имя ' + (host || '—') +
-			': sing-box не стартует с резолвером, заданным именем — резолвить это имя было бы ' +
-			'нечем. Для сертификата имя дописывается к адресу: ' + scheme + '://адрес#имя');
+			': резолвер, заданный именем, создаёт петлю резолва');
 
-	let server = { type: scheme, server: host };
-	if (port)
-		server.server_port = port;
-	if (path != '')
-		server.path = path;
-	// `enabled: true` обязателен, и это не формальность: без него блок tls
-	// принимается `check`, молча игнорируется на запуске, и проверка идёт по
-	// адресу — то есть ровно то, ради чего имя и указывали, не происходит.
-	if (server_name != '')
-		server.tls = { enabled: true, server_name: server_name };
-	return { ok: true,
-		value: scheme + '://' + host + (port ? ':' + port : '') + path +
-			(server_name != '' ? '#' + server_name : ''),
-		server: server };
+	return {
+		ok: true,
+		value: scheme + '://' + host + (port ? ':' + port : '') + path,
+		scheme: scheme,
+		host: host,
+		port: port,
+		path: path
+	};
 }
 
-// Резолвер адреса сервера: ходит мимо туннеля, поэтому `local` ему разрешён —
-// это резолвер самого роутера, и он же умолчание.
+// Собирает объект DnsServerObject для xray-core из разобранного резолвера.
+// local_mode=true использует +local-схемы (обход routing.rules напрямую); для
+// обычного udp у xray нет udp+local, поэтому он получает tag и правило в direct.
+function xray_dns_server(parsed, local_mode, tag, domains, strict) {
+	let obj = {};
+	if (parsed.scheme == 'local') {
+		obj.address = 'localhost';
+	}
+	else if (parsed.scheme == 'https') {
+		let proto = local_mode ? 'https+local://' : 'https://';
+		obj.address = proto + parsed.host + (parsed.port ? ':' + parsed.port : '') + parsed.path;
+	}
+	else if (parsed.scheme == 'tcp') {
+		let proto = local_mode ? 'tcp+local://' : 'tcp://';
+		obj.address = proto + parsed.host + (parsed.port ? ':' + parsed.port : '');
+	}
+	else {
+		obj.address = parsed.host;
+		if (parsed.port)
+			obj.port = parsed.port;
+	}
+
+	if (tag && (!local_mode || parsed.scheme == 'udp'))
+		obj.tag = tag;
+	if (length(domains || []))
+		obj.domains = domains;
+	if (strict) {
+		obj.skipFallback = true;
+		obj.finalQuery = true;
+	}
+	return obj;
+}
+
 function parse_bootstrap(value) {
-	let parsed = parse_resolver(value, BOOTSTRAP_DEFAULT, true, 'Резолвер адреса сервера');
-	if (parsed.ok)
-		parsed.server.tag = BOOTSTRAP_TAG;
-	return parsed;
+	return parse_resolver(value, BOOTSTRAP_DEFAULT, true, 'Резолвер адреса сервера');
 }
 
-// Резолвер для имён, которые уезжают в подключение. Тег и detour ставит вызов:
-// сервер свой на каждое подключение, чтобы ответ приходил с того выхода, куда
-// пойдёт трафик.
 function parse_tunnel_dns(value) {
 	return parse_resolver(value, TUNNEL_DEFAULT, false, 'Резолвер через подключение');
 }
@@ -704,33 +677,48 @@ function validate_rules(input, tags, declared) {
 }
 
 function outbound_json(outbound) {
-	let json = {
-		type: 'vless',
-		tag: outbound.tag,
-		server: outbound.server,
-		server_port: outbound.server_port,
-		uuid: outbound.uuid,
-		tls: {
-			enabled: true,
-			server_name: outbound.server_name,
-			utls: { enabled: true, fingerprint: outbound.fingerprint || 'chrome' },
-			reality: { enabled: true, public_key: outbound.public_key }
-		}
+	let user = {
+		id: outbound.uuid,
+		encryption: 'none'
 	};
-
 	if (outbound.flow)
-		json.flow = outbound.flow;
+		user.flow = outbound.flow;
+
+	let reality = {
+		serverName: outbound.server_name,
+		fingerprint: outbound.fingerprint || 'chrome',
+		publicKey: outbound.public_key
+	};
 	if (outbound.short_id)
-		json.tls.reality.short_id = outbound.short_id;
-	return json;
+		reality.shortId = outbound.short_id;
+
+	let stream = {
+		network: 'tcp',
+		security: 'reality',
+		realitySettings: reality
+	};
+	// Если адрес сервера задан доменом, его обязан резолвить встроенный DNS
+	// xray (а не /etc/resolv.conf, который при resolve_all указывает на сам xray).
+	if (is_domain(outbound.server))
+		stream.sockopt = { domainStrategy: 'UseIPv4' };
+
+	return {
+		tag: outbound.tag,
+		protocol: 'vless',
+		settings: {
+			vnext: [{
+				address: outbound.server,
+				port: outbound.server_port,
+				users: [user]
+			}]
+		},
+		streamSettings: stream
+	};
 }
 
 // Домены, которые стоит резолвить через прокси, и выход для каждого. Только те,
 // что правило отправляет в подключение: для `direct` резолв через туннель ничего
 // не даёт, а для `block` соединение всё равно не состоится.
-//
-// Ответ должен приходить с того же выхода, куда пойдёт трафик, иначе CDN отдаст
-// адрес другого континента — поэтому сервер свой на каждое подключение.
 function dns_routes(rules) {
 	let by_outbound = {}, sets_by_outbound = {}, order = [];
 	for (let rule in rules) {
@@ -746,47 +734,113 @@ function dns_routes(rules) {
 		}
 		for (let domain in domains)
 			push(by_outbound[rule.target], domain);
-		// Списки в dnsmasq не перечислить, а DNS-модулю sing-box они годятся
-		// как есть: `dns.rules` матчит по `rule_set` тем же набором, что и
-		// маршрутизация. Это и есть разница между «резолвить всё через нас» и
-		// адресной пересылкой — второй списки покрыть не может в принципе.
 		for (let tag in sets)
 			push(sets_by_outbound[rule.target], tag);
 	}
 	return { by_outbound: by_outbound, sets_by_outbound: sets_by_outbound, order: order };
 }
 
-// Домен в том виде, в каком его ждут и route, и dns: имя целиком плюс суффикс,
-// либо один суффикс, если запись начиналась с точки.
-function domain_json(domains) {
-	let exact = [], suffixes = [];
+// Преобразование доменов Zarap в формат xray-core:
+// - `youtube.com` -> `domain:youtube.com` (само имя и все поддомены);
+// - `.googlevideo.com` -> `regexp:\.googlevideo\.com$` (только поддомены).
+function xray_domains(domains) {
+	let out = [];
 	for (let domain in domains) {
-		if (substr(domain, 0, 1) == '.') {
-			push(suffixes, domain);
-		}
-		else {
-			push(exact, domain);
-			push(suffixes, '.' + domain);
-		}
+		if (substr(domain, 0, 1) == '.')
+			push(out, 'regexp:' + replace(domain, /\./g, '\\.') + '$');
+		else
+			push(out, 'domain:' + domain);
 	}
-	let json = {};
-	if (length(exact))
-		json.domain = exact;
-	if (length(suffixes))
-		json.domain_suffix = suffixes;
-	return json;
+	return out;
 }
 
-// sing-box cannot match a source by MAC, so a device is represented by the
-// address its static lease pins. address_of maps one to the other.
-//
-// One section becomes a *group* of route rules, one per kind of destination
-// condition, because sing-box ands the fields of a single rule together: a rule
-// carrying both a range and a domain would demand that the traffic match both
-// and would fire for nothing. Adjacency is what expresses the or — the group is
-// contiguous and every element carries the same target, so which one matched
-// makes no difference.
-function rule_jsons(rule, address_of) {
+// Извлекает хост из https:// URL для bootstrap-резолва источника .dat при direct.
+function url_hostname(url) {
+	let rest = '' + (url || '');
+	let mark = index(rest, '://');
+	if (mark >= 0)
+		rest = substr(rest, mark + 3);
+	let slash = index(rest, '/');
+	if (slash >= 0)
+		rest = substr(rest, 0, slash);
+	if (substr(rest, 0, 1) == '[')
+		return '';
+	let colon = rindex(rest, ':');
+	if (colon >= 0)
+		rest = substr(rest, 0, colon);
+	return lc(trim(rest));
+}
+
+// Переводит самый частый update_interval среди используемых списков в
+// 5-польное cron-выражение для блока geodata в xray-core.
+function geodata_cron(used_rulesets) {
+	let min_hours = 0;
+	for (let rs in (used_rulesets || [])) {
+		let iv = rs.update_interval || '';
+		if (!iv)
+			continue;
+		let unit = substr(iv, length(iv) - 1);
+		let num = int(substr(iv, 0, length(iv) - 1));
+		if (num < 1)
+			continue;
+		let hours = unit == 'd' ? num * 24 : num;
+		if (min_hours == 0 || hours < min_hours)
+			min_hours = hours;
+	}
+	if (min_hours == 0)
+		return '';
+	if (min_hours < 24)
+		return '0 */' + min_hours + ' * * *';
+	if (min_hours == 24)
+		return '0 4 * * *';
+	if (min_hours == 168)
+		return '0 4 * * 0';
+	let days = int(min_hours / 24);
+	if (days > 31)
+		days = 31;
+	return '0 4 */' + days + ' * *';
+}
+
+// Выбирает используемые правилами списки .dat и дедуплицирует файлы по URL:
+// два списка с разными категориями из одного geosite.dat скачивают один файл.
+function ruleset_plan(rules, rulesets) {
+	let used = {};
+	for (let rule in (rules || []))
+		for (let tag in (rule.rule_sets || []))
+			used[tag] = true;
+
+	let file_by_url = {}, by_tag = {}, assets = [], used_rulesets = [];
+	for (let rs in (rulesets || [])) {
+		if (!used[rs.tag])
+			continue;
+		let file = file_by_url[rs.url];
+		if (!file) {
+			file = rs.tag + '.dat';
+			file_by_url[rs.url] = file;
+			push(assets, { url: rs.url, file: file });
+		}
+		let kind = rs.kind || 'geosite';
+		let category = rs.category || '';
+		let entry = {
+			tag: rs.tag,
+			label: rs.label || '',
+			url: rs.url,
+			kind: kind,
+			category: category,
+			file: file,
+			expr: 'ext:' + file + ':' + category,
+			update_interval: rs.update_interval || ''
+		};
+		by_tag[rs.tag] = entry;
+		push(used_rulesets, entry);
+	}
+	return { by_tag: by_tag, assets: assets, used_rulesets: used_rulesets };
+}
+
+// Одна секция rule становится группой соседних правил xray-core: домены
+// (включая geosite-списки) и IP-диапазоны (включая geoip-списки) разносятся по
+// разным элементам, потому что внутри одного правила xray соединяет поля через И.
+function rule_jsons(rule, address_of, ruleset_map, skip_assets) {
 	let sources = [];
 	for (let mac in (rule.clients || [])) {
 		let address = address_of[mac];
@@ -794,40 +848,40 @@ function rule_jsons(rule, address_of) {
 			push(sources, address + '/32');
 	}
 
-	// The inbound is the only one there is, so naming it changes nothing today.
-	// It is written from the start so that splitting the capture across several
-	// TProxy ports later does not mean rewriting every rule.
-	let shared = { inbound: [INBOUND_TAG] };
+	let shared = { type: 'field', inboundTag: [INBOUND_TAG] };
 	if (length(sources))
-		shared.source_ip_cidr = sources;
+		shared.source = sources;
 	if (rule.network)
-		shared.network = [rule.network];
+		shared.network = rule.network;
 
-	// Ports qualify whatever else the rule says, so they belong to every
-	// element of the group rather than being a destination of their own.
-	let ports = [], ranges = [];
-	for (let port in (rule.ports || [])) {
-		if (index(port, ':') >= 0)
-			push(ranges, port);
+	let port_parts = [];
+	for (let port in (rule.ports || []))
+		push(port_parts, replace('' + port, /:/g, '-'));
+	if (length(port_parts))
+		shared.port = join(',', port_parts);
+
+	let domain_entries = xray_domains(rule.domains || []);
+	let ip_entries = [];
+	for (let cidr in (rule.ip_cidr || []))
+		push(ip_entries, cidr);
+
+	for (let tag in (rule.rule_sets || [])) {
+		let rs = (ruleset_map || {})[tag];
+		if (!rs)
+			continue;
+		if (skip_assets && skip_assets[rs.file])
+			continue;
+		if (rs.kind == 'geoip')
+			push(ip_entries, rs.expr);
 		else
-			push(ports, int(port));
+			push(domain_entries, rs.expr);
 	}
-	if (length(ports))
-		shared.port = ports;
-	if (length(ranges))
-		shared.port_range = ranges;
 
-	// One entry per kind of destination; an empty list leaves a single element
-	// whose only conditions are the shared ones.
 	let destinations = [];
-	// `example.com` is the name and everything under it; `.example.com` asked
-	// for the subdomains alone.
-	if (length(rule.domains || []))
-		push(destinations, domain_json(rule.domains));
-	if (length(rule.ip_cidr || []))
-		push(destinations, { ip_cidr: rule.ip_cidr });
-	if (length(rule.rule_sets || []))
-		push(destinations, { rule_set: rule.rule_sets });
+	if (length(domain_entries))
+		push(destinations, { domain: domain_entries });
+	if (length(ip_entries))
+		push(destinations, { ip: ip_entries });
 	if (!length(destinations))
 		push(destinations, {});
 
@@ -838,198 +892,193 @@ function rule_jsons(rule, address_of) {
 			json[key] = value;
 		for (let key, value in destination)
 			json[key] = value;
-		// The special `block` outbound was deprecated in sing-box 1.11 and
-		// removed in 1.13; the rule action replaces it.
-		if (rule.target == 'block')
-			json.action = 'reject';
-		else
-			json.outbound = rule.target;
+		json.outboundTag = rule.target;
 		push(emitted, json);
 	}
 	return emitted;
 }
 
-function sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns) {
-	let emitted = [], route_rules = [], wants_direct = false;
+function xray_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns, skip_assets) {
+	let emitted = [], route_rules = [];
+	let wants_direct = false, wants_block = false;
 
 	for (let outbound in outbounds)
 		push(emitted, outbound_json(outbound));
 
-	// A TProxy inbound sees an address and a port; the name is in the first
-	// packet, and only sniffing takes it out. The rule is emitted solely when
-	// something asks for a domain — sniffing delays the first packet while it
-	// waits for the header, and paying that with no domain rule buys nothing.
-	//
-	// It routes by name and dials by address: the connection still goes to the
-	// address the client resolved. A domain rule therefore beats DPI on the SNI
-	// and does nothing about a name blocked in DNS.
-	// Запросы, которые dnsmasq переслал на наш порт, уходят в DNS-модуль
-	// sing-box; правило стоит первым и ловит их по своему inbound, так что с
-	// захваченным трафиком оно не пересекается.
+	let plan = ruleset_plan(rules, rulesets);
+	let detour = trim('' + (ruleset_detour || 'direct'));
+	let parsed_bootstrap = parse_bootstrap(bootstrap);
+	let parsed_tunnel = parse_tunnel_dns(tunnel_dns);
+
+	// Доменные списки и имена, уезжающие в туннель: для каждого подключения
+	// свой DNS-сервер с индивидуальным tag и правилом маршрутизации в этот outbound.
 	let dns = dns_routes(rules);
-	// Слушатель нужен всегда, когда dnsmasq отдаёт нам весь DNS: иначе спросить
-	// будет некого, и дом останется без имён целиком.
-	let listens_dns = resolve_all || length(dns.order);
+	let tunnel_dns_domains = {}, tunnel_dns_order = [];
+	for (let tag in dns.order) {
+		let list = xray_domains(dns.by_outbound[tag]);
+		if (resolve_all) {
+			for (let rstag in dns.sets_by_outbound[tag]) {
+				let rs = plan.by_tag[rstag];
+				if (rs && rs.kind == 'geosite' && !(skip_assets && skip_assets[rs.file]))
+					push(list, rs.expr);
+			}
+		}
+		if (length(list)) {
+			tunnel_dns_domains[tag] = list;
+			push(tunnel_dns_order, tag);
+		}
+	}
+
+	let listens_dns = !!(resolve_all || length(tunnel_dns_order));
+
+	// Собственные имена роутера: домены серверов из ссылок и хост источника
+	// .dat-файлов, если они скачиваются напрямую.
+	let server_domains = [], seen_server = {};
+	for (let outbound in outbounds) {
+		if (is_domain(outbound.server) && !seen_server[outbound.server]) {
+			seen_server[outbound.server] = true;
+			push(server_domains, 'full:' + outbound.server);
+		}
+	}
+	if (length(plan.assets) && detour == 'direct') {
+		for (let asset in plan.assets) {
+			let host = url_hostname(asset.url);
+			if (is_domain(host) && !seen_server[host]) {
+				seen_server[host] = true;
+				push(server_domains, 'full:' + host);
+			}
+		}
+	}
+
+	let wants_bootstrap = !!(length(server_domains) || resolve_all);
+	let uses_udp_bootstrap = wants_bootstrap && parsed_bootstrap.scheme == 'udp';
+	if (uses_udp_bootstrap)
+		wants_direct = true;
+	if (length(plan.assets) && detour == 'direct')
+		wants_direct = true;
+
+	// Внутренние правила DNS стоят в самом начале routing.rules, до трафика
+	// с zarap-tproxy: иначе DNS-запросы попали бы под клиентские правила или
+	// дефолтный первый outbound.
 	if (listens_dns)
-		push(route_rules, { inbound: [DNS_TAG], action: 'hijack-dns' });
+		push(route_rules, { type: 'field', inboundTag: [DNS_TAG], outboundTag: DNS_OUT_TAG });
+	if (uses_udp_bootstrap)
+		push(route_rules, { type: 'field', inboundTag: [BOOTSTRAP_TAG], outboundTag: 'direct' });
+	for (let tag in tunnel_dns_order)
+		push(route_rules, { type: 'field', inboundTag: ['dns_' + tag], outboundTag: tag });
 
 	let wants_sniff = false;
-	for (let rule in rules)
-		if (length(rule.domains || []) || length(rule.rule_sets || []))
-			wants_sniff = true;
-	if (wants_sniff)
-		push(route_rules, { inbound: [INBOUND_TAG], action: 'sniff' });
-
 	for (let rule in rules) {
-		for (let json in rule_jsons(rule, address_of || {}))
+		if (length(rule.domains || []))
+			wants_sniff = true;
+		for (let rstag in (rule.rule_sets || [])) {
+			let rs = plan.by_tag[rstag];
+			if (rs && rs.kind == 'geosite')
+				wants_sniff = true;
+		}
+		for (let json in rule_jsons(rule, address_of || {}, plan.by_tag, skip_assets))
 			push(route_rules, json);
 		if (rule.target == 'direct')
 			wants_direct = true;
+		if (rule.target == 'block')
+			wants_block = true;
 	}
 
-	// `final` takes an outbound tag, and `block` is no longer one. Blocking the
-	// remainder is therefore a trailing rule that matches everything, with the
-	// field itself filled by a declared tag so it stays valid — the flow never
-	// reaches it.
-	let final_tag = final;
-	if (final == 'block') {
-		push(route_rules, { inbound: [INBOUND_TAG], action: 'reject' });
-		final_tag = length(outbounds) ? outbounds[0].tag : 'direct';
-	}
-	if (final_tag == 'direct')
+	// У xray-core нет поля routing.final: без совпадения трафик уходит в первый
+	// элемент outbounds[]. Замыкающее правило по zarap-tproxy выражает final
+	// явно и не зависит от порядка outbounds.
+	push(route_rules, { type: 'field', inboundTag: [INBOUND_TAG], outboundTag: final });
+	if (final == 'direct')
 		wants_direct = true;
+	if (final == 'block')
+		wants_block = true;
 
-	// Declared only when something points at it: an unreferenced `direct` would
-	// turn a mistyped tag into a silent path to the WAN, while an undeclared one
-	// makes `sing-box check` reject the configuration outright.
 	if (wants_direct)
-		push(emitted, { type: 'direct', tag: 'direct' });
+		push(emitted, { tag: 'direct', protocol: 'freedom' });
+	if (wants_block)
+		push(emitted, { tag: 'block', protocol: 'blackhole', settings: { response: { type: 'none' } } });
+	if (listens_dns)
+		push(emitted, { tag: DNS_OUT_TAG, protocol: 'dns', settings: { nonIPQuery: 'drop' } });
 
-	// Only the sets something points at, like the direct outbound: an unused
-	// declaration would still be downloaded and cached.
-	let used = {};
-	for (let rule in rules)
-		for (let tag in (rule.rule_sets || []))
-			used[tag] = true;
-	// Одно подключение на все списки: поле пишется в каждое объявление, потому
-	// что своего места для «через что качать вообще» в схеме sing-box нет.
-	let detour = trim('' + (ruleset_detour || 'direct'));
-	let declared = [];
-	for (let ruleset in (rulesets || [])) {
-		if (!used[ruleset.tag])
-			continue;
-		let json = {
-			type: 'remote',
-			tag: ruleset.tag,
-			format: 'binary',
-			url: ruleset.url
-		};
-		// `direct` is the default detour, so saying it changes nothing and only
-		// adds a field that a later version could rename.
-		if (detour != 'direct')
-			json.download_detour = detour;
-		if (ruleset.update_interval)
-			json.update_interval = ruleset.update_interval;
-		push(declared, json);
-	}
-
-	// Имена, которые роутер резолвит сам: адрес сервера в ссылке и, когда список
-	// качается напрямую, хост его источника. Через прокси такое имя резолвить
-	// нельзя — до прокси ещё надо дозвониться, — поэтому им нужен отдельный
-	// резолвер мимо туннеля. Без него sing-box берёт `dns.final`, то есть
-	// туннельный DoH, и уходит в бесконечный круг: чтобы поднять подключение,
-	// он резолвит его адрес через него же.
-	let wants_bootstrap = false;
-	for (let outbound in outbounds)
-		if (is_domain(outbound.server))
-			wants_bootstrap = true;
-	if (length(declared) && detour == 'direct')
-		wants_bootstrap = true;
-	// В этом режиме он же отвечает за всё неназванное, поэтому нужен всегда.
-	if (resolve_all)
-		wants_bootstrap = true;
-
-	let route = { auto_detect_interface: true, rules: route_rules, final: final_tag };
-	// Названный так резолвер спрашивается напрямую, минуя `dns.rules`, —
-	// поэтому перечислять адреса серверов ещё и правилом не нужно.
-	if (wants_bootstrap)
-		route.default_domain_resolver = BOOTSTRAP_TAG;
-	if (length(declared))
-		route.rule_set = declared;
-
-	let inbounds = [{
-		type: 'tproxy',
+	let tproxy = {
 		tag: INBOUND_TAG,
 		listen: '0.0.0.0',
-		listen_port: CAPTURE_PORT
-	}];
+		port: CAPTURE_PORT,
+		protocol: 'dokodemo-door',
+		settings: { network: 'tcp,udp', followRedirect: true },
+		streamSettings: { sockopt: { tproxy: 'tproxy' } }
+	};
+	if (wants_sniff)
+		tproxy.sniffing = { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true };
+
+	let inbounds = [tproxy];
 	if (listens_dns)
 		push(inbounds, {
-			type: 'direct',
 			tag: DNS_TAG,
 			listen: '127.0.0.1',
-			listen_port: DNS_PORT
+			port: DNS_PORT,
+			protocol: 'dokodemo-door',
+			settings: { address: DNS_UPSTREAM, port: 53, network: 'tcp,udp' }
 		});
 
 	let config = {
-		log: { level: 'info', timestamp: true },
+		log: { loglevel: 'warning' },
 		inbounds: inbounds,
 		outbounds: emitted,
-		route: route
+		routing: {
+			domainStrategy: 'AsIs',
+			rules: route_rules
+		}
 	};
 
-	// Резолв только названных доменов, и каждый — через своё подключение.
-	// Перенаправлять сюда весь DNS дома нельзя: при остановленном sing-box дом
-	// потерял бы имена целиком, включая имена в самой локальной сети. Рядом с
-	// ними — bootstrap, единственный, кто резолвит мимо туннеля.
-	let servers = [], dns_rules = [];
-	// По умолчанию DoH: имя сервера подменяют ровно там, где Zarap и нужен, и
-	// подменённый ответ увёл бы подключение в никуда. Но там же закрывают и сам
-	// DoH, поэтому резолвер выбирается настройкой, а не прибит здесь.
-	if (wants_bootstrap)
-		push(servers, parse_bootstrap(bootstrap).server);
-	for (let tag in dns.order) {
-		// Разбирается на каждое подключение заново, а не копируется: один
-		// объект на всех получил бы тег и detour последнего.
-		let through = parse_tunnel_dns(tunnel_dns).server;
-		through.tag = 'dns_' + tag;
-		through.detour = tag;
-		push(servers, through);
-		let domains = dns.by_outbound[tag];
-		if (length(domains)) {
-			let json = domain_json(domains);
-			json.server = 'dns_' + tag;
-			push(dns_rules, json);
+	// Построение dns.servers без петель и утечек:
+	// 1. Первым — bootstrap для доменов самих серверов (skipFallback + finalQuery),
+	//    чтобы адрес VLESS-сервера никогда не попал в туннельный DNS.
+	// 2. Далее — по одному туннельному серверу на каждый outbound с доменами:
+	//    при resolve_all=1 все туннельные помечены skipFallback + finalQuery, а
+	//    единственным fallback остаётся bootstrap в конце;
+	//    при resolve_all=0 первый туннельный одновременно служит единственным
+	//    fallback, остальные туннельные (и bootstrap-щит) помечены skipFallback + finalQuery.
+	let dns_servers = [];
+	if (length(tunnel_dns_order)) {
+		if (length(server_domains))
+			push(dns_servers, xray_dns_server(parsed_bootstrap, true, BOOTSTRAP_TAG, server_domains, true));
+		if (resolve_all) {
+			for (let tag in tunnel_dns_order)
+				push(dns_servers, xray_dns_server(parsed_tunnel, false, 'dns_' + tag, tunnel_dns_domains[tag], true));
+			push(dns_servers, xray_dns_server(parsed_bootstrap, true, BOOTSTRAP_TAG, [], false));
 		}
-		// Правило по списку — только когда весь DNS дома идёт через нас: при
-		// адресной пересылке dnsmasq такие запросы сюда не приводит вовсе, и
-		// правило стояло бы мёртвым.
-		let sets = resolve_all ? dns.sets_by_outbound[tag] : [];
-		if (length(sets))
-			push(dns_rules, { rule_set: sets, server: 'dns_' + tag });
+		else {
+			for (let i = 0; i < length(tunnel_dns_order); i++) {
+				let tag = tunnel_dns_order[i];
+				push(dns_servers, xray_dns_server(parsed_tunnel, false, 'dns_' + tag, tunnel_dns_domains[tag], i > 0));
+			}
+		}
 	}
-	if (length(servers)) {
+	else if (wants_bootstrap) {
+		push(dns_servers, xray_dns_server(parsed_bootstrap, true, BOOTSTRAP_TAG, [], false));
+	}
+
+	if (length(dns_servers)) {
 		config.dns = {
-			servers: servers,
-			// IPv6 в LAN не раздаётся, и AAAA-ответ отправил бы клиента по
-			// адресу, до которого он не дойдёт.
-			strategy: 'ipv4_only',
-			// Когда весь DNS дома идёт через нас, всё неназванное обязано
-			// резолвиться напрямую: иначе российский сайт получил бы адрес
-			// с чужого континента, а заодно каждый запрос ехал бы в туннель.
-			// Без этого режима спрашивать нас может только dnsmasq и только
-			// про названные домены, поэтому там умолчание — первое подключение.
-			final: resolve_all ? BOOTSTRAP_TAG :
-				(length(dns.order) ? 'dns_' + dns.order[0] : BOOTSTRAP_TAG)
+			queryStrategy: 'UseIPv4',
+			disableFallbackIfMatch: true,
+			servers: dns_servers
 		};
-		if (length(dns_rules))
-			config.dns.rules = dns_rules;
 	}
-	// Without the cache every restart is a trip to the network for lists that
-	// were already fetched; with nothing to cache the file is not worth the
-	// flash it would take.
-	if (length(declared))
-		config.experimental = { cache_file: { enabled: true, path: CACHE_FILE } };
+
+	if (length(plan.assets)) {
+		let geodata = { assets: plan.assets };
+		let cron = geodata_cron(plan.used_rulesets);
+		if (cron)
+			geodata.cron = cron;
+		if (detour != 'direct')
+			geodata.outbound = detour;
+		else
+			geodata.outbound = 'direct';
+		config.geodata = geodata;
+	}
+
 	return config;
 }
 
@@ -1316,7 +1365,7 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all) {
 	if (!section)
 		return;
 
-	// Выключенный Zarap ничего у dnsmasq не забирает: sing-box остановлен, и
+	// Выключенный Zarap ничего у dnsmasq не забирает: xray остановлен, и
 	// пересылка на него оставила бы дом без названных имён вовсе.
 	if (enabled && resolve_all) {
 		dnsmasq_take_over(uci, section);
@@ -1388,7 +1437,7 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets,
 	// где подключение стояло у каждого списка, исчезает вместе с секцией.
 	for (let ruleset in rulesets) {
 		uci.set('zarap', ruleset.tag, 'ruleset');
-		for (let key in ['label', 'url', 'update_interval'])
+		for (let key in ['label', 'url', 'kind', 'category', 'update_interval'])
 			uci.set('zarap', ruleset.tag, key, '' + ruleset[key]);
 	}
 	for (let rule in rules) {
@@ -1438,7 +1487,7 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets,
 	}
 
 	// The capture is IPv4 only, so an advertised IPv6 would be a path around
-	// sing-box for the whole LAN. Not handing it out beats rejecting it packet
+	// xray-core for the whole LAN. Not handing it out beats rejecting it packet
 	// by packet: a device that never gets a global address never tries to use
 	// one, instead of falling back to IPv4 on every connection.
 	//
@@ -1455,12 +1504,14 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets,
 	}
 	configure_dnsmasq(uci, rules, enabled, resolve_all);
 
-	uci.load('sing-box');
-	uci.set('sing-box', 'main', 'sing-box');
-	uci.set('sing-box', 'main', 'enabled', enabled ? '1' : '0');
-	uci.set('sing-box', 'main', 'user', 'root');
-	uci.set('sing-box', 'main', 'conffile', CONFIG);
-	uci.set('sing-box', 'main', 'workdir', '/tmp/zarap');
+	uci.load('xray');
+	uci.set('xray', 'enabled', 'xray');
+	uci.set('xray', 'enabled', 'enabled', enabled ? '1' : '0');
+	uci.set('xray', 'config', 'xray');
+	uci.delete('xray', 'config', 'confdir');
+	uci.set('xray', 'config', 'conffiles', [CONFIG]);
+	uci.set('xray', 'config', 'datadir', ASSETS_DIR);
+	uci.set('xray', 'config', 'format', 'json');
 	return true;
 }
 
@@ -1530,7 +1581,7 @@ function saved_rules() {
 		}
 		// Written by hand into /etc/config/zarap, a condition can be anything;
 		// what does not normalise is dropped rather than carried into the
-		// generator, which would put it in front of sing-box unchecked.
+		// generator, which would put it in front of xray-core unchecked.
 		let domains = [], sets = [], ranges = [], ports = [];
 		for (let value in uci_list(section.rule_set))
 			if (valid_ruleset_tag(trim('' + value)))
@@ -1571,10 +1622,15 @@ function saved_rulesets() {
 		let tag = section['.name'];
 		if (!valid_ruleset_tag(tag))
 			return;
+		let kind = lc(trim('' + (section.kind || 'geosite')));
+		if (kind != 'geosite' && kind != 'geoip')
+			kind = 'geosite';
 		push(rulesets, {
 			tag: tag,
 			label: section.label || '',
 			url: section.url || '',
+			kind: kind,
+			category: lc(trim('' + (section.category || ''))),
 			update_interval: section.update_interval || ''
 		});
 	});
@@ -1694,13 +1750,13 @@ function outbound_link(outbound) {
 
 function tproxy_listening() {
 	let listeners = capture('/usr/sbin/ss -H -lntup sport = :7893').output;
-	return !!(listeners && index(lc(listeners), 'sing-box') >= 0);
+	return !!(listeners && index(lc(listeners), 'xray') >= 0);
 }
 
 // procd returns from a restart once it has signalled the service, not once the
-// service is ready, and sing-box needs a moment to bind ("started (0.22s)").
-// Checking straight away failed a working configuration and rolled it back, so
-// callers that have just started the service wait a little for the port.
+// service is ready, and xray needs a moment to bind. Checking straight away
+// failed a working configuration and rolled it back, so callers that have just
+// started the service wait a little for the port.
 function check_runtime(enabled, wait_seconds) {
 	// The kill switch holds whether or not the proxy is running, so its state
 	// has to be reported truthfully even with Zarap switched off. Reporting a
@@ -1711,7 +1767,7 @@ function check_runtime(enabled, wait_seconds) {
 	if (!enabled)
 		return { ok: true, running: false, listener: false, firewall: firewall, routing: false };
 
-	let running = system(['/etc/init.d/sing-box', 'running']) == 0;
+	let running = system(['/etc/init.d/xray', 'running']) == 0;
 	let listener = tproxy_listening();
 	for (let waited = 0; !listener && waited < (wait_seconds || 0); waited++) {
 		system(['/bin/sleep', '1']);
@@ -1734,25 +1790,200 @@ function check_runtime(enabled, wait_seconds) {
 // ошибок нет, статус говорит «работает» — и ничего не работает. Один рабочий
 // день ушёл на то, чтобы догадаться до строчки, которую программа знала.
 function recent_failures() {
-	let output = lc(capture('/sbin/logread -e sing-box -l 80').output);
-	// «… using outbound/vless[out_4]: lookup cdn1.aidar.one: i/o timeout».
-	// Двоеточие после имени обязательно: оно отличает отказ от удачного резолва
-	// на уровне `debug` («dns: lookup domain …», «dns: lookup failed for …»),
-	// где за словом lookup двоеточия нет.
-	let failed = match(output, /: lookup ([a-z0-9._-]+): /);
+	let output = lc(capture('/sbin/logread -e xray -l 80').output);
+	// «… failed to dial …: lookup cdn1.aidar.one: i/o timeout»,
+	// «… lookup cdn1.aidar.one on 1.1.1.1:53: no such host»,
+	// «… app/dns: failed to lookup cdn1.aidar.one: …».
+	// Двоеточие после имени отличает отказ от обычных debug-строк.
+	let failed = match(output, /: lookup ([a-z0-9._-]+): /) ||
+		match(output, /: lookup ([a-z0-9._-]+) on [^ ]+: /) ||
+		match(output, /failed to lookup ([a-z0-9._-]+): /);
 	if (failed)
 		return { connection: true, unresolved: failed[1] };
 
 	for (let marker in [
 		'connection refused', 'network is unreachable', 'i/o timeout',
-		'connection reset', 'reality handshake', 'tls handshake'
+		'connection reset', 'reality handshake', 'tls handshake',
+		'failed to dial', 'failed to process outbound'
 	])
 		if (index(output, marker) >= 0)
 			return { connection: true, unresolved: '' };
 	return { connection: false, unresolved: '' };
 }
 
-function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns) {
+function xray_test(path) {
+	return system(['/usr/bin/env', 'XRAY_LOCATION_ASSET=' + ASSETS_DIR, '/usr/bin/xray', 'run', '-test', '-c', path]);
+}
+
+function clear_assets_backup() {
+	for (let entry in (lsdir(ASSETS_BACKUP_DIR) || []))
+		if (entry != '.' && entry != '..')
+			unlink(ASSETS_BACKUP_DIR + '/' + entry);
+}
+
+function backup_assets() {
+	mkdir('/etc/zarap');
+	chmod('/etc/zarap', 0700);
+	mkdir(ASSETS_BACKUP_DIR);
+	chmod(ASSETS_BACKUP_DIR, 0700);
+	clear_assets_backup();
+
+	let moved = [];
+	for (let entry in (lsdir(ASSETS_DIR) || [])) {
+		if (!match(entry, /\.dat$/))
+			continue;
+		if (!rename(ASSETS_DIR + '/' + entry, ASSETS_BACKUP_DIR + '/' + entry)) {
+			for (let name in moved)
+				rename(ASSETS_BACKUP_DIR + '/' + name, ASSETS_DIR + '/' + name);
+			return { ok: false, files: [] };
+		}
+		push(moved, entry);
+	}
+	return { ok: true, files: moved };
+}
+
+function restore_assets(files) {
+	for (let entry in (lsdir(ASSETS_DIR) || []))
+		if (match(entry, /\.(dat|tmp)$/))
+			unlink(ASSETS_DIR + '/' + entry);
+
+	let ok = true;
+	for (let name in (files || []))
+		if (!rename(ASSETS_BACKUP_DIR + '/' + name, ASSETS_DIR + '/' + name))
+			ok = false;
+	clear_assets_backup();
+	return ok;
+}
+
+function cleanup_stale_assets(assets) {
+	let keep = {};
+	for (let asset in (assets || []))
+		keep[asset.file] = true;
+	for (let entry in (lsdir(ASSETS_DIR) || []))
+		if ((match(entry, /\.dat$/) || match(entry, /\.tmp$/)) && !keep[entry])
+			unlink(ASSETS_DIR + '/' + entry);
+}
+
+// Первичное скачивание и принудительное обновление .dat-файлов.
+// При detour == 'direct' качает curl напрямую; при detour == 'out_N' поднимает
+// короткоживущий xray с SOCKS5 на 127.0.0.1:17893 и качает через него.
+function fetch_assets(assets, outbounds, detour, bootstrap, force) {
+	if (!length(assets || []))
+		return { ok: true, downloaded: 0 };
+
+	mkdir('/etc/zarap');
+	chmod('/etc/zarap', 0700);
+	mkdir(ASSETS_DIR);
+	chmod(ASSETS_DIR, 0755);
+
+	let pending = [];
+	for (let asset in assets) {
+		let path = ASSETS_DIR + '/' + asset.file;
+		if (force || !access(path) || !(stat(path)?.size > 0))
+			push(pending, asset);
+	}
+	if (!length(pending))
+		return { ok: true, downloaded: 0 };
+
+	let proxy_url = '';
+	let helper_pid = '';
+	if (detour && detour != 'direct') {
+		let target_out = null;
+		for (let outbound in (outbounds || []))
+			if (outbound.tag == detour)
+				target_out = outbound;
+		if (!target_out)
+			return result_error('Не найдено подключение для загрузки списков: ' + detour, '', 'input_error');
+
+		let parsed_bootstrap = parse_bootstrap(bootstrap);
+		let helper_outbounds = [outbound_json(target_out)];
+		let helper_config = {
+			log: { loglevel: 'error' },
+			inbounds: [{
+				tag: 'fetch-socks',
+				listen: '127.0.0.1',
+				port: FETCH_SOCKS_PORT,
+				protocol: 'socks',
+				settings: { udp: false }
+			}],
+			outbounds: helper_outbounds
+		};
+		if (is_domain(target_out.server)) {
+			helper_config.dns = {
+				queryStrategy: 'UseIPv4',
+				servers: [xray_dns_server(parsed_bootstrap, true, BOOTSTRAP_TAG, [], false)]
+			};
+			if (parsed_bootstrap.scheme == 'udp') {
+				push(helper_outbounds, { tag: 'direct', protocol: 'freedom' });
+				helper_config.routing = {
+					rules: [{ type: 'field', inboundTag: [BOOTSTRAP_TAG], outboundTag: 'direct' }]
+				};
+			}
+		}
+		if (writefile(FETCH_CONFIG_TMP, sprintf('%J', helper_config) + '\n') == null)
+			return result_error('Не удалось создать временный конфиг xray для загрузки списков', '', 'startup_error');
+		chmod(FETCH_CONFIG_TMP, 0600);
+
+		let started = capture('/usr/bin/xray run -c ' + FETCH_CONFIG_TMP + ' </dev/null >/dev/null 2>&1 & echo $!');
+		helper_pid = trim(started.output || '');
+		if (!match(helper_pid, /^[0-9]+$/)) {
+			unlink(FETCH_CONFIG_TMP);
+			return result_error('Не удалось запустить временный xray для загрузки списков через ' + detour, '', 'startup_error');
+		}
+		let ready = false;
+		for (let waited = 0; waited < 4; waited++) {
+			let socks = capture('/usr/sbin/ss -H -lntp sport = :' + FETCH_SOCKS_PORT).output;
+			if (socks && index(lc(socks), 'xray') >= 0) {
+				ready = true;
+				break;
+			}
+			system(['/bin/sleep', '1']);
+		}
+		if (!ready) {
+			system(['/bin/kill', helper_pid]);
+			unlink(FETCH_CONFIG_TMP);
+			return result_error('Временный xray для загрузки списков не открыл локальный SOCKS-порт', '', 'startup_error');
+		}
+		proxy_url = 'socks5h://127.0.0.1:' + FETCH_SOCKS_PORT;
+	}
+
+	let failed_msg = '';
+	for (let asset in pending) {
+		let tmp = ASSETS_DIR + '/.' + asset.file + '.tmp';
+		unlink(tmp);
+		let cmd = ['/usr/bin/curl', '-fsSL', '--connect-timeout', '15', '--max-time', '90'];
+		if (proxy_url) {
+			push(cmd, '--proxy');
+			push(cmd, proxy_url);
+		}
+		push(cmd, '-o');
+		push(cmd, tmp);
+		push(cmd, asset.url);
+
+		let code = system(cmd);
+		if (code != 0 || !(stat(tmp)?.size > 0)) {
+			unlink(tmp);
+			failed_msg = 'Не удалось скачать список ' + asset.file + ' (' + asset.url + ')';
+			break;
+		}
+		chmod(tmp, 0644);
+		if (!rename(tmp, ASSETS_DIR + '/' + asset.file)) {
+			unlink(tmp);
+			failed_msg = 'Не удалось сохранить список ' + asset.file + ' в ' + ASSETS_DIR;
+			break;
+		}
+	}
+
+	if (helper_pid) {
+		system(['/bin/kill', helper_pid]);
+		unlink(FETCH_CONFIG_TMP);
+	}
+	if (failed_msg)
+		return result_error(failed_msg, '', 'startup_error');
+	return { ok: true, downloaded: length(pending) };
+}
+
+function validate_candidate(outbounds, rules, final, clients, proxying, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns, dry_run) {
 	let lan = lan_device();
 	// A redirect without an interface condition would capture traffic arriving
 	// from the WAN, so an unanswered ubus has to fail the apply outright.
@@ -1767,11 +1998,23 @@ function validate_candidate(outbounds, rules, final, clients, proxying, rulesets
 		if (address_of[mac])
 			push(guarded, address_of[mac]);
 
+	let skip_assets = null;
+	if (dry_run) {
+		let plan = ruleset_plan(rules, rulesets);
+		for (let asset in plan.assets) {
+			if (!access(ASSETS_DIR + '/' + asset.file)) {
+				if (!skip_assets)
+					skip_assets = {};
+				skip_assets[asset.file] = true;
+			}
+		}
+	}
+
 	mkdir('/etc/zarap');
 	chmod('/etc/zarap', 0700);
-	let sing_box = sprintf('%J', sing_box_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns)) + '\n';
+	let xray = sprintf('%J', xray_config(outbounds, rules, final, address_of, rulesets, ruleset_detour, bootstrap, resolve_all, tunnel_dns, skip_assets)) + '\n';
 	let nft = nft_config(guarded, lan, proxying);
-	let config_written = writefile(CONFIG_TMP, sing_box);
+	let config_written = writefile(CONFIG_TMP, xray);
 	let nft_written = writefile(NFT_TMP, nft);
 	if (config_written == null || nft_written == null) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP);
@@ -1783,15 +2026,15 @@ function validate_candidate(outbounds, rules, final, clients, proxying, rulesets
 		return result_error('Не удалось создать файл проверки nftables', '', 'startup_error');
 	}
 
-	if (system(['/usr/bin/sing-box', 'check', '-c', CONFIG_TMP]) != 0) {
+	if (xray_test(CONFIG_TMP) != 0) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
-		return result_error('Установленный sing-box отклонил сгенерированную конфигурацию', '', 'compatibility_error');
+		return result_error('Установленный xray-core отклонил сгенерированную конфигурацию', '', 'compatibility_error');
 	}
 	if (system(['/usr/sbin/nft', '-c', '-f', NFT_CHECK]) != 0) {
 		unlink(CONFIG_TMP); unlink(NFT_TMP); unlink(NFT_CHECK);
 		return result_error('nftables отклонил сгенерированные правила', '', 'compatibility_error');
 	}
-	return { ok: true, sing_box: sing_box, nft: nft, guarded: guarded, lan: lan };
+	return { ok: true, xray: xray, nft: nft, guarded: guarded, lan: lan };
 }
 
 // firewall4 rebuilds the chains from the generated file but leaves the contents
@@ -1859,7 +2102,7 @@ function rollback(backups) {
 	}
 	if (system(['/etc/init.d/dnsmasq', 'restart']) != 0) ok = false;
 	if (system(['/etc/init.d/zarap', 'restart']) != 0) ok = false;
-	if (system(['/etc/init.d/sing-box', 'restart']) != 0) ok = false;
+	if (system(['/etc/init.d/xray', 'restart']) != 0) ok = false;
 	return ok;
 }
 
@@ -1875,17 +2118,17 @@ function restore_update_files(backups, restart_proxy) {
 	if (system(['/etc/init.d/firewall', 'reload']) != 0) ok = false;
 	if (system(['/etc/init.d/zarap', 'restart']) != 0) ok = false;
 	if (restart_proxy) {
-		if (system(['/etc/init.d/sing-box', 'restart']) != 0) ok = false;
+		if (system(['/etc/init.d/xray', 'restart']) != 0) ok = false;
 	}
 	else {
-		system(['/etc/init.d/sing-box', 'stop']);
+		system(['/etc/init.d/xray', 'stop']);
 	}
 	return ok;
 }
 
 function resource_conflict() {
 	let listeners = capture('/usr/sbin/ss -H -lntup sport = :7893').output;
-	if (listeners && (!length(saved_outbounds()) || index(lc(listeners), 'sing-box') < 0))
+	if (listeners && (!length(saved_outbounds()) || index(lc(listeners), 'xray') < 0))
 		return result_error('Порт 7893 уже занят другим процессом');
 
 	let routes = capture('/sbin/ip -4 route show table 2022').output;
@@ -1945,7 +2188,7 @@ function validate_request(args, enabled) {
 	// поэтому она не предупреждение, а отказ ввода.
 	if (resolve_all && bootstrap_result.value == 'local')
 		return input_error('Резолвер для всей сети не может быть local: dnsmasq отправляет запросы Zarap, ' +
-			'а local спрашивает dnsmasq — получается петля. Укажите адрес резолвера, например tls://77.88.8.8');
+			'а local спрашивает dnsmasq — получается петля. Укажите адрес резолвера, например https://1.1.1.1/dns-query');
 	// Спрашивать имена через подключение можно, только если оно есть.
 	if (resolve_all && !length(outbounds))
 		return input_error('Резолв через подключение включён, но подключений нет');
@@ -1963,7 +2206,7 @@ function validate_request(args, enabled) {
 		return input_error('Некорректная цель для остального трафика: ' + (final || '—'));
 
 	// Capturing the whole LAN with nowhere to send it would put the household
-	// through sing-box only to hand it straight back out.
+	// through xray-core only to hand it straight back out.
 	if (enabled && !length(outbounds))
 		return input_error('Добавьте хотя бы одно подключение');
 
@@ -1990,10 +2233,8 @@ function validate_request(args, enabled) {
 		resolve_all: resolve_all, tunnel_dns: tunnel_result.value };
 }
 
-// Списки скачивает sing-box, и до первой удачной загрузки старт зависит от
-// чужого сервера. Общее «не удалось запустить Zarap» отправляет искать причину
-// не туда, поэтому при объявленных списках отказ называет их — как подозрение,
-// а не как приговор: что именно случилось, знает только журнал.
+// До первого успешного скачивания .dat-файлов запуск зависит от доступности
+// источника списков и корректности указанных категорий.
 function startup_hint(rulesets) {
 	if (!length(rulesets || []))
 		return '';
@@ -2001,8 +2242,8 @@ function startup_hint(rulesets) {
 	for (let ruleset in rulesets)
 		push(names, ruleset.label ? (ruleset.label + ' (' + ruleset.tag + ')') : ruleset.tag);
 	return 'Проверьте наборы правил: ' + join(', ', names) +
-		'. Их скачивает sing-box, и пока список не попал в кэш, запуск зависит от ' +
-		'доступности его адреса — в том числе через подключение, выбранное для ' +
+		'. Перед запуском xray-core файлы .dat должны быть скачаны в ' + ASSETS_DIR +
+		' и содержать указанные категории — проверьте URL, категорию и подключение для ' +
 		'загрузки списков. Причина отказа есть в журнале.';
 }
 
@@ -2016,9 +2257,17 @@ function apply_configuration(args) {
 	if (!conflict.ok)
 		return conflict;
 
+	let plan = ruleset_plan(request.rules, request.rulesets);
+	if (enabled && length(plan.assets)) {
+		let fetched = fetch_assets(plan.assets, request.outbounds,
+			request.ruleset_detour, request.bootstrap_dns, false);
+		if (!fetched.ok)
+			return result_error(fetched.error, startup_hint(request.rulesets), fetched.kind);
+	}
+
 	let candidate = validate_candidate(request.outbounds, request.rules, request.final,
 		request.clients, enabled, request.rulesets, request.ruleset_detour,
-		request.bootstrap_dns, request.resolve_all, request.tunnel_dns);
+		request.bootstrap_dns, request.resolve_all, request.tunnel_dns, !enabled);
 	if (!candidate.ok)
 		return candidate;
 	let uci_candidate = prepare_uci_candidate(request.outbounds, request.rules,
@@ -2031,7 +2280,7 @@ function apply_configuration(args) {
 	}
 
 	let backups = {};
-	for (let path in ['/etc/config/zarap', '/etc/config/dhcp', '/etc/config/sing-box', CONFIG, NFT_CONFIG])
+	for (let path in ['/etc/config/zarap', '/etc/config/dhcp', '/etc/config/xray', CONFIG, NFT_CONFIG])
 		backups[path] = readfile(path);
 	if (backups[CONFIG] != null) {
 		writefile(CONFIG + '.bak', backups[CONFIG]);
@@ -2056,13 +2305,10 @@ function apply_configuration(args) {
 	}
 	chmod(CONFIG, 0600);
 	unlink(NFT_CHECK);
-	// Ни одного набора не осталось — держать их кэш незачем, а место на flash
-	// он занимает настоящее. Вместе с ним уходит и отложенная копия: она того
-	// же кэша, и пережить последний набор ей тем более незачем.
-	if (!length(request.rulesets)) {
-		unlink(CACHE_FILE);
-		unlink(CACHE_BACKUP);
-	}
+	// Лишние .dat-файлы от удалённых или неиспользуемых наборов убираются, чтобы
+	// не занимать место на flash.
+	cleanup_stale_assets(plan.assets);
+	clear_assets_backup();
 
 	if (system(['/etc/init.d/firewall', 'reload']) != 0) {
 		let restored = rollback(backups);
@@ -2086,10 +2332,10 @@ function apply_configuration(args) {
 	if (enabled) {
 		service_code = system(['/etc/init.d/zarap', 'restart']);
 		if (service_code == 0)
-			service_code = system(['/etc/init.d/sing-box', 'restart']);
+			service_code = system(['/etc/init.d/xray', 'restart']);
 	}
 	else {
-		system(['/etc/init.d/sing-box', 'stop']);
+		system(['/etc/init.d/xray', 'stop']);
 		service_code = system(['/etc/init.d/zarap', 'stop']);
 	}
 	if (service_code != 0) {
@@ -2254,14 +2500,13 @@ function device_list(rules, final) {
 	return result;
 }
 
-// True while the sing-box service runs on somebody else's configuration. Its
-// failures then belong to that configuration, not to Zarap, and saying so keeps
-// a crash-looping package default from reading as a Zarap fault.
-// Что можно честно сказать про место: сколько занимает кэш наборов и сколько
-// осталось на разделе, где он лежит. Размер отдельного набора Zarap неоткуда
-// взять — файл не его, — а выдуманное число хуже отсутствующего.
+// Что можно честно сказать про место: сколько занимают .dat-файлы списков в
+// ASSETS_DIR и сколько осталось на разделе /overlay.
 function cache_state() {
-	let size = stat(CACHE_FILE)?.size || 0;
+	let size = 0;
+	for (let entry in (lsdir(ASSETS_DIR) || []))
+		if (match(entry, /\.dat$/))
+			size += stat(ASSETS_DIR + '/' + entry)?.size || 0;
 	let free = 0;
 	for (let line in split(capture('/bin/df -k /overlay').output, '\n')) {
 		let fields = split(trim(line), /[ \t]+/);
@@ -2282,11 +2527,17 @@ function dns_forwarded(rules) {
 	return length(keys(names));
 }
 
-function unmanaged_sing_box() {
+// True while the xray service runs on somebody else's configuration. Its
+// failures then belong to that configuration, not to Zarap, and saying so keeps
+// a crash-looping package default from reading as a Zarap fault.
+function unmanaged_xray() {
 	let uci = cursor();
-	uci.load('sing-box');
-	return (uci.get('sing-box', 'main', 'conffile') || '') != CONFIG &&
-		uci.get('sing-box', 'main', 'enabled') == '1';
+	uci.load('xray');
+	if (uci.get('xray', 'enabled', 'enabled') != '1')
+		return false;
+	let conffiles = uci_list(uci.get('xray', 'config', 'conffiles'));
+	let confdir = trim('' + (uci.get('xray', 'config', 'confdir') || ''));
+	return confdir != '' || length(conffiles) != 1 || conffiles[0] != CONFIG;
 }
 
 function status() {
@@ -2301,13 +2552,13 @@ function status() {
 	let held = !enabled && length(guarded_macs(rules)) > 0;
 	if (!configured) {
 		state = 'not_configured';
-		message = unmanaged_sing_box() ?
-			'Прокси ещё не настроен: вставьте VLESS Reality-ссылку. Служба sing-box сейчас работает не под управлением Zarap, со своей конфигурацией — её ошибки в журнале к Zarap не относятся' :
+		message = unmanaged_xray() ?
+			'Прокси ещё не настроен: вставьте VLESS Reality-ссылку. Служба xray сейчас работает не под управлением Zarap, со своей конфигурацией — её ошибки в журнале к Zarap не относятся' :
 			'Прокси ещё не настроен: вставьте VLESS Reality-ссылку и включите Zarap';
 	}
-	else if (access(CONFIG) && system(['/usr/bin/sing-box', 'check', '-c', CONFIG]) != 0) {
+	else if (access(CONFIG) && xray_test(CONFIG) != 0) {
 		state = 'compatibility_error';
-		message = 'Установленный sing-box не принимает текущую конфигурацию';
+		message = 'Установленный xray-core не принимает текущую конфигурацию';
 	}
 	else if (enabled && !health.ok) {
 		state = 'startup_error';
@@ -2348,6 +2599,8 @@ function status() {
 			tag: ruleset.tag,
 			label: ruleset.label,
 			url: ruleset.url,
+			kind: ruleset.kind,
+			category: ruleset.category,
 			update_interval: ruleset.update_interval,
 			in_use: !!sets_in_use[ruleset.tag]
 		});
@@ -2402,66 +2655,65 @@ function status() {
 	};
 }
 
-// «Обновить сейчас». Списки обновляет sing-box сам, по интервалу, и команды
-// «сходи за ними прямо сейчас» у него нет: скачанное лежит в cache.db, и
-// запуск берёт список оттуда, а не из сети. Единственный рычаг — убрать кэш и
-// перезапустить: без кэша sing-box идёт за каждым списком заново.
-//
-// Поэтому обновление одно на все списки сразу. Кэш внутри принадлежит sing-box,
-// вынуть из него один набор нечем, и обещать построчное обновление значило бы
-// обещать то, чего под ним нет, — как и выбор подключения, ответ здесь один на
-// весь роутер.
-//
-// Кэш при этом не удаляется, а отодвигается. Старт без кэша зависит от чужого
-// сервера: если списка нет ни в кэше, ни в сети, служба может не подняться, и
-// тогда обновление списка стоило бы дому интернета. Отложенная копия
-// возвращается на место, sing-box снова работает на ней, а пользователь читает,
-// что обновление не состоялось.
+// «Обновить сейчас». По расписанию .dat-файлы обновляет сам xray-core через
+// блок geodata с горячей перезагрузкой; кнопка принудительно перекачивает
+// используемые файлы с резервным копированием и откатом при ошибке.
 function refresh_rulesets() {
 	let rulesets = saved_rulesets();
 	if (!length(rulesets))
 		return input_error('На роутере нет ни одного списка: обновлять нечего');
 
+	let rules = saved_rules();
+	let plan = ruleset_plan(rules, rulesets);
+	if (!length(plan.assets))
+		return input_error('Ни один набор правил не используется в правилах: обновлять нечего');
+
 	let uci = cursor();
 	uci.load('zarap');
 	let enabled = uci.get('zarap', 'main', 'enabled') == '1';
 
-	// Копия с прошлого раза означает прерванное обновление. Держать её незачем:
-	// её содержимое старше того, за чем сейчас идут в сеть, а место на flash
-	// она занимает настоящее.
-	unlink(CACHE_BACKUP);
+	let outbounds = saved_outbounds();
+	let detour = saved_ruleset_detour();
+	let bootstrap = saved_bootstrap();
 
-	// Выключенный Zarap перезапускать нечем: sing-box под его конфигурацией не
-	// работает. Кэша достаточно убрать — за списками он сходит на запуске.
+	let backed = backup_assets();
+	if (!backed.ok)
+		return result_error('Не удалось отложить прежние .dat-файлы списков; ничего не менялось',
+			ASSETS_DIR, 'operation_error');
+
+	let fetched = fetch_assets(plan.assets, outbounds, detour, bootstrap, true);
+	if (!fetched.ok) {
+		restore_assets(backed.files);
+		return result_error('Списки не обновились: ' + fetched.error + '. Прежние файлы возвращены',
+			startup_hint(rulesets), 'startup_error');
+	}
+
+	if (access(CONFIG) && xray_test(CONFIG) != 0) {
+		restore_assets(backed.files);
+		return result_error('Скачанные .dat-файлы не прошли проверку xray-core (возможно, отсутствует указанная категория). Прежние файлы возвращены',
+			startup_hint(rulesets), 'compatibility_error');
+	}
+
 	if (!enabled) {
-		unlink(CACHE_FILE);
+		clear_assets_backup();
 		return { ok: true, restarted: false, cache: cache_state() };
 	}
 
-	let cached = !!access(CACHE_FILE);
-	if (cached && !rename(CACHE_FILE, CACHE_BACKUP))
-		return result_error('Не удалось отложить кэш списков; ничего не менялось',
-			CACHE_FILE, 'operation_error');
-
-	let code = system(['/etc/init.d/sing-box', 'restart']);
+	let code = system(['/etc/init.d/xray', 'restart']);
 	let health = code == 0 ? check_runtime(true, LISTENER_WAIT) : { ok: false };
 	if (code == 0 && health.ok) {
-		unlink(CACHE_BACKUP);
+		clear_assets_backup();
 		return { ok: true, restarted: true, cache: cache_state(), health: health };
 	}
 
-	// Не поднялось без кэша — значит, за списком идти оказалось некуда. Свежий
-	// кэш, если он успел появиться, теперь чужой этой конфигурации: на его
-	// место возвращается прежний.
-	unlink(CACHE_FILE);
-	let restored = cached && rename(CACHE_BACKUP, CACHE_FILE);
-	let back = system(['/etc/init.d/sing-box', 'restart']) == 0 &&
+	let restored = restore_assets(backed.files);
+	let back = system(['/etc/init.d/xray', 'restart']) == 0 &&
 		check_runtime(true, LISTENER_WAIT).ok;
 	let details = startup_hint(rulesets) + '\n' + sprintf('%J', health);
 	if (back)
 		return result_error(restored ?
-			'Списки не обновились: без кэша sing-box не поднялся. Прежний кэш возвращён, служба работает на нём' :
-			'Списки не обновились: sing-box не поднялся, а кэша, чтобы вернуться к нему, не было',
+			'Списки не обновились: xray не поднялся с новыми файлами. Прежние файлы возвращены, служба работает на них' :
+			'Списки не обновились: xray не поднялся, а прежних файлов для возврата не было',
 			details, 'startup_error');
 	return result_error('Списки не обновились, и вернуть службу не удалось; kill switch остаётся активным',
 		details, 'startup_error');
@@ -2475,7 +2727,7 @@ function logs() {
 		for (let key in ['uuid', 'public_key', 'short_id'])
 			if (outbound[key])
 				push(secrets, outbound[key]);
-	let output = capture('/sbin/logread -e zarap -e sing-box').output;
+	let output = capture('/sbin/logread -e zarap -e xray').output;
 	let lines = split(output, '\n');
 	if (length(lines) > 200)
 		lines = slice(lines, length(lines) - 200);
@@ -2486,7 +2738,7 @@ function logs() {
 				output = replace(output, secret, '[скрыто]');
 	output = replace(output, /vless:\/\/[^ \t\r\n"'<>]+/g, 'vless://[скрыто]');
 	output = replace(output, /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}/g, '[скрыто]');
-	output = replace(output, /"(public_key|private_key|short_id)"[ \t]*:[ \t]*"[^"]*"/g, '"секрет":"[скрыто]"');
+	output = replace(output, /"(public_key|private_key|short_id|publicKey|privateKey|shortId)"[ \t]*:[ \t]*"[^"]*"/g, '"секрет":"[скрыто]"');
 	return { ok: true, logs: output };
 }
 
@@ -2555,7 +2807,7 @@ function update_component(name) {
 		return result_error('Обновление запрещено: kill switch не активен');
 
 	let backups = {};
-	for (let path in ['/etc/config/zarap', '/etc/config/sing-box', CONFIG, NFT_CONFIG]) {
+	for (let path in ['/etc/config/zarap', '/etc/config/xray', CONFIG, NFT_CONFIG]) {
 		let content = readfile(path);
 		backups[path] = content;
 		if (content != null) {
@@ -2564,20 +2816,20 @@ function update_component(name) {
 		}
 	}
 
-	if (name == 'sing-box')
-		system(['/etc/init.d/sing-box', 'stop']);
+	if (name == 'xray-core')
+		system(['/etc/init.d/xray', 'stop']);
 
 	let code = system(['/usr/bin/apk', 'add', '--upgrade', name]);
 	if (code != 0) {
-		let recovered = name != 'sing-box' || !current.enabled || restore_update_files(backups, true);
+		let recovered = name != 'xray-core' || !current.enabled || restore_update_files(backups, true);
 		return result_error('apk не смог обновить ' + name + (recovered ?
 			'; предыдущая конфигурация восстановлена, kill switch активен' :
 			'; восстановление сервиса не удалось, kill switch оставлен активным'), '', 'startup_error');
 	}
 
-	if (access(CONFIG) && system(['/usr/bin/sing-box', 'check', '-c', CONFIG]) != 0) {
+	if (access(CONFIG) && xray_test(CONFIG) != 0) {
 		restore_update_files(backups, false);
-		return result_error('Новая версия sing-box не принимает текущий конфиг; файлы восстановлены, сервис остановлен, kill switch активен', '', 'compatibility_error');
+		return result_error('Новая версия xray-core не принимает текущий конфиг; файлы восстановлены, сервис остановлен, kill switch активен', '', 'compatibility_error');
 	}
 	if (name == 'luci-app-zarap' && system([
 		'/usr/bin/ucode', '-cdynlink=fs,dynlink=luci.http,dynlink=ubus,dynlink=uci',
@@ -2594,7 +2846,7 @@ function update_component(name) {
 	}
 
 	if (current.enabled) {
-		if (system(['/etc/init.d/zarap', 'restart']) != 0 || system(['/etc/init.d/sing-box', 'restart']) != 0) {
+		if (system(['/etc/init.d/zarap', 'restart']) != 0 || system(['/etc/init.d/xray', 'restart']) != 0) {
 			restore_update_files(backups, true);
 			return result_error('Пакет обновлён, но сервис не запустился; файлы восстановлены, kill switch активен', '', 'startup_error');
 		}
@@ -2628,7 +2880,7 @@ const methods = {
 			let candidate = validate_candidate(checked.outbounds, checked.rules,
 				checked.final, checked.clients, true, checked.rulesets,
 				checked.ruleset_detour, checked.bootstrap_dns, checked.resolve_all,
-				checked.tunnel_dns);
+				checked.tunnel_dns, true);
 			if (!candidate.ok) return candidate;
 			let uci_candidate = prepare_uci_candidate(checked.outbounds, checked.rules,
 				checked.final, true, checked.clients, checked.rulesets,
@@ -2661,7 +2913,7 @@ const methods = {
 		call: function() {
 			let code = system(['/etc/init.d/zarap', 'restart']);
 			if (code == 0)
-				code = system(['/etc/init.d/sing-box', 'restart']);
+				code = system(['/etc/init.d/xray', 'restart']);
 			let health = code == 0 ? check_runtime(true, LISTENER_WAIT) : { ok: false };
 			return code == 0 && health.ok ? { ok: true, health: health } :
 				result_error('После перезапуска не прошла проверка процесса, TProxy, nftables или маршрутизации', sprintf('%J', health), 'startup_error');
@@ -2669,10 +2921,10 @@ const methods = {
 	},
 	stop: {
 		call: function() {
-			let code = system(['/etc/init.d/sing-box', 'stop']);
+			let code = system(['/etc/init.d/xray', 'stop']);
 			let firewall = system('/usr/sbin/nft list chain inet fw4 zarap_killswitch_forward >/dev/null 2>&1') == 0;
 			return code == 0 && firewall ? { ok: true, kill_switch: true } :
-				result_error('Не удалось безопасно остановить sing-box с активным kill switch', '', 'startup_error');
+				result_error('Не удалось безопасно остановить xray с активным kill switch', '', 'startup_error');
 		}
 	},
 	logs: { call: function() { return logs(); } },

@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=LuCI support for Zarap transparent proxy
-LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode sing-box +firewall4 +kmod-nft-tproxy +kmod-nft-socket +ip-full +ss
+LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode xray-core +curl +firewall4 +kmod-nft-tproxy +kmod-nft-socket +ip-full +ss
 LUCI_PKGARCH:=all
 
 PKG_NAME:=luci-app-zarap
@@ -20,7 +20,7 @@ endef
 
 # Applying a configuration turns off router advertisement and DHCPv6 on the LAN,
 # because the capture is IPv4 only and an advertised IPv6 would be a path around
-# sing-box. Those are somebody else's settings, so removing the package has to
+# xray-core. Those are somebody else's settings, so removing the package has to
 # hand them back — from the values recorded on the first apply, not from a guess
 # at the default.
 define Package/luci-app-zarap/prerm

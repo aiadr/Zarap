@@ -4,7 +4,7 @@ USE_PROCD=1
 START=98
 STOP=20
 
-CONFIG=/etc/zarap/sing-box.json
+CONFIG=/etc/zarap/xray.json
 MARK=0x5a52
 ROUTE_TABLE=2022
 RULE_PRIORITY=11000
@@ -46,7 +46,7 @@ stop_service() {
 reload_service() {
 	clear_policy_routing
 	start
-	/etc/init.d/sing-box restart
+	/etc/init.d/xray restart
 }
 
 service_triggers() {

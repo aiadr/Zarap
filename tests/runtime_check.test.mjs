@@ -14,7 +14,7 @@ function capture(command) {
 	if (index(command, 'ss -H') >= 0) {
 		probes++;
 		return { code: 0, output: probes >= ${appearsAt}
-			? 'tcp LISTEN 0 0 0.0.0.0:7893 users:(("sing-box",pid=1,fd=7))'
+			? 'tcp LISTEN 0 0 0.0.0.0:7893 users:(("xray",pid=1,fd=7))'
 			: '' };
 	}
 	return { code: 0, output: '' };

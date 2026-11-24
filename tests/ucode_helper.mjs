@@ -56,10 +56,20 @@ export function liftMany(source, names) {
 }
 
 export function liftConstants(source, prefixes) {
-	return source
-		.split('\n')
-		.filter((line) => prefixes.some((prefix) => line.startsWith(prefix)))
-		.join('\n');
+	const lines = source.split('\n');
+	const out = [];
+	for (let i = 0; i < lines.length; i++) {
+		if (!prefixes.some((prefix) => lines[i].startsWith(prefix)))
+			continue;
+		let line = lines[i];
+		out.push(line);
+		while (!line.trimEnd().endsWith(';') && i + 1 < lines.length) {
+			i++;
+			line = lines[i];
+			out.push(line);
+		}
+	}
+	return out.join('\n');
 }
 
 export function runUcode(ucodeBin, script) {

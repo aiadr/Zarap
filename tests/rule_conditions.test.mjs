@@ -166,17 +166,32 @@ describe('rule_conditions', { skip: !ucode && 'no ucode interpreter available' }
 			assert.equal(validate([{ clients: [TABLET], target }]).ok, true);
 	});
 
-	test('a ruleset needs a name an address and a schedule', () => {
+	test('a ruleset needs a name, https address, kind, category and a schedule', () => {
 		const good = rulesets([{
-			tag: 'rs_1', label: 'Реклама',
-			url: 'https://example.org/a.srs', update_interval: '1d'
+			tag: 'rs_1', label: 'YouTube',
+			url: 'https://example.org/geosite.dat',
+			kind: 'geosite', category: 'youtube',
+			update_interval: '1d'
+		}, {
+			tag: 'rs_2', label: 'Telegram IP',
+			url: 'https://example.org/geoip.dat',
+			kind: 'geoip', category: 'telegram',
+			update_interval: ''
 		}]);
 		assert.equal(good.ok, true, JSON.stringify(good));
 		assert.equal('detour' in good.rulesets[0], false);
+		assert.equal(good.rulesets[0].kind, 'geosite');
+		assert.equal(good.rulesets[0].category, 'youtube');
+		assert.equal(good.rulesets[1].kind, 'geoip');
+		assert.equal(good.rulesets[1].category, 'telegram');
 
-		assert.ok(rulesets([{ tag: 'ads', url: 'https://example.org/a.srs' }]).error.includes('Некорректное имя'));
-		assert.ok(rulesets([{ tag: 'rs_1', url: 'example.org/a.srs' }]).error.includes('http'));
-		assert.ok(rulesets([{ tag: 'rs_1', url: 'https://example.org/a.srs', update_interval: 'каждый день' }]).error.includes('12h'));
+		assert.ok(rulesets([{ tag: 'ads', url: 'https://example.org/a.dat', category: 'ads' }]).error.includes('Некорректное имя'));
+		assert.ok(rulesets([{ tag: 'rs_1', url: 'http://example.org/a.dat', category: 'ads' }]).error.includes('https://'));
+		assert.ok(rulesets([{ tag: 'rs_1', url: 'example.org/a.dat', category: 'ads' }]).error.includes('https://'));
+		assert.ok(rulesets([{ tag: 'rs_1', url: 'https://example.org/a.dat', kind: 'domain', category: 'ads' }]).error.includes('geosite'));
+		assert.ok(rulesets([{ tag: 'rs_1', url: 'https://example.org/a.dat', kind: 'geosite', category: '' }]).error.includes('категорию'));
+		assert.ok(rulesets([{ tag: 'rs_1', url: 'https://example.org/a.dat', kind: 'geosite', category: 'bad cat!' }]).error.includes('категорию'));
+		assert.ok(rulesets([{ tag: 'rs_1', url: 'https://example.org/a.dat', category: 'ads', update_interval: 'каждый день' }]).error.includes('12h'));
 	});
 
 	test('one detour answers for every list', () => {

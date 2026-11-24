@@ -19,29 +19,31 @@ describe('package_contract', () => {
 	});
 
 	test('required package dependencies are declared', () => {
-		for (const pkg of ['firewall4', 'kmod-nft-tproxy', 'kmod-nft-socket', 'ip-full', 'ss'])
+		for (const pkg of ['curl', 'firewall4', 'kmod-nft-tproxy', 'kmod-nft-socket', 'ip-full', 'ss'])
 			assert.ok(MAKEFILE.includes(`+${pkg}`), pkg);
-		assert.match(MAKEFILE, /LUCI_DEPENDS:=.*\bsing-box\b/);
-		assert.equal(MAKEFILE.includes('+sing-box'), false);
+		assert.match(MAKEFILE, /LUCI_DEPENDS:=.*\bxray-core\b/);
+		assert.equal(MAKEFILE.includes('sing-box'), false);
 		assert.equal(MAKEFILE.includes('rpcd-mod-iwinfo'), false);
 	});
 
 	test('external binaries use their installed paths', () => {
 		assert.equal(BACKEND.includes('/sbin/apk'), false);
-		for (const path of ['/usr/bin/apk', '/usr/sbin/ss', '/usr/sbin/nft', '/usr/bin/sing-box'])
+		for (const path of ['/usr/bin/apk', '/usr/sbin/ss', '/usr/sbin/nft', '/usr/bin/xray', '/usr/bin/curl'])
 			assert.ok(BACKEND.includes(path), path);
 	});
 
-	test('install parks only the default sing-box', () => {
-		assert.ok(UCI_DEFAULTS.includes("uci -q set sing-box.main.enabled='0'"));
-		assert.ok(UCI_DEFAULTS.includes('/etc/sing-box/config.json'));
-		assert.ok(UCI_DEFAULTS.includes('"$singbox_conf" != "$zarap_conf"'));
-		assert.equal(UCI_DEFAULTS.includes('sing-box disable'), false);
-		assert.ok(BACKEND.includes("uci.set('sing-box', 'main', 'enabled', enabled ? '1' : '0')"));
+	test('install parks only the default xray', () => {
+		assert.ok(UCI_DEFAULTS.includes("uci -q set xray.enabled.enabled='0'"));
+		assert.ok(UCI_DEFAULTS.includes('/etc/xray'));
+		assert.ok(UCI_DEFAULTS.includes('/etc/zarap/assets'));
+		assert.equal(UCI_DEFAULTS.includes('xray disable'), false);
+		assert.ok(BACKEND.includes("uci.set('xray', 'enabled', 'enabled', enabled ? '1' : '0')"));
+		assert.ok(BACKEND.includes("uci.set('xray', 'config', 'conffiles', [CONFIG])"));
+		assert.ok(BACKEND.includes("uci.set('xray', 'config', 'datadir', ASSETS_DIR)"));
 	});
 
-	test('status separates an unmanaged sing-box', () => {
-		assert.ok(BACKEND.includes('function unmanaged_sing_box()'));
+	test('status separates an unmanaged xray', () => {
+		assert.ok(BACKEND.includes('function unmanaged_xray()'));
 		assert.ok(BACKEND.includes('не под управлением Zarap'));
 	});
 
@@ -71,7 +73,7 @@ describe('package_contract', () => {
 	test('rpc namespace and update allowlist', () => {
 		assert.ok(BACKEND.includes("return { 'zarap': methods };"));
 		assert.ok(BACKEND.includes("'luci-app-zarap': true"));
-		assert.ok(BACKEND.includes("'sing-box': true"));
+		assert.ok(BACKEND.includes("'xray-core': true"));
 		assert.equal(BACKEND.includes('apk upgrade'), false);
 	});
 
@@ -135,19 +137,21 @@ describe('package_contract', () => {
 		assert.ok(acl.write.ubus.zarap.includes('refresh_rulesets'));
 	});
 
-	test('forced refresh can put the previous cache back', () => {
-		assert.ok(BACKEND.includes("const CACHE_BACKUP = '/etc/zarap/cache.db.bak'"));
+	test('forced refresh can put the previous assets back', () => {
+		assert.ok(BACKEND.includes("const ASSETS_DIR = '/etc/zarap/assets'"));
+		assert.ok(BACKEND.includes("const ASSETS_BACKUP_DIR = '/etc/zarap/.assets.bak'"));
 		const body = BACKEND.split('function refresh_rulesets(')[1].split('\nfunction ')[0];
-		assert.ok(body.includes('rename(CACHE_FILE, CACHE_BACKUP)'));
-		assert.ok(body.includes('rename(CACHE_BACKUP, CACHE_FILE)'));
+		assert.ok(body.includes('backup_assets()'));
+		assert.ok(body.includes('restore_assets(backed.files)'));
+		assert.ok(body.includes('xray_test(CONFIG)'));
 		assert.ok(body.includes('check_runtime(true, LISTENER_WAIT)'));
 		assert.ok(body.includes('startup_hint(rulesets)'));
 		assert.ok(body.includes('if (!enabled) {'));
-		assert.ok(BACKEND.includes('unlink(CACHE_FILE);\n\t\tunlink(CACHE_BACKUP);'));
+		assert.ok(BACKEND.includes('cleanup_stale_assets(plan.assets);'));
 	});
 
 	test('atomic temporary files share target directories', () => {
-		assert.ok(BACKEND.includes("const CONFIG_TMP = '/etc/zarap/.sing-box.json.tmp'"));
+		assert.ok(BACKEND.includes("const CONFIG_TMP = '/etc/zarap/.xray.json.tmp'"));
 		assert.ok(BACKEND.includes("const NFT_TMP = '/etc/nftables.d/.90-zarap.nft.tmp'"));
 		assert.ok(BACKEND.includes("const UCI_CANDIDATE = '/etc/config/.zarap-candidate'"));
 		assert.ok(BACKEND.includes('cursor(UCI_CANDIDATE, UCI_CANDIDATE_DELTA)'));
