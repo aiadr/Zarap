@@ -50,17 +50,40 @@ if [ -n "$$section" ]; then
 			done
 		fi
 	done
-	# Удаляем только точные строки пересылки, добавленные самим Zarap
-	# (записанные в zarap.main.managed_dns_servers); для установок без этого
-	# поля чистится только базовый порт 127.0.0.1#5353, чужие порты не трогаются.
-	if managed="$$(uci -q get zarap.main.managed_dns_servers)"; then
-		for entry in $$managed; do
-			[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
-		done
+	# Удаляем только точные строки пересылки, добавленные самим Zarap:
+	# после миграции (managed_dns_tracked=1) — строго по managed_dns_servers;
+	# до миграции — восстанавливаем их из сохранённых правил zarap без
+	# угадывания владельца по номеру порта, чтобы не трогать чужие записи.
+	if [ "$$(uci -q get zarap.main.managed_dns_tracked)" = "1" ]; then
+		if managed="$$(uci -q get zarap.main.managed_dns_servers)"; then
+			for entry in $$managed; do
+				[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
+			done
+		fi
 	else
-		uci -q get "dhcp.$$section.server" | tr ' ' '\n' | grep -E '(^|/)127\.0\.0\.1#5353$$' |
-		while read -r entry; do
-			[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
+		idx=0
+		tags=""
+		while target="$$(uci -q get "zarap.@rule[$$idx].target")"; do
+			domains="$$(uci -q get "zarap.@rule[$$idx].domain")"
+			if [ -n "$$domains" ] && [ "$$target" != "direct" ] && [ "$$target" != "block" ]; then
+				pos=0
+				found=""
+				for t in $$tags; do
+					[ "$$t" = "$$target" ] && { found="$$pos"; break; }
+					pos=$$((pos + 1))
+				done
+				if [ -z "$$found" ]; then
+					found="$$pos"
+					tags="$$tags $$target"
+				fi
+				port=$$((5353 + found))
+				for d in $$domains; do
+					d="$${d#.}"
+					uci -q del_list "dhcp.$$section.server=/$$d/127.0.0.1#5353"
+					[ "$$port" -ne 5353 ] && uci -q del_list "dhcp.$$section.server=/$$d/127.0.0.1#$$port"
+				done
+			fi
+			idx=$$((idx + 1))
 		done
 	fi
 fi

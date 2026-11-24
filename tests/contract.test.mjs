@@ -124,10 +124,13 @@ describe('package_contract', () => {
 		const configure = BACKEND.split('function configure_dnsmasq(')[1].split('\n}')[0];
 		assert.ok(configure.includes('if (enabled && resolve_all)'));
 		assert.ok(configure.includes('dnsmasq_hand_back(uci, section)'));
-		assert.ok(configure.includes("managed_dns_servers"));
+		assert.ok(configure.includes('managed_dns_tracked'));
+		assert.ok(configure.includes('managed_dns_servers'));
 		assert.ok(MAKEFILE.includes('for key in server noresolv cachesize; do'));
 		assert.ok(MAKEFILE.includes('saved_dns_'));
+		assert.ok(MAKEFILE.includes('zarap.main.managed_dns_tracked'));
 		assert.ok(MAKEFILE.includes('zarap.main.managed_dns_servers'));
+		assert.equal(MAKEFILE.includes('grep -E'), false);
 		assert.equal(MAKEFILE.includes('53(5[3-9]|[6-9][0-9])'), false);
 	});
 

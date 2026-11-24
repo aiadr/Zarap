@@ -1443,59 +1443,98 @@ function dnsmasq_hand_back(uci, section) {
 	}
 }
 
-function configure_dnsmasq(uci, rules, enabled, resolve_all) {
+function dns_forward_entries(rules, single_port) {
+	let dns = dns_routes(rules), domain_tags = dns_domain_tags(rules);
+	let entries = [], seen = {};
+	for (let i = 0; i < length(domain_tags); i++) {
+		let tag = domain_tags[i];
+		let forward = '127.0.0.1#' + (single_port ? DNS_PORT : (DNS_PORT + i));
+		for (let domain in dns.by_outbound[tag]) {
+			// dnsmasq сопоставляет по суффиксу, поэтому ведущая точка ему не
+			// нужна: /example.com/ покрывает и имя, и поддомены.
+			let name = substr(domain, 0, 1) == '.' ? substr(domain, 1) : domain;
+			if (seen[name])
+				continue;
+			seen[name] = true;
+			push(entries, '/' + name + '/' + forward);
+		}
+	}
+	return entries;
+}
+
+function uci_dns_rules(uci) {
+	let rules = [];
+	uci.foreach('zarap', 'rule', function(section) {
+		if (!section || !section.target || !section.domain)
+			return;
+		let domains = type(section.domain) == 'array' ? section.domain : [section.domain];
+		push(rules, { domains: domains, target: '' + section.target });
+	});
+	return rules;
+}
+
+function configure_dnsmasq(uci, rules, enabled, resolve_all, previous_rules) {
 	let section = dnsmasq_section(uci);
 	if (!section)
 		return;
 
-	let dns = dns_routes(rules), domain_tags = dns_domain_tags(rules);
-	let port_of = {};
-	for (let i = 0; i < length(domain_tags); i++)
-		port_of[domain_tags[i]] = DNS_PORT + i;
+	let domain_tags = dns_domain_tags(rules);
+	let forwarded = enabled ? dns_forward_entries(rules, false) : [];
 
-	let forwarded = [], seen = {};
-	if (enabled) {
-		for (let tag in domain_tags) {
-			let forward = '127.0.0.1#' + port_of[tag];
-			for (let domain in dns.by_outbound[tag]) {
-				// dnsmasq сопоставляет по суффиксу, поэтому ведущая точка ему не
-				// нужна: /example.com/ покрывает и имя, и поддомены.
-				let name = substr(domain, 0, 1) == '.' ? substr(domain, 1) : domain;
-				if (seen[name])
-					continue;
-				seen[name] = true;
-				push(forwarded, '/' + name + '/' + forward);
-			}
-		}
+	let tracked = uci.get('zarap', 'main', 'managed_dns_tracked') == '1';
+	let owned = {};
+	if (tracked) {
+		let prev_raw = uci.get('zarap', 'main', 'managed_dns_servers');
+		if (type(prev_raw) != 'array')
+			prev_raw = prev_raw ? [prev_raw] : [];
+		for (let entry in prev_raw)
+			owned['' + entry] = true;
+	}
+	else {
+		// Однократная миграция со старой схемы (до появления managed_dns_tracked):
+		// восстанавливаем точные строки из сохранённых до применения правил
+		// (и для формата 5353+i, и для прежнего общего порта 5353), не угадывая
+		// принадлежность по номеру порта и не трогая чужие записи.
+		let legacy_rules = previous_rules != null ? previous_rules : uci_dns_rules(uci);
+		if (previous_rules == null && !length(legacy_rules))
+			legacy_rules = rules || [];
+		for (let entry in dns_forward_entries(legacy_rules, false))
+			owned[entry] = true;
+		for (let entry in dns_forward_entries(legacy_rules, true))
+			owned[entry] = true;
 	}
 
 	// Выключенный Zarap ничего у dnsmasq не забирает: xray остановлен, и
 	// пересылка на него оставила бы дом без названных имён вовсе.
 	if (enabled && resolve_all) {
+		if (!tracked) {
+			let raw = uci.get('dhcp', section, 'server');
+			if (type(raw) != 'array')
+				raw = raw ? [raw] : [];
+			let migrated = [];
+			for (let entry in raw)
+				if (owned['' + entry])
+					push(migrated, '' + entry);
+			if (length(migrated))
+				uci.set('zarap', 'main', 'managed_dns_servers', migrated);
+			else
+				uci.delete('zarap', 'main', 'managed_dns_servers');
+			uci.set('zarap', 'main', 'managed_dns_tracked', '1');
+		}
 		dnsmasq_take_over(uci, section, length(domain_tags) > 1 ? forwarded : []);
 		return;
 	}
 	dnsmasq_hand_back(uci, section);
 
-	let prev_raw = uci.get('zarap', 'main', 'managed_dns_servers');
-	let legacy_cleanup = (prev_raw == null);
-	if (type(prev_raw) != 'array')
-		prev_raw = prev_raw ? [prev_raw] : [];
-	let owned = {};
-	for (let entry in prev_raw)
-		owned['' + entry] = true;
-
 	let raw = uci.get('dhcp', section, 'server');
 	if (type(raw) != 'array')
 		raw = raw ? [raw] : [];
-	// Чужие строки (включая сторонние локальные DNS на соседних портах) остаются
+	// Чужие строки (включая сторонние локальные DNS на тех же портах) остаются
 	// нетронутыми: удаляются только точные записи, ранее добавленные самим Zarap.
 	let kept = [];
 	for (let entry in raw) {
 		let text = '' + entry;
 		if (owned[text])
-			continue;
-		if (legacy_cleanup && (text == DNS_FORWARD || match(text, /^\/[^\/]+\/127\.0\.0\.1#5353$/)))
 			continue;
 		push(kept, text);
 	}
@@ -1508,6 +1547,7 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all) {
 	else
 		uci.delete('dhcp', section, 'server');
 
+	uci.set('zarap', 'main', 'managed_dns_tracked', '1');
 	if (length(forwarded))
 		uci.set('zarap', 'main', 'managed_dns_servers', forwarded);
 	else
@@ -1516,6 +1556,7 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all) {
 
 function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets, ruleset_detour, ruleset_interval, bootstrap, resolve_all, tunnel_dns) {
 	uci.load('zarap');
+	let previous_rules = uci_dns_rules(uci);
 	uci.set('zarap', 'main', 'zarap');
 	uci.set('zarap', 'main', 'enabled', enabled ? '1' : '0');
 	uci.set('zarap', 'main', 'final', final);
@@ -1616,7 +1657,7 @@ function configure_uci(uci, outbounds, rules, final, enabled, clients, rulesets,
 			uci.set('zarap', 'main', 'saved_' + key, previous == null ? '' : previous);
 		uci.set('dhcp', 'lan', key, 'disabled');
 	}
-	configure_dnsmasq(uci, rules, enabled, resolve_all);
+	configure_dnsmasq(uci, rules, enabled, resolve_all, previous_rules);
 
 	uci.load('xray');
 	uci.set('xray', 'enabled', 'xray');

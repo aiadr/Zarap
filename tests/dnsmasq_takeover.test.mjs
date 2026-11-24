@@ -10,12 +10,15 @@ describe('dnsmasq_takeover', { skip: !ucode && 'no ucode interpreter available' 
 		'const DNS_PORT', 'const DNS_FORWARD', 'const DNS_TAKEOVER'
 	]);
 	const prelude = `${constants}\n${liftMany(source, [
-		'dns_routes', 'dns_domain_tags', 'dnsmasq_take_over', 'dnsmasq_hand_back', 'configure_dnsmasq'
+		'dns_routes', 'dns_domain_tags', 'dnsmasq_take_over', 'dnsmasq_hand_back',
+		'dns_forward_entries', 'uci_dns_rules', 'configure_dnsmasq'
 	])}`;
 
-	function runUci(store, rules, enabled, resolveAll) {
+	function runUci(store, rules, enabled, resolveAll, { savedRules = null, previousRules = undefined } = {}) {
+		const prevArg = previousRules === undefined ? '' : `, ${JSON.stringify(previousRules)}`;
 		const stub = `
 let store = ${JSON.stringify(store)};
+let saved_rules = ${JSON.stringify(savedRules || [])};
 function key(config, section, option) { return config + '.' + section + '.' + option; }
 let uci = {
 	get: function(config, section, option) {
@@ -24,13 +27,20 @@ let uci = {
 	},
 	set: function(config, section, option, value) { store[key(config, section, option)] = value; },
 	delete: function(config, section, option) { delete store[key(config, section, option)]; },
-	foreach: function(config, type, fn) { fn({ '.name': 'cfg01' }); }
+	foreach: function(config, type, fn) {
+		if (config == 'zarap' && type == 'rule') {
+			for (let i = 0; i < length(saved_rules); i++)
+				fn(saved_rules[i]);
+			return;
+		}
+		fn({ '.name': 'cfg01' });
+	}
 };
 function dnsmasq_section() { return 'cfg01'; }
 `;
 		return runUcodeJson(
 			ucode,
-			`${stub}\n${prelude}\nconfigure_dnsmasq(uci, ${JSON.stringify(rules)}, ${enabled ? 'true' : 'false'}, ${resolveAll ? 'true' : 'false'});\nprintf('%J', store);\n`
+			`${stub}\n${prelude}\nconfigure_dnsmasq(uci, ${JSON.stringify(rules)}, ${enabled ? 'true' : 'false'}, ${resolveAll ? 'true' : 'false'}${prevArg});\nprintf('%J', store);\n`
 		);
 	}
 
@@ -100,28 +110,39 @@ function dnsmasq_section() { return 'cfg01'; }
 			'/youtube.com/127.0.0.1#5353',
 			'/example.com/127.0.0.1#5354'
 		]);
+		assert.equal(result['zarap.main.managed_dns_tracked'], '1');
 		assert.equal('dhcp.cfg01.noresolv' in result, false);
 	});
 
-	test('preserves foreign dnsmasq entries on ports 5354-5399 across enable, takeover, and disable', () => {
+	test('preserves foreign dnsmasq entries even on ports 5353-5399 across enable, takeover, and disable', () => {
 		const initial = {
-			'dhcp.cfg01.server': ['8.8.8.8', '/corp.test/127.0.0.1#5355', '/lab.test/127.0.0.1#5354']
+			'dhcp.cfg01.server': [
+				'8.8.8.8',
+				'/corp.test/127.0.0.1#5353',
+				'/lab.test/127.0.0.1#5354',
+				'/other.test/127.0.0.1#5355'
+			]
 		};
-		// Disabled with empty rules must never touch foreign 127.0.0.1#5355 or #5354
+		// Disabled with empty rules must never touch foreign 127.0.0.1#5353..5355
+		// and must keep managed_dns_tracked='1' even with an empty managed list.
 		const idle = runUci({ ...initial }, [], false, false);
 		assert.deepEqual(idle['dhcp.cfg01.server'], initial['dhcp.cfg01.server']);
+		assert.equal(idle['zarap.main.managed_dns_tracked'], '1');
 		assert.equal('zarap.main.managed_dns_servers' in idle, false);
 
-		// Scoped apply with two outbounds adds exact Zarap entries and remembers them
+		// A second empty apply stays tracked and never falls back to legacy cleanup.
+		const idleAgain = runUci({ ...idle }, [], false, false);
+		assert.deepEqual(idleAgain['dhcp.cfg01.server'], initial['dhcp.cfg01.server']);
+		assert.equal(idleAgain['zarap.main.managed_dns_tracked'], '1');
+
+		// Scoped apply with two outbounds adds exact Zarap entries and remembers them.
 		const rules = [
 			{ domains: ['youtube.com'], target: 'out_1' },
 			{ domains: ['example.com'], target: 'out_2' }
 		];
-		const scoped = runUci({ ...idle }, rules, true, false);
+		const scoped = runUci({ ...idleAgain }, rules, true, false);
 		assert.deepEqual(scoped['dhcp.cfg01.server'], [
-			'8.8.8.8',
-			'/corp.test/127.0.0.1#5355',
-			'/lab.test/127.0.0.1#5354',
+			...initial['dhcp.cfg01.server'],
 			'/youtube.com/127.0.0.1#5353',
 			'/example.com/127.0.0.1#5354'
 		]);
@@ -130,18 +151,65 @@ function dnsmasq_section() { return 'cfg01'; }
 			'/example.com/127.0.0.1#5354'
 		]);
 
-		// Switching to resolve_all then disabling removes only Zarap's exact entries
+		// Switching to resolve_all then disabling removes only Zarap's exact entries.
 		const taken = runUci({ ...scoped }, rules, true, true);
 		const disabled = runUci({ ...taken }, rules, false, true);
 		assert.deepEqual(disabled['dhcp.cfg01.server'], initial['dhcp.cfg01.server']);
+		assert.equal(disabled['zarap.main.managed_dns_tracked'], '1');
 		assert.equal('zarap.main.managed_dns_servers' in disabled, false);
 	});
 
-	test('legacy cleanup without managed_dns_servers only removes port 5353', () => {
+	test('migrates multi-port 04a52c9 entries on disable without deleting foreign port 5353 entries', () => {
 		const before = {
-			'dhcp.cfg01.server': ['8.8.8.8', '/old.example/127.0.0.1#5353', '/corp.test/127.0.0.1#5355']
+			'dhcp.cfg01.server': [
+				'8.8.8.8',
+				'/corp.test/127.0.0.1#5353',
+				'/one.test/127.0.0.1#5353',
+				'/two.test/127.0.0.1#5354'
+			]
 		};
-		const cleaned = runUci({ ...before }, [], false, false);
-		assert.deepEqual(cleaned['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5355']);
+		const rules = [
+			{ domains: ['one.test'], target: 'out_1' },
+			{ domains: ['two.test'], target: 'out_2' }
+		];
+		// Direct call (as in unit harness without UCI rule sections): both 5353 and 5354 are removed.
+		const disabledDirect = runUci({ ...before }, rules, false, false);
+		assert.deepEqual(disabledDirect['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5353']);
+		assert.equal(disabledDirect['zarap.main.managed_dns_tracked'], '1');
+
+		// Router upgrade where user also deletes all rules in the same apply:
+		// saved UCI rules still clean both old entries while keeping /corp.test/127.0.0.1#5353.
+		const savedRules = [
+			{ domain: ['one.test'], target: 'out_1' },
+			{ domain: ['two.test'], target: 'out_2' }
+		];
+		const wiped = runUci({ ...before }, [], false, false, { savedRules });
+		assert.deepEqual(wiped['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5353']);
+		assert.equal(wiped['zarap.main.managed_dns_tracked'], '1');
+
+		// Upgrade from 04a52c9 directly into resolve_all=true, then disable:
+		// old 5353 + 5354 entries are migrated before takeover and cleaned on hand-back.
+		const taken = runUci({ ...before }, rules, true, true, { savedRules });
+		assert.equal(taken['zarap.main.managed_dns_tracked'], '1');
+		const backOff = runUci({ ...taken }, rules, false, true);
+		assert.deepEqual(backOff['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5353']);
+	});
+
+	test('migrates single-port main entries from saved rules while preserving foreign port 5353', () => {
+		const before = {
+			'dhcp.cfg01.server': [
+				'8.8.8.8',
+				'/corp.test/127.0.0.1#5353',
+				'/one.test/127.0.0.1#5353',
+				'/two.test/127.0.0.1#5353'
+			]
+		};
+		const savedRules = [
+			{ domain: ['one.test'], target: 'out_1' },
+			{ domain: ['.two.test'], target: 'out_2' }
+		];
+		const cleaned = runUci({ ...before }, [], false, false, { savedRules });
+		assert.deepEqual(cleaned['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5353']);
+		assert.equal(cleaned['zarap.main.managed_dns_tracked'], '1');
 	});
 });
