@@ -1485,17 +1485,18 @@ function configure_dnsmasq(uci, rules, enabled, resolve_all, previous_rules) {
 	let forwarded = enabled ? dns_forward_entries(rules, false) : [];
 
 	let tracked = uci.get('zarap', 'main', 'managed_dns_tracked') == '1';
-	let owned = {};
 	let prev_raw = uci.get('zarap', 'main', 'managed_dns_servers');
+	let has_managed = prev_raw != null;
+	let owned = {};
 	if (type(prev_raw) != 'array')
 		prev_raw = prev_raw ? [prev_raw] : [];
 	for (let entry in prev_raw)
 		owned['' + entry] = true;
-	if (!tracked) {
-		// Однократная миграция со старой схемы (до появления managed_dns_tracked):
-		// восстанавливаем точные строки из сохранённых до применения правил
-		// (включая rule_set для сохранения порядка портов 5353+i, а также
-		// прежний общий порт 5353), не угадывая принадлежность по номеру порта.
+	if (!tracked && !has_managed) {
+		// Однократная миграция со старой схемы (нет ни managed_dns_tracked, ни
+		// managed_dns_servers): восстанавливаем точные строки из сохранённых
+		// правил с учётом rule_set. Если managed_dns_servers уже записан, он
+		// считается полным списком без догадок о старом формате.
 		let legacy_rules = previous_rules != null ? previous_rules : uci_dns_rules(uci);
 		if (previous_rules == null && !length(legacy_rules))
 			legacy_rules = rules || [];

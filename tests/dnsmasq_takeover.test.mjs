@@ -236,13 +236,18 @@ function dnsmasq_section() { return 'cfg01'; }
 		assert.equal(cleaned['zarap.main.managed_dns_tracked'], '1');
 	});
 
-	test('honors existing managed_dns_servers when upgrading from a build without managed_dns_tracked', () => {
+	test('treats existing managed_dns_servers as complete without guessing legacy entries for the same domain', () => {
 		const before = {
-			'dhcp.cfg01.server': ['8.8.8.8', '/corp.test/127.0.0.1#5353', '/custom.test/127.0.0.1#5354'],
-			'zarap.main.managed_dns_servers': ['/custom.test/127.0.0.1#5354']
+			'dhcp.cfg01.server': [
+				'8.8.8.8',
+				'/one.test/127.0.0.1#5353',
+				'/one.test/127.0.0.1#5354'
+			],
+			'zarap.main.managed_dns_servers': ['/one.test/127.0.0.1#5354']
 		};
-		const cleaned = runUci({ ...before }, [], false, false);
-		assert.deepEqual(cleaned['dhcp.cfg01.server'], ['8.8.8.8', '/corp.test/127.0.0.1#5353']);
+		const savedRules = [{ domain: ['one.test'], target: 'out_1' }];
+		const cleaned = runUci({ ...before }, [{ domains: ['one.test'], target: 'out_1' }], false, false, { savedRules });
+		assert.deepEqual(cleaned['dhcp.cfg01.server'], ['8.8.8.8', '/one.test/127.0.0.1#5353']);
 		assert.equal(cleaned['zarap.main.managed_dns_tracked'], '1');
 		assert.equal('zarap.main.managed_dns_servers' in cleaned, false);
 	});

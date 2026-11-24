@@ -51,15 +51,14 @@ if [ -n "$$section" ]; then
 		fi
 	done
 	# Удаляем только точные строки пересылки, добавленные самим Zarap:
-	# после миграции (managed_dns_tracked=1) — строго по managed_dns_servers;
-	# до миграции — используем managed_dns_servers (если уже есть) и
-	# восстанавливаем строки из сохранённых правил zarap с учётом rule_set.
+	# если managed_dns_servers уже записан — он считается полным списком;
+	# иначе при отсутствии managed_dns_tracked=1 восстанавливаем строки
+	# из сохранённых правил zarap с учётом rule_set.
 	if managed="$$(uci -q get zarap.main.managed_dns_servers)"; then
 		for entry in $$managed; do
 			[ -n "$$entry" ] && uci -q del_list "dhcp.$$section.server=$$entry"
 		done
-	fi
-	if [ "$$(uci -q get zarap.main.managed_dns_tracked)" != "1" ]; then
+	elif [ "$$(uci -q get zarap.main.managed_dns_tracked)" != "1" ]; then
 		idx=0
 		order=""
 		has_domain=""
